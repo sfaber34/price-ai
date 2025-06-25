@@ -34,6 +34,26 @@ CRYPTO PRICE PREDICTIONS - 2024-01-15 14:30:15
 ================================================================================
 ```
 
+### 📊 Output Explanation
+
+**Column Meanings:**
+- **Current**: Real-time price from live APIs
+- **Predicted**: Model's price forecast for the time horizon
+- **Return**: Expected percentage change from current to predicted price
+
+**Direction Indicators:**
+- **🟢 Green Circle**: Model predicts price will go **UP**
+- **🔴 Red Circle**: Model predicts price will go **DOWN**
+
+**Confidence Levels (Stars):**
+- **⭐** = Very low confidence (50-60%)
+- **⭐⭐** = Low confidence (60-70%)
+- **⭐⭐⭐** = Medium confidence (70-80%)
+- **⭐⭐⭐⭐** = High confidence (80-90%)
+- **⭐⭐⭐⭐⭐** = Very high confidence (90-100%)
+
+**Note**: Direction (🔴🟢) and return percentage may sometimes appear contradictory because they use different model components - the direction classifier predicts UP/DOWN movement, while the return percentage comes from the precise price regression model.
+
 ## 🛠️ Installation
 
 ### 1. Clone the repository
