@@ -242,8 +242,18 @@ class CryptoPredictionBot:
             crypto_predictions[crypto].append(prediction)
         
         for crypto, preds in crypto_predictions.items():
-            print(f"\n📈 {crypto.upper()}")
-            print("-" * 40)
+            # Use distinctive emojis for each crypto
+            if crypto == 'bitcoin':
+                crypto_emoji = "₿"  # Bitcoin symbol
+            elif crypto == 'ethereum':
+                crypto_emoji = "♦️"  # Diamond (ETH is often called digital diamond)
+            else:
+                crypto_emoji = "📈"  # Default for other cryptos
+            
+            print(f"\n{crypto_emoji} {crypto.upper()}")
+            print("-" * 80)
+            print(f"{'Time':>4} | {'Current':>10} | {'Predicted':>10} | {'Return':>8} | {'Dir':>4} | Confidence")
+            print("-" * 80)
             
             # Get real-time current price for this crypto
             try:
@@ -266,10 +276,10 @@ class CryptoPredictionBot:
                 actual_return = ((pred['predicted_price'] - real_time_price) / real_time_price) * 100
                 
                 print(f"  {pred['horizon'].upper():>3} | "
-                      f"Current: ${real_time_price:>8.2f} | "
-                      f"Predicted: ${pred['predicted_price']:>8.2f} | "
-                      f"Return: {actual_return:>6.2f}% | "
-                      f"{direction_emoji} {confidence_stars}")
+                      f"${real_time_price:>9.2f} | "
+                      f"${pred['predicted_price']:>9.2f} | "
+                      f"{actual_return:>6.2f}% | "
+                      f"{direction_emoji:>4} | {confidence_stars}")
         
         print("\n" + "="*80)
     
@@ -331,16 +341,16 @@ class CryptoPredictionBot:
                 now = datetime.now()
                 time_since_created = now - created_at
                 
-                # Define evaluation windows with some tolerance
+                # Define evaluation windows that match the prediction horizons
                 can_evaluate = False
-                if horizon == '1h' and time_since_created >= timedelta(minutes=45):
-                    # Evaluate 1h predictions after 45+ minutes
+                if horizon == '1h' and timedelta(minutes=50) <= time_since_created <= timedelta(hours=1, minutes=30):
+                    # Evaluate 1h predictions made 50min to 1h30min ago
                     can_evaluate = True
-                elif horizon == '1d' and time_since_created >= timedelta(hours=20):
-                    # Evaluate 1d predictions after 20+ hours
+                elif horizon == '1d' and timedelta(hours=22) <= time_since_created <= timedelta(hours=26):
+                    # Evaluate 1d predictions made 22h to 26h ago
                     can_evaluate = True
-                elif horizon == '1w' and time_since_created >= timedelta(days=5):
-                    # Evaluate 1w predictions after 5+ days
+                elif horizon == '1w' and timedelta(days=6) <= time_since_created <= timedelta(days=8):
+                    # Evaluate 1w predictions made 6-8 days ago
                     can_evaluate = True
                 
                 # Only evaluate if within the time window and we have current price
@@ -398,12 +408,33 @@ class CryptoPredictionBot:
             for horizon in ['1h', '1d', '1w']:
                 key = f"{crypto}_{horizon}"
                 if key in evaluations and evaluations[key]:
-                    crypto_evals[horizon] = evaluations[key][-1]  # Most recent evaluation
+                    # Find the prediction closest to the ideal timing
+                    if horizon == '1h':
+                        ideal_time = timedelta(hours=1)
+                    elif horizon == '1d':
+                        ideal_time = timedelta(days=1)
+                    elif horizon == '1w':
+                        ideal_time = timedelta(weeks=1)
+                    
+                    # Find prediction with time_elapsed closest to ideal_time
+                    best_eval = min(evaluations[key], 
+                                  key=lambda x: abs(x['time_elapsed'] - ideal_time))
+                    crypto_evals[horizon] = best_eval
                     has_data = True
             
             if has_data:
-                print(f"\n📈 {crypto.upper()} - PREDICTION vs ACTUAL")
-                print("-" * 50)
+                # Use distinctive emojis for each crypto
+                if crypto == 'bitcoin':
+                    crypto_emoji = "₿"  # Bitcoin symbol
+                elif crypto == 'ethereum':
+                    crypto_emoji = "♦️"  # Diamond (ETH is often called digital diamond)
+                else:
+                    crypto_emoji = "📈"  # Default for other cryptos
+                
+                print(f"\n{crypto_emoji} {crypto.upper()} - PREDICTION vs ACTUAL")
+                print("-" * 85)
+                print(f"{'Time':>4} | {'Predicted':>10} | {'Actual':>10} | {'Error':>7} | {'After':>8} | {'Result':>6} | Confidence")
+                print("-" * 85)
                 
                 for horizon in ['1h', '1d', '1w']:
                     if horizon in crypto_evals:
@@ -437,11 +468,11 @@ class CryptoPredictionBot:
                         confidence_stars = "⭐" * int(confidence * 5)
                         
                         print(f"  {horizon.upper():>3} | "
-                              f"Predicted: ${predicted_price:>8.2f} | "
-                              f"Actual: ${actual_price:>8.2f} | "
-                              f"Error: {price_accuracy:>5.1f}% | "
-                              f"After: {time_str:>6} | "
-                              f"{accuracy_emoji} {confidence_stars}")
+                              f"${predicted_price:>9.2f} | "
+                              f"${actual_price:>9.2f} | "
+                              f"{price_accuracy:>5.1f}% | "
+                              f"{time_str:>8} | "
+                              f"{accuracy_emoji:>6} | {confidence_stars}")
         
         print("\n" + "="*80)
     
