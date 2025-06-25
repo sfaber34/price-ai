@@ -432,9 +432,9 @@ class CryptoPredictionBot:
                     crypto_emoji = "📈"  # Default for other cryptos
                 
                 print(f"\n{crypto_emoji} {crypto.upper()} - PREDICTION vs ACTUAL")
-                print("-" * 85)
-                print(f"{'Time':>4} | {'Predicted':>10} | {'Actual':>10} | {'Error':>7} | {'After':>8} | {'Result':>6} | Confidence")
-                print("-" * 85)
+                print("-" * 100)
+                print(f"{'Time':>4} | {'Predicted':>10} | {'Actual':>10} | {'Error $':>8} | {'% Error':>7} | {'After':>8} | {'Result':>6} | Confidence")
+                print("-" * 100)
                 
                 for horizon in ['1h', '1d', '1w']:
                     if horizon in crypto_evals:
@@ -443,7 +443,8 @@ class CryptoPredictionBot:
                         # Calculate accuracy metrics
                         predicted_price = eval_data['predicted_price']
                         actual_price = eval_data['actual_price']
-                        price_accuracy = abs(predicted_price - actual_price) / actual_price * 100
+                        dollar_error = abs(predicted_price - actual_price)
+                        price_accuracy = dollar_error / actual_price * 100
                         confidence = eval_data['confidence']
                         time_elapsed = eval_data['time_elapsed']
                         
@@ -470,6 +471,7 @@ class CryptoPredictionBot:
                         print(f"  {horizon.upper():>3} | "
                               f"${predicted_price:>9.2f} | "
                               f"${actual_price:>9.2f} | "
+                              f"${dollar_error:>7.2f} | "
                               f"{price_accuracy:>5.1f}% | "
                               f"{time_str:>8} | "
                               f"{accuracy_emoji:>6} | {confidence_stars}")
