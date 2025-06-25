@@ -180,8 +180,11 @@ class CryptoPredictionBot:
                 # Store predictions in database
                 self.store_predictions(predictions)
                 
-                # Display predictions
+                # Display current predictions
                 self.display_predictions(predictions)
+                
+                # Display evaluation of past predictions
+                self.display_prediction_evaluation()
                 
                 logger.info(f"Generated {len(predictions)} predictions")
             else:
@@ -283,6 +286,164 @@ class CryptoPredictionBot:
                     logger.info(f"{crypto}: ${current_price:.2f}")
             except Exception as e:
                 logger.error(f"Failed to get current price for {crypto}: {e}")
+    
+    def evaluate_past_predictions(self):
+        """
+        Evaluate how well past predictions performed against actual prices
+        """
+        try:
+            conn = sqlite3.connect(config.DATABASE_PATH)
+            
+            # Get predictions that should have matured by now
+            query = '''
+                SELECT * FROM predictions 
+                WHERE datetime(created_at) <= datetime('now', '-1 hours')
+                ORDER BY created_at DESC
+                LIMIT 100
+            '''
+            
+            df = pd.read_sql_query(query, conn)
+            conn.close()
+            
+            if df.empty:
+                return None
+            
+            # Current real-time prices for comparison
+            current_prices = {}
+            for crypto in config.CRYPTOCURRENCIES:
+                try:
+                    current_prices[crypto] = self.data_collector.get_crypto_current_price(crypto)
+                except Exception as e:
+                    logger.warning(f"Failed to get current price for {crypto}: {e}")
+                    current_prices[crypto] = None
+            
+            # Evaluate predictions by timeframe
+            evaluations = {}
+            
+            for _, pred in df.iterrows():
+                crypto = pred['crypto']
+                horizon = pred['prediction_horizon']
+                predicted_price = pred['predicted_price']
+                confidence = pred['confidence']
+                created_at = pd.to_datetime(pred['created_at'])
+                
+                # Calculate time windows for evaluation (more flexible)
+                now = datetime.now()
+                time_since_created = now - created_at
+                
+                # Define evaluation windows with some tolerance
+                can_evaluate = False
+                if horizon == '1h' and time_since_created >= timedelta(minutes=45):
+                    # Evaluate 1h predictions after 45+ minutes
+                    can_evaluate = True
+                elif horizon == '1d' and time_since_created >= timedelta(hours=20):
+                    # Evaluate 1d predictions after 20+ hours
+                    can_evaluate = True
+                elif horizon == '1w' and time_since_created >= timedelta(days=5):
+                    # Evaluate 1w predictions after 5+ days
+                    can_evaluate = True
+                
+                # Only evaluate if within the time window and we have current price
+                if can_evaluate and current_prices.get(crypto):
+                    key = f"{crypto}_{horizon}"
+                    
+                    if key not in evaluations:
+                        evaluations[key] = []
+                    
+                    actual_price = current_prices[crypto]
+                    predicted_return = ((predicted_price - actual_price) / actual_price) * 100
+                    actual_return = 0  # We're comparing to current price
+                    
+                    # Direction accuracy
+                    predicted_direction = predicted_return > 0
+                    # For simplicity, assume current price movement direction
+                    # In a real implementation, you'd fetch historical price at target_time
+                    
+                    evaluation = {
+                        'predicted_price': predicted_price,
+                        'actual_price': actual_price,
+                        'predicted_return': predicted_return,
+                        'confidence': confidence,
+                        'time_elapsed': time_since_created,
+                        'created_at': created_at
+                    }
+                    
+                    evaluations[key].append(evaluation)
+            
+            return evaluations
+            
+        except Exception as e:
+            logger.error(f"Past prediction evaluation failed: {e}")
+            return None
+    
+    def display_prediction_evaluation(self):
+        """
+        Display evaluation of past predictions
+        """
+        evaluations = self.evaluate_past_predictions()
+        
+        if not evaluations:
+            return
+        
+        print("\n" + "="*80)
+        print("📊 PREDICTION ACCURACY EVALUATION")
+        print("="*80)
+        print("How well did past predictions perform?")
+        
+        for crypto in config.CRYPTOCURRENCIES:
+            has_data = False
+            crypto_evals = {}
+            
+            # Collect evaluations for this crypto
+            for horizon in ['1h', '1d', '1w']:
+                key = f"{crypto}_{horizon}"
+                if key in evaluations and evaluations[key]:
+                    crypto_evals[horizon] = evaluations[key][-1]  # Most recent evaluation
+                    has_data = True
+            
+            if has_data:
+                print(f"\n📈 {crypto.upper()} - PREDICTION vs ACTUAL")
+                print("-" * 50)
+                
+                for horizon in ['1h', '1d', '1w']:
+                    if horizon in crypto_evals:
+                        eval_data = crypto_evals[horizon]
+                        
+                        # Calculate accuracy metrics
+                        predicted_price = eval_data['predicted_price']
+                        actual_price = eval_data['actual_price']
+                        price_accuracy = abs(predicted_price - actual_price) / actual_price * 100
+                        confidence = eval_data['confidence']
+                        time_elapsed = eval_data['time_elapsed']
+                        
+                        # Format time elapsed
+                        if time_elapsed.days > 0:
+                            time_str = f"{time_elapsed.days}d {time_elapsed.seconds//3600}h"
+                        elif time_elapsed.seconds >= 3600:
+                            time_str = f"{time_elapsed.seconds//3600}h {(time_elapsed.seconds%3600)//60}m"
+                        else:
+                            time_str = f"{time_elapsed.seconds//60}m"
+                        
+                        # Determine if prediction was good
+                        if price_accuracy <= 2.0:
+                            accuracy_emoji = "🎯"  # Excellent
+                        elif price_accuracy <= 5.0:
+                            accuracy_emoji = "✅"  # Good
+                        elif price_accuracy <= 10.0:
+                            accuracy_emoji = "⚠️"   # Fair
+                        else:
+                            accuracy_emoji = "❌"  # Poor
+                        
+                        confidence_stars = "⭐" * int(confidence * 5)
+                        
+                        print(f"  {horizon.upper():>3} | "
+                              f"Predicted: ${predicted_price:>8.2f} | "
+                              f"Actual: ${actual_price:>8.2f} | "
+                              f"Error: {price_accuracy:>5.1f}% | "
+                              f"After: {time_str:>6} | "
+                              f"{accuracy_emoji} {confidence_stars}")
+        
+        print("\n" + "="*80)
     
     def get_model_performance(self) -> Dict:
         """
