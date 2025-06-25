@@ -242,6 +242,16 @@ class CryptoPredictionBot:
             print(f"\n📈 {crypto.upper()}")
             print("-" * 40)
             
+            # Get real-time current price for this crypto
+            try:
+                real_time_price = self.data_collector.get_crypto_current_price(crypto)
+                if real_time_price is None:
+                    # Fallback to historical price if real-time fails
+                    real_time_price = preds[0]['current_price']
+            except Exception as e:
+                logger.warning(f"Failed to get real-time price for {crypto}: {e}")
+                real_time_price = preds[0]['current_price']
+            
             # Sort by horizon
             preds.sort(key=lambda x: {'1h': 1, '1d': 2, '1w': 3}[x['horizon']])
             
@@ -249,10 +259,13 @@ class CryptoPredictionBot:
                 direction_emoji = "🟢" if pred['predicted_direction'] else "🔴"
                 confidence_stars = "⭐" * int(pred['model_confidence'] * 5)
                 
+                # Calculate return based on real-time price vs predicted price
+                actual_return = ((pred['predicted_price'] - real_time_price) / real_time_price) * 100
+                
                 print(f"  {pred['horizon'].upper():>3} | "
-                      f"Current: ${pred['current_price']:>8.2f} | "
+                      f"Current: ${real_time_price:>8.2f} | "
                       f"Predicted: ${pred['predicted_price']:>8.2f} | "
-                      f"Return: {pred['predicted_return']:>6.2f}% | "
+                      f"Return: {actual_return:>6.2f}% | "
                       f"{direction_emoji} {confidence_stars}")
         
         print("\n" + "="*80)

@@ -210,7 +210,27 @@ class DataCollector:
             return pd.DataFrame()
 
     def get_crypto_current_price(self, crypto_id: str) -> Optional[float]:
-        """Get current price for quick updates"""
+        """Get current price for quick updates using Yahoo Finance as primary source"""
+        # First try Yahoo Finance (more reliable, no rate limits)
+        try:
+            crypto_symbols = {
+                'bitcoin': 'BTC-USD',
+                'ethereum': 'ETH-USD'
+            }
+            
+            if crypto_id in crypto_symbols:
+                symbol = crypto_symbols[crypto_id]
+                ticker = yf.Ticker(symbol)
+                
+                # Get the latest price
+                hist = ticker.history(period='1d', interval='1m')
+                if not hist.empty:
+                    latest_price = hist['Close'].iloc[-1]
+                    return float(latest_price)
+        except Exception as e:
+            logger.warning(f"Yahoo Finance failed for {crypto_id}: {e}")
+        
+        # Fallback to CoinGecko if Yahoo Finance fails
         try:
             self._rate_limit('coingecko', config.RATE_LIMITS['coingecko'])
             
