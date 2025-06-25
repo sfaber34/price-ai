@@ -52,7 +52,33 @@ CRYPTO PRICE PREDICTIONS - 2024-01-15 14:30:15
 - **⭐⭐⭐⭐** = High confidence (80-90%)
 - **⭐⭐⭐⭐⭐** = Very high confidence (90-100%)
 
-**Note**: Direction (🔴🟢) and return percentage may sometimes appear contradictory because they use different model components - the direction classifier predicts UP/DOWN movement, while the return percentage comes from the precise price regression model.
+### 🔬 Model Components Explained
+
+**Two XGBoost Models Work Together:**
+
+1. **Price Prediction (Return %)**: 
+   - **XGBoost Regressor** trained on 89 features (technical indicators, market correlations, economic data)
+   - Predicts exact price target and calculates return percentage vs current price
+   - Used for: "Predicted: $43,450.00" and "Return: +0.46%"
+
+2. **Direction Prediction (🔴🟢)**: 
+   - **XGBoost Classifier** trained on the same 89 features
+   - Binary classification: Will price go UP or DOWN from historical baseline?
+   - Used for: 🟢 (UP) or 🔴 (DOWN) circles
+
+3. **Confidence Score (⭐)**: 
+   - Based on the direction classifier's probability output
+   - Higher confidence = model is more certain about the direction
+   - Calculated as distance from 50% probability (closer to 0% or 100% = higher confidence)
+
+**Data Sources (No News Sentiment):**
+- Technical indicators: RSI, MACD, Bollinger Bands, moving averages
+- Market correlations: S&P 500, Gold, Dollar Index, VIX relationships  
+- Economic indicators: Fed rates, inflation, GDP, unemployment (via FRED API)
+- Price history: Lagged features and momentum indicators
+
+**Why Direction and Return % Can Differ:**
+The regressor and classifier are trained independently on the same data but optimize for different objectives. The regressor predicts exact prices, while the classifier focuses on directional movement patterns. This can lead to scenarios where the direction shows 🟢 (UP) but return % is negative, meaning the model expects upward movement from the historical training baseline but the current real-time price is already higher than the predicted target.
 
 ## 🛠️ Installation
 
