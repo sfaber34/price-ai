@@ -15,6 +15,7 @@ import os
 from data_collector import DataCollector, initialize_database
 from feature_engineering import FeatureEngineer
 from ml_predictor import EnsemblePredictionEngine
+from prediction_accuracy_tracker import PredictionAccuracyTracker
 import config
 
 # Set up logging
@@ -33,13 +34,14 @@ class CryptoPredictionBot:
         self.data_collector = DataCollector()
         self.feature_engineer = FeatureEngineer()
         self.prediction_engine = EnsemblePredictionEngine()
+        self.accuracy_tracker = PredictionAccuracyTracker()
         self.is_trained = False
         self.last_training_time = None
         
         # Initialize database
         initialize_database()
         
-        logger.info("Crypto Prediction Bot initialized")
+        logger.info("Crypto Prediction Bot initialized with accuracy tracking")
     
     def collect_all_data(self, days: int = 30) -> Dict[str, pd.DataFrame]:
         """
@@ -299,7 +301,7 @@ class CryptoPredictionBot:
             if crypto == 'bitcoin':
                 crypto_emoji = "₿"  # Bitcoin symbol
             elif crypto == 'ethereum':
-                crypto_emoji = "♦️"  # Diamond (ETH is often called digital diamond)
+                crypto_emoji = "♦️ "  # Diamond (ETH is often called digital diamond)
             else:
                 crypto_emoji = "📈"  # Default for other cryptos
             
@@ -480,7 +482,7 @@ class CryptoPredictionBot:
                 if crypto == 'bitcoin':
                     crypto_emoji = "₿"  # Bitcoin symbol
                 elif crypto == 'ethereum':
-                    crypto_emoji = "♦️"  # Diamond (ETH is often called digital diamond)
+                    crypto_emoji = "♦️ "  # Diamond (ETH is often called digital diamond)
                 else:
                     crypto_emoji = "📈"  # Default for other cryptos
                 
@@ -531,6 +533,55 @@ class CryptoPredictionBot:
         
         print("\n" + "="*80)
     
+    def evaluate_and_track_accuracy(self):
+        """
+        Evaluate mature predictions and update accuracy tracking tables
+        """
+        try:
+            logger.info("Evaluating prediction accuracy...")
+            
+            # Use the accuracy tracker to evaluate mature predictions
+            evaluations = self.accuracy_tracker.batch_evaluate_mature_predictions(self.data_collector)
+            
+            if evaluations:
+                total_evaluated = sum(len(evals) for evals in evaluations.values())
+                logger.info(f"Evaluated {total_evaluated} predictions")
+                
+                # Update timeseries data for current prices
+                for crypto in config.CRYPTOCURRENCIES:
+                    try:
+                        current_price = self.data_collector.get_crypto_current_price(crypto)
+                        if current_price:
+                            # Store current actual price for timeseries tracking
+                            self.accuracy_tracker.update_prediction_timeseries(
+                                crypto=crypto,
+                                timestamp=datetime.now(),
+                                actual_price=current_price
+                            )
+                            
+                            # Store actual price at target for future evaluations
+                            self.accuracy_tracker.store_actual_price_at_target(
+                                crypto=crypto,
+                                target_timestamp=datetime.now(),
+                                actual_price=current_price
+                            )
+                    except Exception as e:
+                        logger.error(f"Failed to update timeseries for {crypto}: {e}")
+                
+                # Generate and log accuracy report
+                report = self.accuracy_tracker.generate_accuracy_report(days_back=7)
+                logger.info("Accuracy evaluation completed")
+                
+                # Optionally print report
+                if logger.isEnabledFor(logging.DEBUG):
+                    print(report)
+            else:
+                logger.info("No predictions ready for evaluation")
+                
+        except Exception as e:
+            logger.error(f"Accuracy evaluation failed: {e}")
+    
+
     def get_model_performance(self) -> Dict:
         """
         Analyze model performance by comparing predictions with actual prices
@@ -579,6 +630,7 @@ class CryptoPredictionBot:
         schedule.every(config.UPDATE_FREQUENCY_MINUTES).minutes.do(self.generate_predictions)
         schedule.every(30).minutes.do(self.update_current_prices)
         schedule.every(config.MODEL_SETTINGS['retrain_frequency_hours']).hours.do(self.train_models)
+        schedule.every(60).minutes.do(self.evaluate_and_track_accuracy)
         
         # Initial training and prediction
         logger.info("Running initial training...")
@@ -586,6 +638,10 @@ class CryptoPredictionBot:
         
         logger.info("Running initial prediction...")
         self.generate_predictions()
+        
+        # Initial accuracy evaluation
+        logger.info("Running initial accuracy evaluation...")
+        self.evaluate_and_track_accuracy()
         
         # Main loop
         logger.info(f"Bot started - Predictions every {config.UPDATE_FREQUENCY_MINUTES} minutes")
@@ -607,6 +663,12 @@ class CryptoPredictionBot:
         logger.info("Running bot once...")
         self.train_models()
         self.generate_predictions()
+        self.evaluate_and_track_accuracy()
+        
+        # Generate accuracy report
+        accuracy_report = self.accuracy_tracker.generate_accuracy_report(days_back=7)
+        print(accuracy_report)
+        
         performance = self.get_model_performance()
         print(f"Performance: {json.dumps(performance, indent=2)}")
 

@@ -18,6 +18,9 @@ models/
 optimal_training_results.json
 backtest_results.json
 
+# Generated plots and visualizations
+plots/
+
 # Python
 __pycache__/
 *.py[cod]
