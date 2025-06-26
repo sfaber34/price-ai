@@ -486,7 +486,7 @@ class CryptoPredictionBot:
                 
                 print(f"\n{crypto_emoji} {crypto.upper()} - PREDICTION vs ACTUAL")
                 print("-" * 100)
-                print(f"{'Time':>4} | {'Predicted':>10} | {'Actual':>10} | {'Error $':>8} | {'% Error':>7} | {'After':>8} | {'Result':>6} | Confidence")
+                print(f"{'Time':>4} | {'Predicted':>10} | {'Actual':>10} | {'Error $':>8} | {'% Error':>9} | {'After':>8} | {'Result':>6} | Confidence")
                 print("-" * 100)
                 
                 for horizon in ['1h', '1d', '1w']:
@@ -525,7 +525,7 @@ class CryptoPredictionBot:
                               f"${predicted_price:>9.2f} | "
                               f"${actual_price:>9.2f} | "
                               f"${dollar_error:>7.2f} | "
-                              f"{price_accuracy:>5.1f}% | "
+                              f"{price_accuracy:>7.3f}% | "
                               f"{time_str:>8} | "
                               f"{accuracy_emoji:>6} | {confidence_stars}")
         
