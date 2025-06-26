@@ -546,42 +546,98 @@ class CryptoPredictionBot:
             if evaluations:
                 total_evaluated = sum(len(evals) for evals in evaluations.values())
                 logger.info(f"Evaluated {total_evaluated} predictions")
-                
-                # Update timeseries data for current prices
-                for crypto in config.CRYPTOCURRENCIES:
-                    try:
-                        current_price = self.data_collector.get_crypto_current_price(crypto)
-                        if current_price:
-                            # Store current actual price for timeseries tracking
-                            self.accuracy_tracker.update_prediction_timeseries(
-                                crypto=crypto,
-                                timestamp=datetime.now(),
-                                actual_price=current_price
-                            )
-                            
-                            # Store actual price at target for future evaluations
-                            self.accuracy_tracker.store_actual_price_at_target(
-                                crypto=crypto,
-                                target_timestamp=datetime.now(),
-                                actual_price=current_price
-                            )
-                    except Exception as e:
-                        logger.error(f"Failed to update timeseries for {crypto}: {e}")
-                
-                # Generate and log accuracy report
-                report = self.accuracy_tracker.generate_accuracy_report(days_back=7)
-                logger.info("Accuracy evaluation completed")
-                
-                # Optionally print report
-                if logger.isEnabledFor(logging.DEBUG):
-                    print(report)
             else:
                 logger.info("No predictions ready for evaluation")
+            
+            # Update timeseries data for current prices AND current predictions
+            for crypto in config.CRYPTOCURRENCIES:
+                try:
+                    current_price = self.data_collector.get_crypto_current_price(crypto)
+                    if current_price:
+                        # Get the most recent predictions for this crypto
+                        current_predictions = self.get_current_predictions_for_crypto(crypto)
+                        
+                        # Store current actual price and predictions for timeseries tracking
+                        self.accuracy_tracker.update_prediction_timeseries(
+                            crypto=crypto,
+                            timestamp=datetime.now(),
+                            actual_price=current_price,
+                            predictions=current_predictions
+                        )
+                        
+                        # Store actual price at target for future evaluations
+                        self.accuracy_tracker.store_actual_price_at_target(
+                            crypto=crypto,
+                            target_timestamp=datetime.now(),
+                            actual_price=current_price
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to update timeseries for {crypto}: {e}")
+            
+            # Generate and log accuracy report
+            report = self.accuracy_tracker.generate_accuracy_report(days_back=7)
+            logger.info("Accuracy evaluation completed")
+            
+            # Optionally print report
+            if logger.isEnabledFor(logging.DEBUG):
+                print(report)
                 
         except Exception as e:
             logger.error(f"Accuracy evaluation failed: {e}")
-    
 
+    def get_current_predictions_for_crypto(self, crypto: str) -> Dict[str, float]:
+        """
+        Get predictions that are mature enough to be compared with current prices
+        Only returns predictions made at appropriate times ago for each horizon
+        """
+        try:
+            conn = sqlite3.connect(config.DATABASE_PATH)
+            
+            predictions = {}
+            now = datetime.now()
+            
+            for horizon in config.PREDICTION_INTERVALS:
+                # Define time windows for when predictions can be compared to current prices
+                if horizon == '1h':
+                    # Compare 1h predictions made 50min to 1h30min ago
+                    min_age = timedelta(minutes=50)
+                    max_age = timedelta(hours=1, minutes=30)
+                elif horizon == '1d':
+                    # Compare 1d predictions made 22h to 26h ago  
+                    min_age = timedelta(hours=22)
+                    max_age = timedelta(hours=26)
+                elif horizon == '1w':
+                    # Compare 1w predictions made 6-8 days ago
+                    min_age = timedelta(days=6)
+                    max_age = timedelta(days=8)
+                else:
+                    continue
+                
+                # Get predictions from the appropriate time window
+                earliest_time = (now - max_age).isoformat()
+                latest_time = (now - min_age).isoformat()
+                
+                query = '''
+                    SELECT predicted_price FROM predictions 
+                    WHERE crypto = ? AND prediction_horizon = ?
+                    AND created_at >= ? AND created_at <= ?
+                    ORDER BY created_at DESC 
+                    LIMIT 1
+                '''
+                cursor = conn.cursor()
+                cursor.execute(query, (crypto, horizon, earliest_time, latest_time))
+                result = cursor.fetchone()
+                
+                if result:
+                    predictions[horizon] = result[0]
+            
+            conn.close()
+            return predictions
+            
+        except Exception as e:
+            logger.error(f"Failed to get evaluatable predictions for {crypto}: {e}")
+            return {}
+    
     def get_model_performance(self) -> Dict:
         """
         Analyze model performance by comparing predictions with actual prices
