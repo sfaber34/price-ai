@@ -99,9 +99,18 @@ cp .env.example .env
 # Edit .env with your API keys
 ```
 
-### 4. Run the bot
+### 4. Train optimal models (first time setup)
 ```bash
-# Test run (single prediction)
+# Quick test (1 run per training window - just test script)
+python train_optimal_models.py --quick
+
+# Full training optimization (30 runs per window - recommended)  
+python train_optimal_models.py
+```
+
+### 5. Run the bot
+```bash
+# Test run (single prediction using pre-trained models)
 python crypto_prediction_bot.py --once
 
 # Continuous mode (predictions every 10 minutes)
@@ -133,6 +142,35 @@ NEWS_API_KEY=your_key_here
 
 ## 🧠 How It Works
 
+### Two-Script Architecture
+
+This bot uses an optimized two-script workflow:
+
+#### 1. **train_optimal_models.py** - The Heavy Lifter 🏋️
+- **Purpose**: Finds optimal training windows and trains production models
+- **Process**: 
+  - Tests 6 different training window sizes (1 month → 4 months)
+  - Runs 30 backtests per window to find the best performing setup
+  - Trains final production models using optimal windows
+  - Saves trained models to `models/` directory
+- **Run**: Once initially, then weekly/monthly for reoptimization
+- **Output**: Pre-trained models ready for immediate use
+
+#### 2. **crypto_prediction_bot.py** - The Speed Demon ⚡
+- **Purpose**: Makes real-time predictions using pre-trained models  
+- **Process**:
+  - Loads optimal models from `models/` directory (instant startup)
+  - Collects recent data and generates predictions
+  - No training delays - immediate predictions
+- **Run**: Continuously for live predictions
+- **Fallback**: Can still train from scratch if no pre-trained models exist
+
+### Workflow Benefits
+- **🚀 Instant startup**: Bot loads pre-trained models immediately
+- **🎯 Optimized accuracy**: Models use scientifically determined optimal training windows
+- **⚡ Efficiency**: No wasted compute retraining every time
+- **🔄 Flexible**: Can retrain/reoptimize models as needed
+
 ### Data Collection
 - **Crypto prices**: CoinGecko API (free, no registration)
 - **Traditional markets**: Yahoo Finance (S&P 500, Gold, Dollar Index, VIX)
@@ -163,17 +201,26 @@ NEWS_API_KEY=your_key_here
 
 ```
 crypto-price-prediction-bot/
-├── config.py                 # Configuration and API settings
-├── data_collector.py         # Data collection from APIs
-├── feature_engineering.py    # Technical indicators and features
-├── ml_predictor.py           # Machine learning models
-├── crypto_prediction_bot.py  # Main bot orchestrator
-├── requirements.txt          # Python dependencies
-├── README.md                 # This file
-├── .env.example             # Environment variables template
-├── crypto_predictions.db    # SQLite database (created automatically)
-├── crypto_bot.log          # Log file (created automatically)
-└── models/                 # Trained models (created automatically)
+├── config.py                    # Configuration and API settings
+├── data_collector.py            # Data collection from APIs
+├── feature_engineering.py       # Technical indicators and features
+├── ml_predictor.py              # Machine learning models
+├── train_optimal_models.py      # Training script - finds optimal windows & trains models
+├── crypto_prediction_bot.py     # Main bot - loads models & makes predictions
+├── requirements.txt             # Python dependencies
+├── README.md                    # This file
+├── .env.example                 # Environment variables template
+├── crypto_predictions.db       # SQLite database (created automatically)
+├── crypto_bot.log              # Log file (created automatically)
+├── optimal_training_results.json # Training optimization results
+└── models/                      # Trained models & metadata
+    ├── production_models.json   # Model metadata & paths
+    ├── bitcoin_1h_production.pkl
+    ├── bitcoin_1d_production.pkl
+    ├── bitcoin_1w_production.pkl
+    ├── ethereum_1h_production.pkl
+    ├── ethereum_1d_production.pkl
+    └── ethereum_1w_production.pkl
 ```
 
 ## ⚙️ Configuration
@@ -260,9 +307,23 @@ performance = bot.get_model_performance()
 print(performance)
 ```
 
-### Manual Training
+### Model Training Options
+
+#### Optimal Training Script
+```bash
+# Quick test (1 run per window - for testing)
+python train_optimal_models.py --quick
+
+# Standard optimization (30 runs per window - recommended)
+python train_optimal_models.py --runs 30
+
+# Extended data collection (default 180 days)
+python train_optimal_models.py --days 365
+```
+
+#### Manual Bot Training
 ```python
-# Force model retraining
+# Force model retraining in the bot
 bot.train_models(force_retrain=True)
 ```
 

@@ -107,17 +107,70 @@ class CryptoPredictionBot:
         
         return prepared_data
     
+    def load_production_models(self) -> bool:
+        """
+        Load pre-trained production models from train_optimal_models.py
+        """
+        try:
+            # Check if production models exist
+            if not os.path.exists('models/production_models.json'):
+                logger.warning("No production models found. Run train_optimal_models.py first to train optimal models.")
+                return False
+            
+            # Load model metadata
+            with open('models/production_models.json', 'r') as f:
+                production_models = json.load(f)
+            
+            logger.info("Loading pre-trained production models...")
+            
+            # Load each model
+            models_loaded = 0
+            for crypto in config.CRYPTOCURRENCIES:
+                if crypto in production_models:
+                    for horizon in config.PREDICTION_INTERVALS:
+                        if horizon in production_models[crypto]:
+                            model_info = production_models[crypto][horizon]
+                            model_path = model_info['model_path']
+                            
+                            if os.path.exists(model_path):
+                                # Add model to prediction engine and load it
+                                model = self.prediction_engine.add_model(crypto, horizon)
+                                model.load_model(model_path)
+                                
+                                models_loaded += 1
+                                logger.info(f"✅ Loaded {crypto} {horizon} model (trained on {model_info['training_window']})")
+                            else:
+                                logger.warning(f"❌ Model file not found: {model_path}")
+            
+            if models_loaded > 0:
+                self.is_trained = True
+                self.last_training_time = datetime.now()
+                logger.info(f"Successfully loaded {models_loaded} production models")
+                return True
+            else:
+                logger.error("No production models could be loaded")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to load production models: {e}")
+            return False
+
     def train_models(self, force_retrain: bool = False):
         """
-        Train all prediction models
+        Train all prediction models (fallback if no production models available)
         """
+        # First try to load pre-trained production models
+        if not force_retrain and self.load_production_models():
+            logger.info("Using pre-trained production models")
+            return
+        
         # Check if retraining is needed
         if (not force_retrain and self.is_trained and self.last_training_time and 
             datetime.now() - self.last_training_time < timedelta(hours=config.MODEL_SETTINGS['retrain_frequency_hours'])):
             logger.info("Models recently trained, skipping training")
             return
         
-        logger.info("Starting model training...")
+        logger.info("Starting model training from scratch...")
         
         # Collect data for training (longer history for better models)
         raw_data = self.collect_all_data(days=90)  # 3 months of data
