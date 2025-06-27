@@ -398,8 +398,8 @@ class CryptoPredictionBot:
                 
                 # Define evaluation windows that match the prediction horizons
                 can_evaluate = False
-                if horizon == '1h' and timedelta(minutes=50) <= time_since_created <= timedelta(hours=1, minutes=30):
-                    # Evaluate 1h predictions made 50min to 1h30min ago
+                if horizon == '1h' and timedelta(minutes=55) <= time_since_created <= timedelta(minutes=65):
+                    # Evaluate 1h predictions made 55-65 minutes ago
                     can_evaluate = True
                 elif horizon == '1d' and timedelta(hours=22) <= time_since_created <= timedelta(hours=26):
                     # Evaluate 1d predictions made 22h to 26h ago
@@ -599,9 +599,9 @@ class CryptoPredictionBot:
             for horizon in config.PREDICTION_INTERVALS:
                 # Define time windows for when predictions can be compared to current prices
                 if horizon == '1h':
-                    # Compare 1h predictions made 50min to 1h30min ago
-                    min_age = timedelta(minutes=50)
-                    max_age = timedelta(hours=1, minutes=30)
+                    # Compare 1h predictions made 55-65 minutes ago
+                    min_age = timedelta(minutes=55)
+                    max_age = timedelta(minutes=65)
                 elif horizon == '1d':
                     # Compare 1d predictions made 22h to 26h ago  
                     min_age = timedelta(hours=22)
