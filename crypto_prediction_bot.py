@@ -678,34 +678,86 @@ class CryptoPredictionBot:
     
     def run_scheduled_tasks(self):
         """
-        Set up and run scheduled tasks
+        Set up and run scheduled tasks with clock-based timing
         """
-        logger.info("Setting up scheduled tasks...")
+        logger.info("Setting up clock-based scheduled tasks...")
         
-        # Schedule tasks
-        schedule.every(config.UPDATE_FREQUENCY_MINUTES).minutes.do(self.generate_predictions)
-        schedule.every(30).minutes.do(self.update_current_prices)
-        schedule.every(config.MODEL_SETTINGS['retrain_frequency_hours']).hours.do(self.train_models)
-        schedule.every(60).minutes.do(self.evaluate_and_track_accuracy)
-        
-        # Initial training and prediction
+        # Initial training (but not prediction - we'll wait for the boundary)
         logger.info("Running initial training...")
         self.train_models()
         
-        logger.info("Running initial prediction...")
-        self.generate_predictions()
+        # Calculate next 10-minute boundary and wait
+        def wait_for_next_10min_boundary():
+            now = datetime.now()
+            current_minute = now.minute
+            current_second = now.second
+            
+            # Calculate minutes to next 10-minute boundary
+            minutes_to_next_boundary = (10 - (current_minute % 10)) % 10
+            
+            # If we're at a boundary (like XX:10:05), wait for the next one
+            if minutes_to_next_boundary == 0:
+                minutes_to_next_boundary = 10
+            
+            # Calculate the exact next run time
+            next_run_time = now.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_next_boundary)
+            
+            wait_seconds = (next_run_time - now).total_seconds()
+            
+            # Ensure wait_seconds is always positive
+            if wait_seconds <= 0:
+                next_run_time = next_run_time + timedelta(minutes=10)
+                wait_seconds = (next_run_time - now).total_seconds()
+            
+            logger.info(f"Current time: {now.strftime('%H:%M:%S')}")
+            logger.info(f"Waiting {wait_seconds:.1f} seconds until next 10-minute boundary at {next_run_time.strftime('%H:%M:%S')}")
+            
+            return wait_seconds, next_run_time
         
-        # Initial accuracy evaluation
-        logger.info("Running initial accuracy evaluation...")
-        self.evaluate_and_track_accuracy()
+        # Wait for the first 10-minute boundary before starting predictions
+        wait_seconds, next_run_time = wait_for_next_10min_boundary()
+        time.sleep(wait_seconds)
         
-        # Main loop
-        logger.info(f"Bot started - Predictions every {config.UPDATE_FREQUENCY_MINUTES} minutes")
+        # Set up variables for tracking other scheduled tasks
+        last_price_update = datetime.now()
+        last_model_training = datetime.now()
+        last_accuracy_evaluation = datetime.now()
+        
+        logger.info(f"Bot started - Predictions every 10 minutes at clock boundaries (XX:00, XX:10, XX:20, etc.)")
         
         try:
             while True:
-                schedule.run_pending()
-                time.sleep(60)  # Check every minute
+                now = datetime.now()
+                current_minute = now.minute
+                
+                # Check if we're at a 10-minute boundary (within 30 seconds)
+                if current_minute % 10 == 0 and now.second <= 30:
+                    logger.info(f"Running scheduled prediction at {now.strftime('%H:%M:%S')}")
+                    self.generate_predictions()
+                    
+                    # Also run other tasks based on their frequency
+                    # Update prices every 30 minutes (at XX:00 and XX:30)
+                    if current_minute % 30 == 0:
+                        self.update_current_prices()
+                        last_price_update = now
+                    
+                    # Evaluate accuracy every hour (at XX:00)
+                    if current_minute == 0:
+                        self.evaluate_and_track_accuracy()
+                        last_accuracy_evaluation = now
+                    
+                    # Check if model retraining is needed (every N hours)
+                    hours_since_training = (now - last_model_training).total_seconds() / 3600
+                    if hours_since_training >= config.MODEL_SETTINGS['retrain_frequency_hours']:
+                        logger.info("Retraining models...")
+                        self.train_models()
+                        last_model_training = now
+                    
+                    # Wait a bit to avoid running the same task multiple times
+                    time.sleep(35)
+                else:
+                    # Check every 10 seconds when not at boundary
+                    time.sleep(10)
                 
         except KeyboardInterrupt:
             logger.info("Bot stopped by user")
