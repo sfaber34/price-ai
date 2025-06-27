@@ -686,54 +686,35 @@ class CryptoPredictionBot:
         logger.info("Running initial training...")
         self.train_models()
         
-        # Calculate next 10-minute boundary and wait
-        def wait_for_next_10min_boundary():
-            now = datetime.now()
-            current_minute = now.minute
-            current_second = now.second
-            
-            # Calculate minutes to next 10-minute boundary
-            minutes_to_next_boundary = (10 - (current_minute % 10)) % 10
-            
-            # If we're at a boundary (like XX:10:05), wait for the next one
-            if minutes_to_next_boundary == 0:
-                minutes_to_next_boundary = 10
-            
-            # Calculate the exact next run time
-            next_run_time = now.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_next_boundary)
-            
-            wait_seconds = (next_run_time - now).total_seconds()
-            
-            # Ensure wait_seconds is always positive
-            if wait_seconds <= 0:
-                next_run_time = next_run_time + timedelta(minutes=10)
-                wait_seconds = (next_run_time - now).total_seconds()
-            
-            logger.info(f"Current time: {now.strftime('%H:%M:%S')}")
-            logger.info(f"Waiting {wait_seconds:.1f} seconds until next 10-minute boundary at {next_run_time.strftime('%H:%M:%S')}")
-            
-            return wait_seconds, next_run_time
-        
-        # Wait for the first 10-minute boundary before starting predictions
-        wait_seconds, next_run_time = wait_for_next_10min_boundary()
-        time.sleep(wait_seconds)
+        # Don't wait for boundaries - start checking immediately
+        logger.info(f"Starting immediately at {datetime.now().strftime('%H:%M:%S')} - will catch next 10-minute boundary")
         
         # Set up variables for tracking other scheduled tasks
         last_price_update = datetime.now()
         last_model_training = datetime.now()
         last_accuracy_evaluation = datetime.now()
+        last_prediction_run = datetime.now() - timedelta(minutes=15)  # Initialize to 15 min ago
         
         logger.info(f"Bot started - Predictions every 10 minutes at clock boundaries (XX:00, XX:10, XX:20, etc.)")
+        logger.info("Checking system clock every second for 10-minute boundaries...")
         
         try:
             while True:
                 now = datetime.now()
                 current_minute = now.minute
+                current_second = now.second
                 
-                # Check if we're at a 10-minute boundary (within 30 seconds)
-                if current_minute % 10 == 0 and now.second <= 30:
-                    logger.info(f"Running scheduled prediction at {now.strftime('%H:%M:%S')}")
+                # Check if we're at a 10-minute boundary (XX:00, XX:10, XX:20, etc.)
+                is_ten_minute_boundary = (current_minute % 10 == 0)
+                
+                # Only run if we're at boundary AND haven't run in the last 5 minutes (prevent double-runs)
+                time_since_last_prediction = (now - last_prediction_run).total_seconds()
+                should_run_prediction = is_ten_minute_boundary and time_since_last_prediction > 300
+                
+                if should_run_prediction:
+                    logger.info(f"🎯 BOUNDARY HIT! Running scheduled prediction at {now.strftime('%H:%M:%S')}")
                     self.generate_predictions()
+                    last_prediction_run = now
                     
                     # Also run other tasks based on their frequency
                     # Update prices every 30 minutes (at XX:00 and XX:30)
@@ -752,12 +733,9 @@ class CryptoPredictionBot:
                         logger.info("Retraining models...")
                         self.train_models()
                         last_model_training = now
-                    
-                    # Wait a bit to avoid running the same task multiple times
-                    time.sleep(35)
-                else:
-                    # Check every 10 seconds when not at boundary
-                    time.sleep(10)
+                
+                # Simple: sleep 1 second and check again
+                time.sleep(1)
                 
         except KeyboardInterrupt:
             logger.info("Bot stopped by user")
