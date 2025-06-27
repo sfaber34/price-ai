@@ -84,7 +84,7 @@ def generate_all_plots(crypto=None, days_back=30, save_dir=None):
     # Generate combined accuracy report
     try:
         report_path = os.path.join(save_dir, "accuracy_report.txt")
-        report = tracker.generate_accuracy_report(crypto=crypto, days_back=days_back)
+        report = tracker.generate_accuracy_report(crypto=None, days_back=days_back)
         
         with open(report_path, 'w') as f:
             f.write(report)

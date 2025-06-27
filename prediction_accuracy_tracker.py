@@ -391,11 +391,14 @@ class PredictionAccuracyTracker:
                 'direction_accuracy': df['direction_correct'].mean(),
                 'min_error': df['absolute_error'].min(),
                 'max_error': df['absolute_error'].max(),
-                'error_percentiles': {
+                'percent_error_percentiles': {
+                    '1st': df['percent_error'].quantile(0.01),
+                    '10th': df['percent_error'].quantile(0.10),
                     '25th': df['percent_error'].quantile(0.25),
+                    '50th': df['percent_error'].quantile(0.50),  # median
                     '75th': df['percent_error'].quantile(0.75),
                     '90th': df['percent_error'].quantile(0.90),
-                    '95th': df['percent_error'].quantile(0.95)
+                    '99th': df['percent_error'].quantile(0.99)
                 }
             }
             
@@ -494,14 +497,23 @@ class PredictionAccuracyTracker:
         report.append("-" * 80)
         
         for crypto in cryptos:
-            if len(cryptos) > 1:
-                report.append(f"\n📊 {crypto.upper()}")
-                report.append("-" * 40)
+            # Always show crypto header for clarity
+            if crypto == 'bitcoin':
+                crypto_emoji = "₿"  # Bitcoin symbol
+            elif crypto == 'ethereum':
+                crypto_emoji = "♦️ "  # Diamond (ETH is often called digital diamond)
+            else:
+                crypto_emoji = "📈"  # Default for other cryptos
             
+            report.append(f"\nCrypto: {crypto_emoji} {crypto.upper()}")
+            report.append("-" * 80)
+            
+            crypto_has_data = False
             for horizon in config.PREDICTION_INTERVALS:
                 metrics = self.calculate_accuracy_metrics(crypto, horizon, days_back)
                 
-                if metrics:
+                if metrics and metrics.get('total_predictions', 0) > 0:
+                    crypto_has_data = True
                     report.append(f"\n  ⏱️  {horizon.upper()} Predictions:")
                     report.append(f"    Total Predictions: {metrics['total_predictions']}")
                     report.append(f"    Mean Absolute Error: ${metrics['mean_absolute_error']:.2f}")
@@ -509,8 +521,17 @@ class PredictionAccuracyTracker:
                     report.append(f"    Direction Accuracy: {metrics['direction_accuracy']:.2%}")
                     report.append(f"    RMSE: ${metrics['root_mean_squared_error']:.2f}")
                     report.append(f"    Error Range: ${metrics['min_error']:.2f} - ${metrics['max_error']:.2f}")
+                    
+                    # Add percentile information
+                    percentiles = metrics['percent_error_percentiles']
+                    report.append(f"    Percent Error Percentiles:")
+                    report.append(f"      1st: {percentiles['1st']:.2f}%   10th: {percentiles['10th']:.2f}%   25th: {percentiles['25th']:.2f}%")
+                    report.append(f"     50th: {percentiles['50th']:.2f}%   75th: {percentiles['75th']:.2f}%   90th: {percentiles['90th']:.2f}%   99th: {percentiles['99th']:.2f}%")
                 else:
                     report.append(f"\n  ⏱️  {horizon.upper()} Predictions: No data available")
+            
+            if not crypto_has_data:
+                report.append(f"    📍 No evaluation data available for {crypto} in the last {days_back} days")
         
         report.append(f"\n{'='*80}")
         
