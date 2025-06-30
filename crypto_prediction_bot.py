@@ -87,27 +87,61 @@ class CryptoPredictionBot:
     
     def prepare_features_for_all_cryptos(self, raw_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """
-        Prepare features for all cryptocurrencies
+        Prepare features for all cryptocurrencies with cross-asset correlation features
         """
-        logger.info("Preparing features for all cryptocurrencies...")
+        logger.info("Preparing features for all cryptocurrencies with cross-asset correlations...")
         
-        prepared_data = {}
         market_data = raw_data.get('traditional_markets', pd.DataFrame())
         
+        # Extract crypto data for cross-asset feature engineering
+        crypto_data = {}
         for crypto in config.CRYPTOCURRENCIES:
-            if crypto in raw_data:
-                try:
-                    features_df = self.feature_engineer.prepare_features(
-                        raw_data[crypto], 
-                        market_data
-                    )
-                    prepared_data[crypto] = features_df
-                    logger.info(f"Features prepared for {crypto}: {features_df.shape}")
-                    
-                except Exception as e:
-                    logger.error(f"Feature preparation failed for {crypto}: {e}")
+            if crypto in raw_data and not raw_data[crypto].empty:
+                crypto_data[crypto] = raw_data[crypto]
         
-        return prepared_data
+        if not crypto_data:
+            logger.warning("No crypto data available for feature preparation")
+            return {}
+        
+        try:
+            # Use the new cross-asset correlation feature preparation
+            prepared_data = self.feature_engineer.prepare_features_with_cross_asset_correlation(
+                crypto_data, 
+                market_data
+            )
+            
+            # Log feature counts for each crypto
+            for crypto, features_df in prepared_data.items():
+                # Count cross-asset features specifically
+                cross_asset_features = [col for col in features_df.columns 
+                                      if any(other_crypto in col for other_crypto in config.CRYPTOCURRENCIES 
+                                           if other_crypto != crypto)]
+                
+                logger.info(f"✅ {crypto}: {features_df.shape[1]} total features "
+                           f"({len(cross_asset_features)} cross-asset)")
+            
+            return prepared_data
+            
+        except Exception as e:
+            logger.error(f"Cross-asset feature preparation failed: {e}")
+            
+            # Fallback to individual feature preparation
+            logger.info("Falling back to individual feature preparation...")
+            prepared_data = {}
+            for crypto in config.CRYPTOCURRENCIES:
+                if crypto in raw_data:
+                    try:
+                        features_df = self.feature_engineer.prepare_features(
+                            raw_data[crypto], 
+                            market_data
+                        )
+                        prepared_data[crypto] = features_df
+                        logger.info(f"Features prepared for {crypto}: {features_df.shape}")
+                        
+                    except Exception as crypto_error:
+                        logger.error(f"Feature preparation failed for {crypto}: {crypto_error}")
+            
+            return prepared_data
     
     def load_production_models(self) -> bool:
         """

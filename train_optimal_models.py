@@ -73,30 +73,66 @@ class CryptoBacktester:
     
     def prepare_features_for_backtest(self, raw_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """
-        Prepare features for all cryptocurrencies using the feature engineer
+        Prepare features for all cryptocurrencies using the feature engineer with cross-asset correlations
         """
-        logger.info("Preparing features for backtesting...")
-        prepared_data = {}
+        logger.info("Preparing features for backtesting with cross-asset correlations...")
         
+        market_data = raw_data.get('traditional_markets', pd.DataFrame())
+        
+        # Extract crypto data for cross-asset feature engineering
+        crypto_data = {}
         for crypto in config.CRYPTOCURRENCIES:
             if crypto in raw_data and not raw_data[crypto].empty:
-                try:
-                    # Prepare features using the same pipeline as the main bot
-                    crypto_features = self.feature_engineer.prepare_features(
-                        raw_data[crypto],
-                        raw_data.get('traditional_markets', pd.DataFrame())
-                    )
-                    
-                    if not crypto_features.empty:
-                        prepared_data[crypto] = crypto_features
-                        logger.info(f"Features prepared for {crypto}: {crypto_features.shape}")
-                    else:
-                        logger.warning(f"No features prepared for {crypto}")
-                        
-                except Exception as e:
-                    logger.error(f"Feature preparation failed for {crypto}: {e}")
+                crypto_data[crypto] = raw_data[crypto]
         
-        return prepared_data
+        if not crypto_data:
+            logger.warning("No crypto data available for backtest feature preparation")
+            return {}
+        
+        try:
+            # Use the new cross-asset correlation feature preparation
+            prepared_data = self.feature_engineer.prepare_features_with_cross_asset_correlation(
+                crypto_data, 
+                market_data
+            )
+            
+            # Log feature counts for each crypto
+            for crypto, features_df in prepared_data.items():
+                # Count cross-asset features specifically
+                cross_asset_features = [col for col in features_df.columns 
+                                      if any(other_crypto in col for other_crypto in config.CRYPTOCURRENCIES 
+                                           if other_crypto != crypto)]
+                
+                logger.info(f"🔬 Backtest {crypto}: {features_df.shape[1]} total features "
+                           f"({len(cross_asset_features)} cross-asset)")
+            
+            return prepared_data
+            
+        except Exception as e:
+            logger.error(f"Cross-asset backtest feature preparation failed: {e}")
+            
+            # Fallback to individual feature preparation
+            logger.info("Falling back to individual feature preparation for backtest...")
+            prepared_data = {}
+            for crypto in config.CRYPTOCURRENCIES:
+                if crypto in raw_data and not raw_data[crypto].empty:
+                    try:
+                        # Prepare features using the same pipeline as the main bot
+                        crypto_features = self.feature_engineer.prepare_features(
+                            raw_data[crypto],
+                            market_data
+                        )
+                        
+                        if not crypto_features.empty:
+                            prepared_data[crypto] = crypto_features
+                            logger.info(f"Features prepared for {crypto}: {crypto_features.shape}")
+                        else:
+                            logger.warning(f"No features prepared for {crypto}")
+                            
+                    except Exception as crypto_error:
+                        logger.error(f"Feature preparation failed for {crypto}: {crypto_error}")
+            
+            return prepared_data
     
     def create_time_splits(self, data: pd.DataFrame, train_days: int = 90, 
                           step_days: int = 7, min_future_days: int = 8) -> List[Tuple[int, int]]:
@@ -315,9 +351,19 @@ class CryptoBacktester:
         # Results organized by training window size
         experiment_results = {}
         
+        # Calculate total number of runs across all windows and cryptos
+        available_cryptos = [crypto for crypto in config.CRYPTOCURRENCIES if crypto in prepared_data]
+        total_runs = len(training_windows) * len(available_cryptos) * runs_per_window
+        current_run = 0
+        
+        # Track progress through training windows
+        total_windows = len(training_windows)
+        current_window = 0
+        
         for window_name, window_days in training_windows.items():
+            current_window += 1
             logger.info(f"\n{'='*60}")
-            logger.info(f"Testing training window: {window_name.upper()} ({window_days} days)")
+            logger.info(f"Testing training window {current_window}/{total_windows}: {window_name.upper()} ({window_days} days)")
             logger.info(f"{'='*60}")
             
             experiment_results[window_name] = {}
@@ -343,7 +389,8 @@ class CryptoBacktester:
                 crypto_results = []
                 
                 for i, (train_start, train_end, test_start) in enumerate(splits):
-                    logger.info(f"Processing {window_name} split {i+1}/{len(splits)} for {crypto}")
+                    current_run += 1
+                    logger.info(f"Run {current_run}/{total_runs}: Processing {window_name} split {i+1}/{len(splits)} for {crypto}")
                     
                     split_results = self.evaluate_predictions_at_split(
                         data, train_start, train_end, test_start, crypto
