@@ -211,14 +211,19 @@ class FeatureEngineer:
     def create_target_variables(self, df: pd.DataFrame, price_col: str = 'price') -> pd.DataFrame:
         """
         Create target variables for different prediction horizons
+        CRITICAL: This creates targets that look FORWARD in time to avoid data leakage
         """
         df = df.copy()
         
         try:
-            # Target variables for different horizons
-            df['target_1h'] = df[price_col].shift(-1)  # Next hour price
-            df['target_1d'] = df[price_col].shift(-24)  # Next day price (24h later)
-            df['target_1w'] = df[price_col].shift(-24*7)  # Next week price (7 days later)
+            # IMPORTANT: For time series prediction, we want to predict FUTURE prices
+            # Using shift(-n) means we're looking n periods into the future
+            # This is correct as long as during training we drop rows where targets are NaN
+            
+            # Target variables for different horizons (future prices)
+            df['target_1h'] = df[price_col].shift(-1)   # Price 1 hour in the future
+            df['target_1d'] = df[price_col].shift(-24)  # Price 24 hours in the future  
+            df['target_1w'] = df[price_col].shift(-24*7)  # Price 7 days in the future
             
             # Target returns (percentage change)
             df['target_return_1h'] = (df['target_1h'] / df[price_col] - 1) * 100
@@ -229,6 +234,12 @@ class FeatureEngineer:
             df['target_direction_1h'] = (df['target_return_1h'] > 0).astype(int)
             df['target_direction_1d'] = (df['target_return_1d'] > 0).astype(int)
             df['target_direction_1w'] = (df['target_return_1w'] > 0).astype(int)
+            
+            # CRITICAL: Create future datetime stamps for proper evaluation
+            # These represent the actual TIME that our predictions are targeting
+            df['target_datetime_1h'] = df['datetime'] + pd.Timedelta(hours=1)
+            df['target_datetime_1d'] = df['datetime'] + pd.Timedelta(days=1)
+            df['target_datetime_1w'] = df['datetime'] + pd.Timedelta(weeks=1)
             
             logger.info("Created target variables for 1h, 1d, 1w horizons")
             
@@ -270,7 +281,8 @@ class FeatureEngineer:
         # Store feature column names (excluding targets and metadata)
         exclude_cols = ['datetime', 'crypto', 'target_1h', 'target_1d', 'target_1w', 
                        'target_return_1h', 'target_return_1d', 'target_return_1w',
-                       'target_direction_1h', 'target_direction_1d', 'target_direction_1w']
+                       'target_direction_1h', 'target_direction_1d', 'target_direction_1w',
+                       'target_datetime_1h', 'target_datetime_1d', 'target_datetime_1w']
         
         self.feature_columns = [col for col in df.columns if col not in exclude_cols]
         

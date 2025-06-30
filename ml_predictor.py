@@ -41,7 +41,8 @@ class CryptoPredictionModel:
         exclude_cols = [
             'datetime', 'crypto', 'target_1h', 'target_1d', 'target_1w', 
             'target_return_1h', 'target_return_1d', 'target_return_1w',
-            'target_direction_1h', 'target_direction_1d', 'target_direction_1w'
+            'target_direction_1h', 'target_direction_1d', 'target_direction_1w',
+            'target_datetime_1h', 'target_datetime_1d', 'target_datetime_1w'
         ]
         
         feature_cols = [col for col in clean_df.columns if col not in exclude_cols]
@@ -271,7 +272,8 @@ class CryptoPredictionModel:
             exclude_cols = [
                 'datetime', 'crypto', 'target_1h', 'target_1d', 'target_1w', 
                 'target_return_1h', 'target_return_1d', 'target_return_1w',
-                'target_direction_1h', 'target_direction_1d', 'target_direction_1w'
+                'target_direction_1h', 'target_direction_1d', 'target_direction_1w',
+                'target_datetime_1h', 'target_datetime_1d', 'target_datetime_1w'
             ]
             
             X = latest_data[[col for col in latest_data.columns if col not in exclude_cols]].fillna(0)
@@ -306,8 +308,25 @@ class CryptoPredictionModel:
             current_price = latest_data['price'].iloc[0]
             predicted_price = current_price * (1 + predicted_return / 100)
             
+            # CRITICAL FIX: Use target datetime instead of feature datetime
+            # This represents WHEN the prediction is valid, not when it was made
+            feature_datetime = latest_data['datetime'].iloc[0]
+            if isinstance(feature_datetime, str):
+                feature_datetime = pd.to_datetime(feature_datetime)
+            
+            # Calculate target datetime based on prediction horizon
+            if self.prediction_horizon == '1h':
+                target_datetime = feature_datetime + pd.Timedelta(hours=1)
+            elif self.prediction_horizon == '1d':
+                target_datetime = feature_datetime + pd.Timedelta(days=1)
+            elif self.prediction_horizon == '1w':
+                target_datetime = feature_datetime + pd.Timedelta(weeks=1)
+            else:
+                target_datetime = feature_datetime  # Fallback
+            
             return {
-                'timestamp': latest_data['datetime'].iloc[0],
+                'timestamp': target_datetime,  # FIXED: Now points to prediction target time
+                'feature_timestamp': feature_datetime,  # When the features were from
                 'crypto': self.crypto_name,
                 'horizon': self.prediction_horizon,
                 'current_price': current_price,

@@ -256,21 +256,22 @@ class CryptoPredictionBot:
             conn = sqlite3.connect(config.DATABASE_PATH)
             
             for model_key, prediction in predictions.items():
-                # Convert timestamp to string if it's a pandas Timestamp
-                timestamp_str = str(prediction['timestamp'])
+                # Convert timestamps to strings - now using target timestamp (when prediction is FOR)
+                target_timestamp_str = str(prediction['timestamp'])
+                feature_timestamp_str = str(prediction.get('feature_timestamp', prediction['timestamp']))
                 
-                # Insert prediction into database
+                # Insert prediction into database with corrected timestamp logic
                 conn.execute('''
                     INSERT INTO predictions 
                     (datetime, crypto, prediction_horizon, predicted_price, confidence, created_at)
                     VALUES (?, ?, ?, ?, ?, ?)
                 ''', (
-                    timestamp_str,
+                    target_timestamp_str,  # FIXED: Use target time, not feature time
                     str(prediction['crypto']),
                     str(prediction['horizon']),
                     float(prediction['predicted_price']),
                     float(prediction['model_confidence']),
-                    datetime.now().isoformat()
+                    datetime.now().isoformat()  # When the prediction was actually made
                 ))
             
             conn.commit()

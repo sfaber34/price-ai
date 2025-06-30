@@ -183,7 +183,7 @@ class PredictionAccuracyTracker:
             # Get predictions that haven't been evaluated yet
             query = '''
                 SELECT p.id, p.crypto, p.prediction_horizon, p.predicted_price, 
-                       p.confidence, p.datetime as prediction_time, p.created_at
+                       p.confidence, p.datetime as target_time, p.created_at
                 FROM predictions p
                 LEFT JOIN prediction_evaluations pe ON p.id = pe.prediction_id
                 WHERE pe.id IS NULL
@@ -202,34 +202,40 @@ class PredictionAccuracyTracker:
             
             for _, pred in predictions_df.iterrows():
                 try:
-                    prediction_time = pd.to_datetime(pred['prediction_time'])
+                    # FIXED: target_time is now the actual target time (when prediction is FOR)
+                    target_time = pd.to_datetime(pred['target_time'])
                     created_at = pd.to_datetime(pred['created_at'])
                     horizon = pred['prediction_horizon']
                     crypto = pred['crypto']
                     
-                    # Calculate target time based on horizon
-                    if horizon == '1h':
-                        target_time = prediction_time + timedelta(hours=1)
-                        min_wait = timedelta(hours=1)
-                    elif horizon == '1d':
-                        target_time = prediction_time + timedelta(days=1)
-                        min_wait = timedelta(days=1)
-                    elif horizon == '1w':
-                        target_time = prediction_time + timedelta(weeks=1)
-                        min_wait = timedelta(weeks=1)
-                    else:
-                        continue
-                    
                     # Check if enough time has passed for evaluation
+                    # We can only evaluate if we've reached the target time
                     now = datetime.now()
-                    if now < created_at + min_wait:
-                        continue
+                    if now < target_time:
+                        continue  # Prediction target time hasn't arrived yet
+                    
+                    # Allow a reasonable window for evaluation after target time
+                    time_since_target = now - target_time
+                    max_evaluation_delay = timedelta(hours=2)  # Don't evaluate too old targets
+                    
+                    if time_since_target > max_evaluation_delay:
+                        continue  # Target time was too long ago, data might be stale
                     
                     # Get actual price at target time (or closest available)
                     actual_price = self.get_actual_price_at_time(crypto, target_time, data_collector)
                     
                     if actual_price is None:
                         continue
+                    
+                    # Calculate the original prediction time (when features were from)
+                    if horizon == '1h':
+                        prediction_time = target_time - timedelta(hours=1)
+                    elif horizon == '1d':
+                        prediction_time = target_time - timedelta(days=1)
+                    elif horizon == '1w':
+                        prediction_time = target_time - timedelta(weeks=1)
+                    else:
+                        prediction_time = target_time
                     
                     # Evaluate the prediction
                     evaluation = self.evaluate_prediction(
