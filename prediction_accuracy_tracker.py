@@ -195,17 +195,17 @@ class PredictionAccuracyTracker:
             evaluation_windows = {
                 '1h': {
                     'lookback_time': now - timedelta(hours=1),
-                    'window_size': timedelta(minutes=20),  # ±20 minutes (was ±10)
+                    'window_size': timedelta(minutes=3),  # ±3 minutes for accurate 1-hour evaluation
                     'description': '1 hour ago'
                 },
                 '1d': {
                     'lookback_time': now - timedelta(days=1),
-                    'window_size': timedelta(hours=4),  # ±4 hours (was ±2)
+                    'window_size': timedelta(hours=1),  # ±1 hour for more accurate 1-day evaluation
                     'description': '1 day ago'
                 },
                 '1w': {
                     'lookback_time': now - timedelta(weeks=1),
-                    'window_size': timedelta(hours=24),  # ±24 hours (was ±12)
+                    'window_size': timedelta(hours=12),  # ±12 hours for more accurate 1-week evaluation
                     'description': '1 week ago'
                 }
             }
@@ -218,70 +218,77 @@ class PredictionAccuracyTracker:
                 earliest_time = lookback_time - window_size
                 latest_time = lookback_time + window_size
                 
-                query = '''
-                    SELECT p.id, p.crypto, p.prediction_horizon, p.predicted_price, 
-                           p.confidence, p.datetime as target_time, p.created_at,
-                           ABS(julianday(p.created_at) - julianday(?)) as time_diff_from_target
-                    FROM predictions p
-                    LEFT JOIN prediction_evaluations pe ON p.id = pe.prediction_id
-                    WHERE pe.id IS NULL 
-                    AND p.prediction_horizon = ?
-                    AND p.created_at >= ? 
-                    AND p.created_at <= ?
-                    ORDER BY time_diff_from_target ASC, p.created_at DESC
-                '''
-                
-                cursor = conn.cursor()
-                cursor.execute(query, (
-                    lookback_time.isoformat(),  # Target time for comparison
-                    horizon, 
-                    earliest_time.isoformat(), 
-                    latest_time.isoformat()
-                ))
-                predictions = cursor.fetchall()
-                
-                logger.info(f"Found {len(predictions)} {horizon} predictions created {window_config['description']} to evaluate")
-                logger.debug(f"  Search window: {earliest_time.strftime('%H:%M')} to {latest_time.strftime('%H:%M')} (±{window_size})")
-                
-                for pred_row in predictions:
-                    try:
-                        pred_id, crypto, pred_horizon, predicted_price, confidence, target_time_str, created_at_str, time_diff = pred_row
-                        
-                        created_at = pd.to_datetime(created_at_str)
-                        target_time = pd.to_datetime(target_time_str)
-                        
-                        # Get current price as the "actual" price for evaluation
-                        current_price = data_collector.get_crypto_current_price(crypto)
-                        if current_price is None:
-                            logger.warning(f"Could not get current price for {crypto}")
-                            continue
-                        
-                        # Evaluate the prediction (prediction made at created_at, compared to current price)
-                        evaluation = self.evaluate_prediction(
-                            prediction_id=pred_id,
-                            crypto=crypto,
-                            prediction_horizon=pred_horizon,
-                            predicted_price=predicted_price,
-                            actual_price=current_price,
-                            prediction_timestamp=created_at,  # When prediction was made
-                            target_timestamp=now,  # Current time (when we're evaluating)
-                            confidence=confidence
-                        )
-                        
-                        if evaluation:
-                            key = f"{crypto}_{pred_horizon}"
-                            if key not in evaluations:
-                                evaluations[key] = []
-                            evaluations[key].append(evaluation)
-                            evaluated_count += 1
+                # Evaluate each crypto separately to get the closest prediction for each crypto-horizon combination
+                horizon_evaluations = 0
+                for crypto in config.CRYPTOCURRENCIES:
+                    query = '''
+                        SELECT p.id, p.crypto, p.prediction_horizon, p.predicted_price, 
+                               p.confidence, p.datetime as target_time, p.created_at,
+                               ABS(julianday(p.created_at) - julianday(?)) as time_diff_from_target
+                        FROM predictions p
+                        LEFT JOIN prediction_evaluations pe ON p.id = pe.prediction_id
+                        WHERE pe.id IS NULL 
+                        AND p.prediction_horizon = ?
+                        AND p.crypto = ?
+                        AND p.created_at >= ? 
+                        AND p.created_at <= ?
+                        ORDER BY time_diff_from_target ASC, p.created_at DESC
+                        LIMIT 1
+                    '''
+                    
+                    cursor = conn.cursor()
+                    cursor.execute(query, (
+                        lookback_time.isoformat(),  # Target time for comparison
+                        horizon,
+                        crypto,
+                        earliest_time.isoformat(), 
+                        latest_time.isoformat()
+                    ))
+                    prediction = cursor.fetchone()
+                    
+                    if prediction:
+                        horizon_evaluations += 1
+                        try:
+                            pred_id, crypto_name, pred_horizon, predicted_price, confidence, target_time_str, created_at_str, time_diff = prediction
                             
-                            logger.debug(f"✅ Evaluated {crypto} {pred_horizon} prediction: "
-                                       f"predicted ${predicted_price:.2f}, actual ${current_price:.2f}, "
-                                       f"error {evaluation['percent_error']:.2f}%")
+                            created_at = pd.to_datetime(created_at_str)
+                            target_time = pd.to_datetime(target_time_str)
+                            
+                            # Get current price as the "actual" price for evaluation
+                            current_price = data_collector.get_crypto_current_price(crypto)
+                            if current_price is None:
+                                logger.warning(f"Could not get current price for {crypto}")
+                                continue
+                            
+                            # Evaluate the prediction (prediction made at created_at, compared to current price)
+                            evaluation = self.evaluate_prediction(
+                                prediction_id=pred_id,
+                                crypto=crypto,
+                                prediction_horizon=pred_horizon,
+                                predicted_price=predicted_price,
+                                actual_price=current_price,
+                                prediction_timestamp=created_at,  # When prediction was made
+                                target_timestamp=now,  # Current time (when we're evaluating)
+                                confidence=confidence
+                            )
+                            
+                            if evaluation:
+                                key = f"{crypto}_{pred_horizon}"
+                                if key not in evaluations:
+                                    evaluations[key] = []
+                                evaluations[key].append(evaluation)
+                                evaluated_count += 1
+                                
+                                logger.debug(f"✅ Evaluated {crypto} {pred_horizon} prediction: "
+                                           f"predicted ${predicted_price:.2f}, actual ${current_price:.2f}, "
+                                           f"error {evaluation['percent_error']:.2f}%")
+                        
+                        except Exception as e:
+                            logger.error(f"Failed to evaluate individual prediction: {e}")
+                            continue
                 
-                    except Exception as e:
-                        logger.error(f"Failed to evaluate individual prediction: {e}")
-                        continue
+                logger.info(f"Found {horizon_evaluations} {horizon} predictions created {window_config['description']} to evaluate")
+                logger.debug(f"  Search window: {earliest_time.strftime('%H:%M')} to {latest_time.strftime('%H:%M')} (±{window_size})")
             
             conn.close()
             
@@ -332,24 +339,23 @@ class PredictionAccuracyTracker:
             # Determine appropriate evaluation window based on how recent the target time is
             can_use_current_price = False
             
-            # FIXED: More flexible evaluation windows that work with 10-minute prediction schedule
-            # Allow evaluation any time after the minimum required waiting period
+            # Precise evaluation windows that match the batch evaluation logic
             if horizon == '1h':
-                # Evaluate 1h predictions any time 50+ minutes after target (was 55-65 minutes)
-                min_wait_time = 50 * 60  # 50 minutes in seconds
-                max_wait_time = 4 * 60 * 60  # 4 hours max (to avoid stale data)
+                # Evaluate 1h predictions when target is 57-63 minutes ago (±3 minutes)
+                min_wait_time = 57 * 60  # 57 minutes in seconds
+                max_wait_time = 63 * 60  # 63 minutes in seconds
                 if min_wait_time <= time_diff <= max_wait_time:
                     can_use_current_price = True
             elif horizon == '1d':
-                # Evaluate 1d predictions any time 20+ hours after target (was 23-25 hours)
-                min_wait_time = 20 * 60 * 60  # 20 hours in seconds
-                max_wait_time = 48 * 60 * 60  # 48 hours max
+                # Evaluate 1d predictions when target is 23-25 hours ago (±1 hour)
+                min_wait_time = 23 * 60 * 60  # 23 hours in seconds
+                max_wait_time = 25 * 60 * 60  # 25 hours in seconds
                 if min_wait_time <= time_diff <= max_wait_time:
                     can_use_current_price = True
             elif horizon == '1w':
-                # Evaluate 1w predictions any time 6+ days after target (was 6.5-7.5 days)
-                min_wait_time = 6 * 24 * 60 * 60  # 6 days in seconds
-                max_wait_time = 14 * 24 * 60 * 60  # 14 days max
+                # Evaluate 1w predictions when target is 6.5-7.5 days ago (±12 hours)
+                min_wait_time = int(6.5 * 24 * 60 * 60)  # 6.5 days in seconds
+                max_wait_time = int(7.5 * 24 * 60 * 60)  # 7.5 days in seconds
                 if min_wait_time <= time_diff <= max_wait_time:
                     can_use_current_price = True
             
@@ -502,14 +508,22 @@ class PredictionAccuracyTracker:
             
             where_clause = " AND ".join(where_conditions)
             
+            # Deduplicate to avoid counting the same prediction multiple times
             query = f'''
-                SELECT * FROM prediction_evaluations
+                SELECT *, 
+                       ROW_NUMBER() OVER (
+                           PARTITION BY target_timestamp, prediction_horizon, crypto
+                           ORDER BY evaluation_timestamp DESC
+                       ) as rn
+                FROM prediction_evaluations
                 WHERE {where_clause}
-                ORDER BY evaluation_timestamp DESC
             '''
             
             df = pd.read_sql_query(query, conn, params=params)
             conn.close()
+            
+            # Keep only the most recent evaluation for each unique target time + horizon + crypto
+            df = df[df['rn'] == 1].drop('rn', axis=1)
             
             if df.empty:
                 return {}
@@ -551,7 +565,8 @@ class PredictionAccuracyTracker:
         try:
             conn = sqlite3.connect(config.DATABASE_PATH)
             
-            # Use prediction_evaluations table - the single source of truth
+            # Get most recent evaluation for each unique target_timestamp and horizon
+            # This prevents duplicate points on the timeseries plot
             query = '''
                 SELECT 
                     target_timestamp as timestamp,
@@ -562,25 +577,30 @@ class PredictionAccuracyTracker:
                     actual_price,
                     absolute_error,
                     percent_error,
-                    direction_correct
+                    direction_correct,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY target_timestamp, prediction_horizon 
+                        ORDER BY evaluation_timestamp DESC
+                    ) as rn
                 FROM prediction_evaluations
                 WHERE crypto = ? AND evaluation_timestamp >= ?
-                ORDER BY target_timestamp ASC
             '''
             
             params = [crypto, (datetime.now() - timedelta(days=days_back)).isoformat()]
             df = pd.read_sql_query(query, conn, params=params)
             conn.close()
             
-            if df.empty:
-                return pd.DataFrame()
+            # Keep only the most recent evaluation for each target_timestamp + horizon
+            df = df[df['rn'] == 1].drop('rn', axis=1)
             
-            # Convert timestamps to datetime - FIXED: Handle microseconds properly
+            if df.empty:
+                return pd.DataFrame(), {}
+            
+            # Convert timestamps to datetime
             df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
             df['evaluation_timestamp'] = pd.to_datetime(df['evaluation_timestamp'], format='ISO8601')
             
-            # FIXED: Find the most recently evaluated prediction for each horizon BEFORE pivoting
-            # This avoids the "evaluation_timestamp not in index" error
+            # Find the most recently evaluated prediction for each horizon
             latest_evaluations = {}
             for horizon in df['prediction_horizon'].unique():
                 horizon_data = df[df['prediction_horizon'] == horizon]
@@ -593,12 +613,12 @@ class PredictionAccuracyTracker:
                         'percent_error': latest_eval_row['percent_error']
                     }
 
-            # Pivot to get separate columns for each horizon
+            # Now pivot using target_timestamp (for proper x-axis) with no duplicates
             df_pivoted = df.pivot_table(
-                index='timestamp',
+                index='timestamp',  # target_timestamp for proper x-axis timing
                 columns='prediction_horizon', 
                 values=['predicted_price', 'actual_price', 'absolute_error', 'percent_error'],
-                aggfunc='first'  # Take first value if multiple
+                aggfunc='first'  # Should be unique now since we deduplicated
             )
             
             # Flatten column names
@@ -624,7 +644,6 @@ class PredictionAccuracyTracker:
             
             df_pivoted = df_pivoted.rename(columns=rename_map)
             
-            # Store the latest evaluation info for use in plotting (avoiding pandas warning)
             return df_pivoted, latest_evaluations
             
         except Exception as e:
@@ -635,6 +654,7 @@ class PredictionAccuracyTracker:
                                   days_back: int = 30) -> pd.DataFrame:
         """
         Get error distribution data for histogram plotting
+        Deduplicates to show only the most recent evaluation for each unique target time
         """
         try:
             conn = sqlite3.connect(config.DATABASE_PATH)
@@ -655,16 +675,23 @@ class PredictionAccuracyTracker:
             
             where_clause = " AND ".join(where_conditions)
             
+            # Deduplicate to avoid counting the same prediction multiple times
             query = f'''
                 SELECT crypto, prediction_horizon, absolute_error, percent_error, 
-                       direction_correct, evaluation_timestamp
+                       direction_correct, evaluation_timestamp, target_timestamp,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY target_timestamp, prediction_horizon, crypto
+                           ORDER BY evaluation_timestamp DESC
+                       ) as rn
                 FROM prediction_evaluations
                 WHERE {where_clause}
-                ORDER BY evaluation_timestamp DESC
             '''
             
             df = pd.read_sql_query(query, conn, params=params)
             conn.close()
+            
+            # Keep only the most recent evaluation for each unique target time + horizon + crypto
+            df = df[df['rn'] == 1].drop('rn', axis=1)
             
             return df
             
