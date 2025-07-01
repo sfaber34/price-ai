@@ -269,10 +269,83 @@ class CryptoPredictionBot:
                 # Store predictions in database
                 self.store_predictions(predictions)
                 
+                # Update timeseries data for current prices and predictions
+                for crypto in config.CRYPTOCURRENCIES:
+                    try:
+                        current_price = self.data_collector.get_crypto_current_price(crypto)
+                        if current_price:
+                            # Get current predictions for this crypto
+                            current_predictions = {
+                                pred['horizon']: pred['predicted_price'] 
+                                for model_key, pred in predictions.items() 
+                                if pred['crypto'] == crypto
+                            }
+                            
+                            # Update timeseries tracking
+                            self.accuracy_tracker.update_prediction_timeseries(
+                                crypto=crypto,
+                                timestamp=datetime.now(),
+                                actual_price=current_price,
+                                predictions=current_predictions
+                            )
+                            
+                            # Store actual price at target for future evaluations
+                            self.accuracy_tracker.store_actual_price_at_target(
+                                crypto=crypto,
+                                target_timestamp=datetime.now(),
+                                actual_price=current_price
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to update timeseries for {crypto}: {e}")
+                
                 # Display current predictions
                 self.display_predictions(predictions)
                 
-                # Display evaluation of past predictions
+                # FIXED: Evaluate mature predictions RIGHT BEFORE displaying evaluation table
+                logger.info("Checking for mature predictions to evaluate...")
+                try:
+                    evaluations = self.accuracy_tracker.batch_evaluate_mature_predictions(self.data_collector)
+                    if evaluations:
+                        total_evaluated = sum(len(evals) for evals in evaluations.values())
+                        logger.info(f"✅ Automatically evaluated {total_evaluated} mature predictions")
+                        
+                        # Debug: Show what was evaluated
+                        for key, evals in evaluations.items():
+                            logger.info(f"   - {key}: {len(evals)} evaluations")
+                    else:
+                        logger.info("No predictions ready for evaluation yet")
+                        
+                        # Debug: Check how many unevaluated predictions exist
+                        try:
+                            conn = sqlite3.connect(config.DATABASE_PATH)
+                            query = '''
+                                SELECT p.crypto, p.prediction_horizon, COUNT(*) as count,
+                                       MIN(p.created_at) as oldest, MAX(p.created_at) as newest
+                                FROM predictions p
+                                LEFT JOIN prediction_evaluations pe ON p.id = pe.prediction_id
+                                WHERE pe.id IS NULL
+                                GROUP BY p.crypto, p.prediction_horizon
+                                ORDER BY p.crypto, p.prediction_horizon
+                            '''
+                            df = pd.read_sql_query(query, conn)
+                            conn.close()
+                            
+                            if not df.empty:
+                                logger.info("📋 Unevaluated predictions waiting:")
+                                for _, row in df.iterrows():
+                                    oldest_time = pd.to_datetime(row['oldest'])
+                                    time_waiting = datetime.now() - oldest_time
+                                    logger.info(f"   - {row['crypto']} {row['prediction_horizon']}: {row['count']} predictions "
+                                              f"(oldest waiting {time_waiting.total_seconds()/3600:.1f}h)")
+                            else:
+                                logger.info("   - No unevaluated predictions in database")
+                        except Exception as debug_e:
+                            logger.warning(f"Debug query failed: {debug_e}")
+                            
+                except Exception as e:
+                    logger.warning(f"Automatic accuracy evaluation failed: {e}")
+                
+                # Display evaluation of past predictions (now with fresh evaluations)
                 self.display_prediction_evaluation()
                 
                 logger.info(f"Generated {len(predictions)} predictions")
@@ -433,14 +506,15 @@ class CryptoPredictionBot:
                 
                 # Define evaluation windows that match the prediction horizons
                 can_evaluate = False
-                if horizon == '1h' and timedelta(minutes=55) <= time_since_created <= timedelta(minutes=65):
-                    # Evaluate 1h predictions made 55-65 minutes ago
+                # FIXED: More flexible evaluation windows that work with 10-minute prediction schedule
+                if horizon == '1h' and time_since_created >= timedelta(minutes=50):
+                    # Evaluate 1h predictions any time 50+ minutes after creation (was 55-65 minutes)
                     can_evaluate = True
-                elif horizon == '1d' and timedelta(hours=22) <= time_since_created <= timedelta(hours=26):
-                    # Evaluate 1d predictions made 22h to 26h ago
+                elif horizon == '1d' and time_since_created >= timedelta(hours=20):
+                    # Evaluate 1d predictions any time 20+ hours after creation (was 22-26 hours)
                     can_evaluate = True
-                elif horizon == '1w' and timedelta(days=6) <= time_since_created <= timedelta(days=8):
-                    # Evaluate 1w predictions made 6-8 days ago
+                elif horizon == '1w' and time_since_created >= timedelta(days=6):
+                    # Evaluate 1w predictions any time 6+ days after creation (was 6-8 days)
                     can_evaluate = True
                 
                 # Only evaluate if within the time window and we have current price
@@ -478,95 +552,148 @@ class CryptoPredictionBot:
     
     def display_prediction_evaluation(self):
         """
-        Display evaluation of past predictions
+        Display evaluation of prediction accuracy
         """
-        evaluations = self.evaluate_past_predictions()
-        
-        if not evaluations:
-            return
-        
-        print("\n" + "="*80)
-        print("📊 PREDICTION ACCURACY EVALUATION")
-        print("="*80)
-        print("How well did past predictions perform?")
-        
-        for crypto in config.CRYPTOCURRENCIES:
-            has_data = False
-            crypto_evals = {}
+        try:
+            conn = sqlite3.connect(config.DATABASE_PATH)
             
-            # Collect evaluations for this crypto
-            for horizon in ['1h', '1d', '1w']:
-                key = f"{crypto}_{horizon}"
-                if key in evaluations and evaluations[key]:
-                    # Find the prediction closest to the ideal timing
-                    if horizon == '1h':
-                        ideal_time = timedelta(hours=1)
-                    elif horizon == '1d':
-                        ideal_time = timedelta(days=1)
-                    elif horizon == '1w':
-                        ideal_time = timedelta(weeks=1)
-                    
-                    # Find prediction with time_elapsed closest to ideal_time
-                    best_eval = min(evaluations[key], 
-                                  key=lambda x: abs(x['time_elapsed'] - ideal_time))
-                    crypto_evals[horizon] = best_eval
-                    has_data = True
+            # Get recent prediction evaluations
+            query = '''
+                SELECT 
+                    crypto,
+                    prediction_horizon,
+                    predicted_price,
+                    actual_price,
+                    absolute_error,
+                    percent_error,
+                    direction_correct,
+                    confidence,
+                    prediction_timestamp,
+                    target_timestamp,
+                    evaluation_timestamp
+                FROM prediction_evaluations 
+                WHERE evaluation_timestamp >= datetime('now', '-7 days')
+                ORDER BY evaluation_timestamp DESC
+            '''
             
-            if has_data:
+            df = pd.read_sql_query(query, conn)
+            conn.close()
+            
+            if df.empty:
+                print("\n📊 No prediction evaluations available yet")
+                print("    Predictions need time to mature before evaluation")
+                return
+            
+            print("\n" + "="*80)
+            print("📊 PREDICTION ACCURACY EVALUATION")
+            print("="*80)
+            
+            # Group by crypto
+            for crypto in config.CRYPTOCURRENCIES:
+                crypto_data = df[df['crypto'] == crypto]
+                
+                if crypto_data.empty:
+                    continue
+                
                 # Use distinctive emojis for each crypto
                 if crypto == 'bitcoin':
-                    crypto_emoji = "₿"  # Bitcoin symbol
+                    crypto_emoji = "₿"
                 elif crypto == 'ethereum':
-                    crypto_emoji = "♦️ "  # Diamond (ETH is often called digital diamond)
+                    crypto_emoji = "♦️ "
                 else:
-                    crypto_emoji = "📈"  # Default for other cryptos
+                    crypto_emoji = "📈"
                 
                 print(f"\n{crypto_emoji} {crypto.upper()} - PREDICTION vs ACTUAL")
                 print("-" * 100)
-                print(f"{'Time':>4} | {'Predicted':>10} | {'Actual':>10} | {'Error $':>8} | {'% Error':>9} | {'After':>8} | {'Result':>6} | Confidence")
+                print(f"{'Time':>4} | {'Predicted':>10} | {'Actual':>10} | {'Error $':>8} | {'% Error':>9} | {'Direction':>9} | {'Result':>6} | Confidence")
                 print("-" * 100)
                 
+                # Get latest evaluation for each horizon
                 for horizon in ['1h', '1d', '1w']:
-                    if horizon in crypto_evals:
-                        eval_data = crypto_evals[horizon]
+                    horizon_data = crypto_data[crypto_data['prediction_horizon'] == horizon]
+                    
+                    if not horizon_data.empty:
+                        total_evals = len(horizon_data)
                         
-                        # Calculate accuracy metrics
-                        predicted_price = eval_data['predicted_price']
-                        actual_price = eval_data['actual_price']
-                        dollar_error = abs(predicted_price - actual_price)
-                        price_accuracy = dollar_error / actual_price * 100
-                        confidence = eval_data['confidence']
-                        time_elapsed = eval_data['time_elapsed']
+                        # Get the most recent evaluation for this horizon
+                        latest = horizon_data.iloc[0]
+                        latest_eval_time = pd.to_datetime(latest['evaluation_timestamp'])
                         
-                        # Format time elapsed
-                        if time_elapsed.days > 0:
-                            time_str = f"{time_elapsed.days}d {time_elapsed.seconds//3600}h"
-                        elif time_elapsed.seconds >= 3600:
-                            time_str = f"{time_elapsed.seconds//3600}h {(time_elapsed.seconds%3600)//60}m"
-                        else:
-                            time_str = f"{time_elapsed.seconds//60}m"
+                        predicted_price = latest['predicted_price']
+                        actual_price = latest['actual_price']
+                        dollar_error = latest['absolute_error']
+                        percent_error = latest['percent_error']
+                        direction_correct = latest['direction_correct']
+                        confidence = latest['confidence']
                         
-                        # Determine if prediction was good
-                        if price_accuracy <= 2.0:
+                        # Direction indicator
+                        direction_emoji = "🟢" if direction_correct else "🔴"
+                        direction_text = "✓" if direction_correct else "✗"
+                        
+                        # Determine if prediction was good based on percent error
+                        if percent_error <= 2.0:
                             accuracy_emoji = "🎯"  # Excellent
-                        elif price_accuracy <= 5.0:
+                        elif percent_error <= 5.0:
                             accuracy_emoji = "✅"  # Good
-                        elif price_accuracy <= 10.0:
+                        elif percent_error <= 10.0:
                             accuracy_emoji = "⚠️"   # Fair
                         else:
                             accuracy_emoji = "❌"  # Poor
                         
-                        confidence_stars = "⭐" * int(confidence * 5)
+                        confidence_stars = "⭐" * int(confidence * 5) if confidence else ""
+                        
+                        # Calculate how long ago this evaluation was done
+                        time_since_eval = datetime.now() - latest_eval_time
+                        if time_since_eval < timedelta(minutes=1):
+                            eval_age = "just now"
+                        elif time_since_eval < timedelta(hours=1):
+                            eval_age = f"{int(time_since_eval.total_seconds()/60)}m ago"
+                        elif time_since_eval < timedelta(days=1):
+                            eval_age = f"{int(time_since_eval.total_seconds()/3600)}h ago"
+                        else:
+                            eval_age = f"{int(time_since_eval.total_seconds()/86400)}d ago"
                         
                         print(f"  {horizon.upper():>3} | "
                               f"${predicted_price:>9.2f} | "
                               f"${actual_price:>9.2f} | "
                               f"${dollar_error:>7.2f} | "
-                              f"{price_accuracy:>7.3f}% | "
-                              f"{time_str:>8} | "
-                              f"{accuracy_emoji:>6} | {confidence_stars}")
-        
-        print("\n" + "="*80)
+                              f"{percent_error:>7.2f}% | "
+                              f"{direction_emoji} {direction_text:>6} | "
+                              f"{accuracy_emoji:>6} | {confidence_stars} ({total_evals} evals, latest {eval_age})")
+            
+            # Individual crypto summaries
+            if not df.empty:
+                print("\n" + "="*80)
+                print("📊 ACCURACY SUMMARY BY CRYPTOCURRENCY")
+                print("="*80)
+                
+                for crypto in config.CRYPTOCURRENCIES:
+                    crypto_data = df[df['crypto'] == crypto]
+                    
+                    if not crypto_data.empty:
+                        avg_error = crypto_data['percent_error'].mean()
+                        direction_accuracy = crypto_data['direction_correct'].mean() * 100
+                        total_evals = len(crypto_data)
+                        
+                        # Use distinctive emojis for each crypto
+                        if crypto == 'bitcoin':
+                            crypto_emoji = "₿"
+                        elif crypto == 'ethereum':
+                            crypto_emoji = "♦️ "
+                        else:
+                            crypto_emoji = "📈"
+                        
+                        print(f"{crypto_emoji} {crypto.upper()}")
+                        print(f"   • Total Evaluations: {total_evals}")
+                        print(f"   • Average Error: {avg_error:.2f}%")
+                        print(f"   • Direction Accuracy: {direction_accuracy:.1f}%")
+                        print()
+                
+                print("="*80)
+            
+        except Exception as e:
+            logger.error(f"Prediction evaluation display failed: {e}")
+            print(f"\n❌ Error displaying evaluations: {e}")
     
     def evaluate_and_track_accuracy(self):
         """
@@ -633,18 +760,19 @@ class CryptoPredictionBot:
             
             for horizon in config.PREDICTION_INTERVALS:
                 # Define time windows for when predictions can be compared to current prices
+                # FIXED: More flexible evaluation windows that work with 10-minute prediction schedule
                 if horizon == '1h':
-                    # Compare 1h predictions made 55-65 minutes ago
-                    min_age = timedelta(minutes=55)
-                    max_age = timedelta(minutes=65)
+                    # Compare 1h predictions made 50+ minutes ago (was 55-65 minutes)
+                    min_age = timedelta(minutes=50)
+                    max_age = timedelta(hours=4)  # Up to 4 hours old
                 elif horizon == '1d':
-                    # Compare 1d predictions made 22h to 26h ago  
-                    min_age = timedelta(hours=22)
-                    max_age = timedelta(hours=26)
+                    # Compare 1d predictions made 20+ hours ago (was 22-26 hours)
+                    min_age = timedelta(hours=20)
+                    max_age = timedelta(hours=48)  # Up to 48 hours old
                 elif horizon == '1w':
-                    # Compare 1w predictions made 6-8 days ago
+                    # Compare 1w predictions made 6+ days ago (was 6-8 days)
                     min_age = timedelta(days=6)
-                    max_age = timedelta(days=8)
+                    max_age = timedelta(days=14)  # Up to 14 days old
                 else:
                     continue
                 
@@ -727,7 +855,6 @@ class CryptoPredictionBot:
         # Set up variables for tracking other scheduled tasks
         last_price_update = datetime.now()
         last_model_training = datetime.now()
-        last_accuracy_evaluation = datetime.now()
         last_prediction_run = datetime.now() - timedelta(minutes=15)  # Initialize to 15 min ago
         
         logger.info(f"Bot started - Predictions every 10 minutes at clock boundaries (XX:00, XX:10, XX:20, etc.)")
@@ -757,10 +884,7 @@ class CryptoPredictionBot:
                         self.update_current_prices()
                         last_price_update = now
                     
-                    # Evaluate accuracy every hour (at XX:00)
-                    if current_minute == 0:
-                        self.evaluate_and_track_accuracy()
-                        last_accuracy_evaluation = now
+                    # NOTE: Accuracy evaluation now happens automatically in generate_predictions()
                     
                     # Check if model retraining is needed (every N hours)
                     hours_since_training = (now - last_model_training).total_seconds() / 3600
@@ -783,8 +907,7 @@ class CryptoPredictionBot:
         """
         logger.info("Running bot once...")
         self.train_models()
-        self.generate_predictions()
-        self.evaluate_and_track_accuracy()
+        self.generate_predictions()  # Now includes automatic accuracy evaluation
         
         # Generate accuracy report
         accuracy_report = self.accuracy_tracker.generate_accuracy_report(days_back=7)

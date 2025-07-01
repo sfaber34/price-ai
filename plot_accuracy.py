@@ -125,20 +125,52 @@ def show_accuracy_summary():
     print("\n" + "="*80)
     print("PREDICTION ACCURACY SUMMARY")
     print("="*80)
+    print("Note: Predictions can only be evaluated after their target time:")
+    print("  • 1H predictions: evaluated 1 hour after prediction")
+    print("  • 1D predictions: evaluated 1 day after prediction") 
+    print("  • 1W predictions: evaluated 1 week after prediction")
+    print("-" * 80)
+    
+    overall_has_data = False
     
     for crypto in config.CRYPTOCURRENCIES:
         print(f"\n🔸 {crypto.upper()}")
         print("-" * 40)
         
+        crypto_has_data = False
         for horizon in config.PREDICTION_INTERVALS:
             metrics = tracker.calculate_accuracy_metrics(crypto=crypto, horizon=horizon, days_back=7)
             
             if metrics and metrics.get('total_predictions', 0) > 0:
-                print(f"  {horizon.upper()}: {metrics['total_predictions']} predictions")
+                crypto_has_data = True
+                overall_has_data = True
+                print(f"  {horizon.upper()}: {metrics['total_predictions']} evaluations")
                 print(f"    Mean Error: {metrics['mean_percent_error']:.2f}%")
                 print(f"    Direction Accuracy: {metrics['direction_accuracy']:.1%}")
             else:
-                print(f"  {horizon.upper()}: No data")
+                # Check if we have any predictions stored but not yet mature for evaluation
+                # This gives more helpful feedback
+                if horizon == '1h':
+                    time_needed = "1 hour"
+                elif horizon == '1d':
+                    time_needed = "1 day"
+                elif horizon == '1w':
+                    time_needed = "1 week"
+                else:
+                    time_needed = "target time"
+                    
+                print(f"  {horizon.upper()}: No mature evaluations yet")
+                print(f"    (Requires {time_needed} to pass after prediction)")
+        
+        if not crypto_has_data:
+            print(f"    📍 No mature evaluations available for {crypto} yet")
+    
+    if not overall_has_data:
+        print(f"\n⏳ IMPORTANT: No mature prediction evaluations are available yet.")
+        print(f"   This is normal if the model has been running for less than:")
+        print(f"   • 1 hour (for 1H predictions)")
+        print(f"   • 1 day (for 1D predictions)")
+        print(f"   • 1 week (for 1W predictions)")
     
     print("\n" + "="*80)
 
