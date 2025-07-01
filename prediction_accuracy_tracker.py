@@ -908,17 +908,49 @@ class PredictionAccuracyTracker:
             plt.subplot(2, 2, 4)
             error_data = self.get_error_distribution_data(crypto, days_back=days_back)
             if not error_data.empty:
-                plt.hist(error_data['percent_error'], bins=30, alpha=0.7, edgecolor='black')
+                # Calculate appropriate bin edges for percent error
+                percent_errors = error_data['percent_error']
+                min_err = percent_errors.min()
+                max_err = percent_errors.max()
+                
+                # Create nice round bin edges
+                range_err = max_err - min_err
+                if range_err < 0.1:
+                    bin_width = 0.01  # Very precise for small ranges
+                elif range_err < 1:
+                    bin_width = 0.1
+                elif range_err < 5:
+                    bin_width = 0.25
+                elif range_err < 10:
+                    bin_width = 0.5
+                else:
+                    bin_width = 1.0
+                
+                # Round bin edges to nice numbers
+                start_bin = np.floor(min_err / bin_width) * bin_width
+                end_bin = np.ceil(max_err / bin_width) * bin_width
+                bins_percent = np.arange(start_bin, end_bin + bin_width, bin_width)
+                
+                n, bins, patches = plt.hist(percent_errors, bins=bins_percent, alpha=0.7, 
+                                          edgecolor='black', align='mid')
+                
                 plt.title(f'{crypto.upper()} - Error Distribution')
                 plt.xlabel('Percent Error (%)')
                 plt.ylabel('Frequency')
                 plt.grid(True, alpha=0.3)
                 
-                # Add mean line for reference
-                mean_error = error_data['percent_error'].mean()
-                plt.axvline(mean_error, color='red', linestyle='--', alpha=0.8, linewidth=2)
-                plt.text(mean_error, plt.ylim()[1]*0.8, f'Mean: {mean_error:.2f}%', 
-                        rotation=90, verticalalignment='bottom', fontweight='bold')
+                # Add percentile lines
+                q25 = percent_errors.quantile(0.25)
+                q50 = percent_errors.quantile(0.50)  # median
+                q75 = percent_errors.quantile(0.75)
+                
+                plt.axvline(q25, color='blue', linestyle='--', alpha=0.7, linewidth=1.5)
+                plt.axvline(q50, color='red', linestyle='--', alpha=0.8, linewidth=2)
+                plt.axvline(q75, color='blue', linestyle='--', alpha=0.7, linewidth=1.5)
+                
+                plt.text(0.98, 0.95, f'Mean: {percent_errors.mean():.2f}%\nStd: {percent_errors.std():.2f}%\nN: {len(percent_errors)}',
+                        transform=plt.gca().transAxes, verticalalignment='top', horizontalalignment='right',
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
             else:
                 plt.text(0.5, 0.5, 'No evaluations\navailable for histogram', 
                          horizontalalignment='center', verticalalignment='center',
@@ -958,7 +990,47 @@ class PredictionAccuracyTracker:
                 
                 # Percent error histogram
                 plt.subplot(2, n_horizons, i + 1)
-                plt.hist(horizon_data['percent_error'], bins=30, alpha=0.7, edgecolor='black')
+                
+                if not horizon_data.empty:
+                    # Calculate appropriate bin edges for percent error
+                    percent_errors = horizon_data['percent_error']
+                    min_err = percent_errors.min()
+                    max_err = percent_errors.max()
+                    
+                    # Create nice round bin edges
+                    range_err = max_err - min_err
+                    if range_err < 0.1:
+                        bin_width = 0.01  # Very precise for small ranges
+                    elif range_err < 1:
+                        bin_width = 0.1
+                    elif range_err < 5:
+                        bin_width = 0.25
+                    elif range_err < 10:
+                        bin_width = 0.5
+                    else:
+                        bin_width = 1.0
+                    
+                    # Round bin edges to nice numbers
+                    start_bin = np.floor(min_err / bin_width) * bin_width
+                    end_bin = np.ceil(max_err / bin_width) * bin_width
+                    bins_percent = np.arange(start_bin, end_bin + bin_width, bin_width)
+                    
+                    n, bins, patches = plt.hist(percent_errors, bins=bins_percent, alpha=0.7, 
+                                              edgecolor='black', align='mid')
+                    
+                    # Add percentile lines
+                    q25 = percent_errors.quantile(0.25)
+                    q50 = percent_errors.quantile(0.50)  # median
+                    q75 = percent_errors.quantile(0.75)
+                    
+                    plt.axvline(q25, color='blue', linestyle='--', alpha=0.7, linewidth=1.5)
+                    plt.axvline(q50, color='red', linestyle='--', alpha=0.8, linewidth=2)
+                    plt.axvline(q75, color='blue', linestyle='--', alpha=0.7, linewidth=1.5)
+                    
+                    plt.text(0.98, 0.95, f'Mean: {percent_errors.mean():.2f}%\nStd: {percent_errors.std():.2f}%\nN: {len(percent_errors)}',
+                            transform=plt.gca().transAxes, verticalalignment='top', horizontalalignment='right',
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+                
                 plt.title(f'{horizon.upper()} - Percent Error Distribution')
                 plt.xlabel('Percent Error (%)')
                 plt.ylabel('Frequency')
@@ -966,7 +1038,47 @@ class PredictionAccuracyTracker:
                 
                 # Absolute error histogram
                 plt.subplot(2, n_horizons, i + 1 + n_horizons)
-                plt.hist(horizon_data['absolute_error'], bins=30, alpha=0.7, edgecolor='black')
+                
+                if not horizon_data.empty:
+                    # Calculate appropriate bin edges for absolute error
+                    abs_errors = horizon_data['absolute_error']
+                    min_err = abs_errors.min()
+                    max_err = abs_errors.max()
+                    
+                    # Create nice round bin edges for dollar amounts
+                    range_err = max_err - min_err
+                    if range_err < 10:
+                        bin_width = 1  # $1 bins for small ranges
+                    elif range_err < 100:
+                        bin_width = 5  # $5 bins
+                    elif range_err < 500:
+                        bin_width = 25  # $25 bins
+                    elif range_err < 1000:
+                        bin_width = 50  # $50 bins
+                    else:
+                        bin_width = 100  # $100 bins for large ranges
+                    
+                    # Round bin edges to nice numbers
+                    start_bin = np.floor(min_err / bin_width) * bin_width
+                    end_bin = np.ceil(max_err / bin_width) * bin_width
+                    bins_abs = np.arange(start_bin, end_bin + bin_width, bin_width)
+                    
+                    n, bins, patches = plt.hist(abs_errors, bins=bins_abs, alpha=0.7, 
+                                              edgecolor='black', align='mid')
+                    
+                    # Add percentile lines
+                    q25 = abs_errors.quantile(0.25)
+                    q50 = abs_errors.quantile(0.50)  # median
+                    q75 = abs_errors.quantile(0.75)
+                    
+                    plt.axvline(q25, color='blue', linestyle='--', alpha=0.7, linewidth=1.5)
+                    plt.axvline(q50, color='red', linestyle='--', alpha=0.8, linewidth=2)
+                    plt.axvline(q75, color='blue', linestyle='--', alpha=0.7, linewidth=1.5)
+                    
+                    plt.text(0.98, 0.95, f'Mean: ${abs_errors.mean():.0f}\nStd: ${abs_errors.std():.0f}\nN: {len(abs_errors)}',
+                            transform=plt.gca().transAxes, verticalalignment='top', horizontalalignment='right',
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+                
                 plt.title(f'{horizon.upper()} - Absolute Error Distribution')
                 plt.xlabel('Absolute Error (USD)')
                 plt.ylabel('Frequency')
