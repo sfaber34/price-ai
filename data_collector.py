@@ -133,99 +133,22 @@ class DataCollector:
 
     def get_traditional_markets_data(self, days: int = 30) -> pd.DataFrame:
         """
-        Get traditional market data using yfinance (free)
+        Disabled: traditional market data (stocks, bonds, forex) comes at 1h resolution
+        and is forward-filled to match 15m crypto bars, producing 4 identical rows per hour.
+        Rolling correlations over such synthetic data are spurious and hurt model accuracy.
+        Returns empty DataFrame so the rest of the pipeline is unaffected.
         """
-        all_data = []
-        
-        try:
-            # Calculate date range
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
-            
-            # Collect all traditional market data
-            all_symbols = []
-            for category, symbols in config.TRADITIONAL_MARKETS.items():
-                all_symbols.extend(symbols)
-            
-            for symbol in all_symbols:
-                try:
-                    ticker = yf.Ticker(symbol)
-                    # Yahoo Finance limits 15m data to the last 60 days.
-                    # Traditional markets are auxiliary features, so use 1h interval
-                    # which supports up to 730 days of history.
-                    hist = ticker.history(start=start_date, end=end_date, interval='1h')
-                    
-                    if not hist.empty:
-                        df = hist.reset_index()
-                        df['symbol'] = symbol
-                        df['datetime'] = df['Datetime']
-                        # Ensure timezone-naive datetimes
-                        if hasattr(df['datetime'].dtype, 'tz') and df['datetime'].dt.tz is not None:
-                            df['datetime'] = df['datetime'].dt.tz_localize(None)
-                        df = df[['datetime', 'symbol', 'Open', 'High', 'Low', 'Close', 'Volume']]
-                        all_data.append(df)
-                        
-                except Exception as e:
-                    logger.warning(f"Could not fetch {symbol}: {e}")
-                    continue
-            
-            if all_data:
-                combined_df = pd.concat(all_data, ignore_index=True)
-                logger.info(f"Collected traditional market data for {len(all_symbols)} symbols")
-                return combined_df
-            else:
-                return pd.DataFrame()
-                
-        except Exception as e:
-            logger.error(f"Error collecting traditional market data: {e}")
-            return pd.DataFrame()
+        logger.info("Traditional market data collection disabled for 15m predictions (too coarse)")
+        return pd.DataFrame()
 
     def get_economic_indicators(self) -> pd.DataFrame:
         """
-        Get economic indicators from FRED API (requires free API key)
+        Disabled: FRED economic indicators (Fed Funds rate, CPI, GDP, unemployment) are
+        published monthly/quarterly and have no predictive signal at 15m/1h/4h horizons.
+        Returns empty DataFrame so the rest of the pipeline is unaffected.
         """
-        if not config.FRED_API_KEY:
-            logger.warning("FRED API key not provided, skipping economic indicators")
-            return pd.DataFrame()
-        
-        all_data = []
-        
-        try:
-            for indicator_name, series_id in config.FRED_SERIES.items():
-                self._rate_limit('fred', config.RATE_LIMITS['fred'])
-                
-                params = {
-                    'series_id': series_id,
-                    'api_key': config.FRED_API_KEY,
-                    'file_type': 'json',
-                    'observation_start': (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'),
-                    'observation_end': datetime.now().strftime('%Y-%m-%d')
-                }
-                
-                response = self.session.get(config.FRED_BASE_URL, params=params)
-                response.raise_for_status()
-                
-                data = response.json()
-                observations = data.get('observations', [])
-                
-                if observations:
-                    df = pd.DataFrame(observations)
-                    df['indicator'] = indicator_name
-                    df['datetime'] = pd.to_datetime(df['date'])
-                    df['value'] = pd.to_numeric(df['value'], errors='coerce')
-                    df = df[['datetime', 'indicator', 'value']].dropna()
-                    all_data.append(df)
-            
-            if all_data:
-                combined_df = pd.concat(all_data, ignore_index=True)
-                logger.info(f"Collected economic indicators: {list(config.FRED_SERIES.keys())}")
-                return combined_df
-            else:
-                return pd.DataFrame()
-                
-        except Exception as e:
-            logger.error(f"Error collecting economic indicators: {e}")
-            return pd.DataFrame()
+        logger.info("Economic indicator collection disabled for 15m predictions (monthly/quarterly frequency)")
+        return pd.DataFrame()
 
     def get_crypto_current_price(self, crypto_id: str) -> Optional[float]:
         """Get current price for quick updates using Yahoo Finance as primary source"""

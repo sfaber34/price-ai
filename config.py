@@ -23,33 +23,25 @@ PREDICTION_INTERVALS = ['15m', '1h', '4h']
 UPDATE_FREQUENCY_MINUTES = 5
 
 # Technical Indicators Settings
+# Windows are tuned for 15-minute bars (1 period = 15 minutes):
+#   4 periods = 1h, 8 = 2h, 20 = 5h, 48 = 12h
 TECHNICAL_INDICATORS = {
-    'sma_windows': [7, 14, 30, 50],
-    'ema_windows': [7, 14, 30],
-    'rsi_window': 14,
-    'macd_fast': 12,
-    'macd_slow': 26,
-    'macd_signal': 9,
-    'bollinger_window': 20,
+    'sma_windows': [4, 8, 20, 48],
+    'ema_windows': [4, 8, 20],
+    'rsi_window': 7,        # ~1.75h — fast RSI appropriate for 15m momentum
+    'macd_fast': 5,
+    'macd_slow': 12,
+    'macd_signal': 4,
+    'bollinger_window': 20, # 5h window
     'bollinger_std': 2
 }
 
-# Traditional Market Symbols (Yahoo Finance)
-TRADITIONAL_MARKETS = {
-    'stocks': ['^GSPC', '^IXIC', '^DJI'],  # S&P 500, NASDAQ, Dow Jones
-    'bonds': ['^TNX'],  # 10-year Treasury
-    'commodities': ['GC=F', 'SI=F'],  # Gold, Silver
-    'forex': ['DX-Y.NYB'],  # Dollar Index
-    'volatility': ['^VIX']  # VIX
-}
-
-# FRED Economic Indicators
-FRED_SERIES = {
-    'interest_rates': 'FEDFUNDS',
-    'inflation': 'CPIAUCSL',
-    'gdp': 'GDP',
-    'unemployment': 'UNRATE'
-}
+# Traditional market and macro data are NOT used for 15m/1h/4h predictions:
+# - Traditional markets trade at 1h resolution — too coarse for intraday crypto
+# - FRED indicators are monthly/quarterly — irrelevant for sub-4h prediction
+# These configs are kept for reference but the collection methods are disabled.
+TRADITIONAL_MARKETS = {}
+FRED_SERIES = {}
 
 # Model Configuration
 MODEL_SETTINGS = {
@@ -69,6 +61,4 @@ MODEL_SETTINGS = {
 RATE_LIMITS = {
     'coingecko': 30,  # calls per minute
     'alpha_vantage': 5,  # calls per minute
-    'fred': 120,  # calls per minute
-    'news_api': 1000  # calls per day
 } 
