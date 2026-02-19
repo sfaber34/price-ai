@@ -33,103 +33,113 @@ class DataCollector:
                 time.sleep(sleep_time)
         self.last_api_call[api_name] = current_time
 
-    def get_crypto_data(self, crypto_id: str, days: int = 30) -> pd.DataFrame:
-        """
-        Get cryptocurrency data at 15-minute intervals.
-        Primary source: yfinance (supports 15m intervals up to 60 days back).
-        Fallback: CoinGecko hourly data resampled to 15m.
-        """
-        # yfinance only supports 15m data for up to 60 days
-        days = min(days, 59)
+    # Binance.US public REST endpoints — no API key required
+    # (api.binance.com returns HTTP 451 for US IPs; binance.us is the US-accessible endpoint)
+    _BINANCE_BASE    = 'https://api.binance.us/api/v3'
+    _BINANCE_SYMBOLS = {'bitcoin': 'BTCUSDT', 'ethereum': 'ETHUSDT'}
 
-        crypto_symbols = {
-            'bitcoin': 'BTC-USD',
-            'ethereum': 'ETH-USD'
-        }
+    def get_crypto_data(self, crypto_id: str, days: int = 365) -> pd.DataFrame:
+        """
+        Fetch 15-minute OHLCV bars from Binance (no API key required).
 
-        # Primary: yfinance with 15-minute intervals
-        if crypto_id in crypto_symbols:
+        Key advantage over yfinance:
+          - No 60-day history cap — years of data available.
+          - Includes taker_buy_base_vol and taker_sell_base_vol per bar,
+            which are the raw inputs for Volume Delta / CVD — the most
+            informative short-term directional feature available.
+
+        Returned columns:
+            datetime, crypto,
+            open, high, low, price (=close),
+            volume, quote_volume, num_trades,
+            taker_buy_base_vol, taker_sell_base_vol
+        """
+        if crypto_id not in self._BINANCE_SYMBOLS:
+            logger.error(f"Unknown crypto_id '{crypto_id}'. Supported: {list(self._BINANCE_SYMBOLS)}")
+            return pd.DataFrame()
+
+        symbol   = self._BINANCE_SYMBOLS[crypto_id]
+        end_ms   = int(datetime.now().timestamp() * 1000)
+        start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+
+        all_klines: list = []
+        current_start = start_ms
+
+        logger.info(f"Fetching {days}d of 15m bars for {crypto_id} from Binance…")
+
+        while current_start < end_ms:
             try:
-                symbol = crypto_symbols[crypto_id]
-                ticker = yf.Ticker(symbol)
+                resp = self.session.get(
+                    f"{self._BINANCE_BASE}/klines",
+                    params={
+                        'symbol':    symbol,
+                        'interval':  '15m',
+                        'startTime': current_start,
+                        'endTime':   end_ms,
+                        'limit':     1000,
+                    },
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                klines = resp.json()
 
-                end_date = datetime.now()
-                # Yahoo Finance limits 15m interval to the last 60 days
-                effective_days = min(days, 59)
-                start_date = end_date - timedelta(days=effective_days)
+                if not klines:
+                    break
 
-                hist = ticker.history(start=start_date, end=end_date, interval='15m')
+                all_klines.extend(klines)
+                current_start = klines[-1][6] + 1   # advance past last bar's close_time
 
-                if not hist.empty:
-                    df = hist.reset_index()
-                    df = df.rename(columns={
-                        'Datetime': 'datetime',
-                        'Close': 'price',
-                        'Volume': 'volume'
-                    })
-                    df['crypto'] = crypto_id
-                    df['market_cap'] = df['price'] * 1000000  # Approximation
-                    df = df[['datetime', 'crypto', 'price', 'market_cap', 'volume']]
+                if len(klines) < 1000:
+                    break   # reached present, no more pages
 
-                    # Ensure timezone-naive datetimes
-                    if hasattr(df['datetime'].dtype, 'tz') and df['datetime'].dt.tz is not None:
-                        df['datetime'] = df['datetime'].dt.tz_localize(None)
-
-                    logger.info(f"Collected {len(df)} 15m records for {crypto_id} from Yahoo Finance")
-                    return df
+                time.sleep(0.05)    # stay well under 1200 req/min limit
 
             except Exception as e:
-                logger.warning(f"Yahoo Finance 15m failed for {crypto_id}: {e}")
+                logger.error(f"Binance fetch error for {crypto_id}: {e}")
+                break
 
-        # Fallback: CoinGecko hourly data (resample to 15m via ffill)
-        try:
-            self._rate_limit('coingecko', config.RATE_LIMITS['coingecko'])
+        if not all_klines:
+            logger.error(f"No data returned from Binance for {crypto_id}")
+            return pd.DataFrame()
 
-            simple_url = f"{config.COINGECKO_BASE_URL}/simple/price"
-            simple_params = {
-                'ids': crypto_id,
-                'vs_currencies': 'usd',
-                'include_market_cap': 'true',
-                'include_24hr_vol': 'true'
-            }
+        # Binance kline layout (positional):
+        #  0 open_time  1 open  2 high  3 low  4 close  5 volume
+        #  6 close_time  7 quote_vol  8 num_trades
+        #  9 taker_buy_base_vol  10 taker_buy_quote_vol  11 ignore
+        kline_cols = [
+            'open_time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_volume', 'num_trades',
+            'taker_buy_base_vol', 'taker_buy_quote_vol', '_ignore',
+        ]
+        df = pd.DataFrame(all_klines, columns=kline_cols)
 
-            simple_response = self.session.get(simple_url, params=simple_params)
-            if simple_response.status_code == 200:
-                url = f"{config.COINGECKO_BASE_URL}/coins/{crypto_id}/market_chart"
-                params = {
-                    'vs_currency': 'usd',
-                    'days': min(days, 30),
-                    'interval': 'hourly'
-                }
+        df['datetime'] = pd.to_datetime(df['open_time'], unit='ms')
+        for col in ['open', 'high', 'low', 'close', 'volume',
+                    'quote_volume', 'taker_buy_base_vol']:
+            df[col] = pd.to_numeric(df[col])
+        df['num_trades'] = pd.to_numeric(df['num_trades'])
 
-                response = self.session.get(url, params=params)
-                if response.status_code == 200:
-                    data = response.json()
+        # Taker sell = total − taker buy
+        df['taker_sell_base_vol'] = df['volume'] - df['taker_buy_base_vol']
+        df = df.rename(columns={'close': 'price'})
+        df['crypto'] = crypto_id
 
-                    df = pd.DataFrame({
-                        'timestamp': [item[0] for item in data['prices']],
-                        'price': [item[1] for item in data['prices']],
-                        'market_cap': [item[1] for item in data['market_caps']],
-                        'volume': [item[1] for item in data['total_volumes']]
-                    })
+        keep = [
+            'datetime', 'crypto',
+            'open', 'high', 'low', 'price',
+            'volume', 'quote_volume', 'num_trades',
+            'taker_buy_base_vol', 'taker_sell_base_vol',
+        ]
+        df = (df[keep]
+              .drop_duplicates('datetime')
+              .sort_values('datetime')
+              .reset_index(drop=True))
 
-                    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-                    df['crypto'] = crypto_id
-                    df = df.drop('timestamp', axis=1)
-
-                    # Resample hourly CoinGecko data to 15-minute intervals via ffill
-                    df = df.set_index('datetime')
-                    df_15m = df.resample('15min').ffill()
-                    df_15m = df_15m.reset_index()
-
-                    logger.info(f"Collected {len(df_15m)} 15m records for {crypto_id} from CoinGecko (resampled)")
-                    return df_15m
-
-        except Exception as e:
-            logger.warning(f"CoinGecko fallback failed for {crypto_id}: {e}")
-
-        logger.error(f"All data sources failed for {crypto_id}")
-        return pd.DataFrame()
+        logger.info(
+            f"Collected {len(df)} 15m bars for {crypto_id} "
+            f"({df['datetime'].min().date()} → {df['datetime'].max().date()})"
+        )
+        return df
 
     def get_traditional_markets_data(self, days: int = 30) -> pd.DataFrame:
         """
@@ -151,44 +161,20 @@ class DataCollector:
         return pd.DataFrame()
 
     def get_crypto_current_price(self, crypto_id: str) -> Optional[float]:
-        """Get current price for quick updates using Yahoo Finance as primary source"""
-        # First try Yahoo Finance (more reliable, no rate limits)
+        """Get the latest trade price from Binance ticker (no API key required)."""
+        if crypto_id not in self._BINANCE_SYMBOLS:
+            logger.error(f"Unknown crypto_id '{crypto_id}'")
+            return None
         try:
-            crypto_symbols = {
-                'bitcoin': 'BTC-USD',
-                'ethereum': 'ETH-USD'
-            }
-            
-            if crypto_id in crypto_symbols:
-                symbol = crypto_symbols[crypto_id]
-                ticker = yf.Ticker(symbol)
-                
-                # Get the latest price
-                hist = ticker.history(period='1d', interval='1m')
-                if not hist.empty:
-                    latest_price = hist['Close'].iloc[-1]
-                    return float(latest_price)
+            resp = self.session.get(
+                f"{self._BINANCE_BASE}/ticker/price",
+                params={'symbol': self._BINANCE_SYMBOLS[crypto_id]},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            return float(resp.json()['price'])
         except Exception as e:
-            logger.warning(f"Yahoo Finance failed for {crypto_id}: {e}")
-        
-        # Fallback to CoinGecko if Yahoo Finance fails
-        try:
-            self._rate_limit('coingecko', config.RATE_LIMITS['coingecko'])
-            
-            url = f"{config.COINGECKO_BASE_URL}/simple/price"
-            params = {
-                'ids': crypto_id,
-                'vs_currencies': 'usd'
-            }
-            
-            response = self.session.get(url, params=params)
-            response.raise_for_status()
-            
-            data = response.json()
-            return data.get(crypto_id, {}).get('usd')
-            
-        except Exception as e:
-            logger.error(f"Error getting current price for {crypto_id}: {e}")
+            logger.error(f"Binance price fetch failed for {crypto_id}: {e}")
             return None
 
 def initialize_database():

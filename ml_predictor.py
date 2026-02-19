@@ -7,7 +7,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split, TimeSeriesSplit, cross_val_score
 from sklearn.metrics import mean_squared_error, mean_absolute_error, accuracy_score, classification_report
 from sklearn.preprocessing import StandardScaler
-from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.feature_selection import SelectKBest, f_classif
 import xgboost as xgb
 import joblib
 import logging
@@ -95,23 +95,23 @@ class CryptoPredictionModel:
     
     def feature_selection(self, X: pd.DataFrame, y: pd.Series, k: int = 50) -> pd.DataFrame:
         """
-        Select top k features using statistical tests
+        Select top k features using f_classif — selects features most informative
+        for the direction target (UP/DOWN), not for return magnitude.
         """
         selector_key = f"{self.prediction_horizon}_selector"
-        
+
         if selector_key not in self.feature_selectors:
-            selector = SelectKBest(score_func=f_regression, k=min(k, X.shape[1]))
+            selector = SelectKBest(score_func=f_classif, k=min(k, X.shape[1]))
             X_selected = selector.fit_transform(X, y)
             self.feature_selectors[selector_key] = selector
-            
+
             selected_features = X.columns[selector.get_support()].tolist()
-            logger.info(f"Selected {len(selected_features)} features for {self.prediction_horizon}")
-            
+            logger.info(f"Selected {len(selected_features)} features for {self.prediction_horizon}: {selected_features[:10]}...")
         else:
             selector = self.feature_selectors[selector_key]
             X_selected = selector.transform(X)
             selected_features = X.columns[selector.get_support()].tolist()
-        
+
         return pd.DataFrame(X_selected, columns=selected_features, index=X.index)
     
     def scale_features(self, X: pd.DataFrame, fit: bool = False) -> pd.DataFrame:
@@ -296,138 +296,115 @@ class CryptoPredictionModel:
     
     def train(self, df: pd.DataFrame) -> Dict:
         """
-        Main training pipeline
+        Train a direction classifier for the given horizon.
+        Feature selection uses f_classif against the binary direction target so
+        the 50 chosen features are the ones that actually predict UP/DOWN, not
+        return magnitude.
         """
-        logger.info(f"Training model for {self.crypto_name} - {self.prediction_horizon}")
-        
-        # Define target columns based on prediction horizon
-        target_mapping = {
-            '15m': ('target_return_15m', 'target_direction_15m'),
-            '1h':  ('target_return_1h',  'target_direction_1h'),
-            '4h':  ('target_return_4h',  'target_direction_4h')
+        logger.info(f"Training direction classifier for {self.crypto_name} - {self.prediction_horizon}")
+
+        clf_target_map = {
+            '15m': 'target_direction_15m',
+            '1h':  'target_direction_1h',
+            '4h':  'target_direction_4h',
         }
-        
-        if self.prediction_horizon not in target_mapping:
+
+        if self.prediction_horizon not in clf_target_map:
             raise ValueError(f"Invalid prediction horizon: {self.prediction_horizon}")
-        
-        regression_target, classification_target = target_mapping[self.prediction_horizon]
-        
-        # Prepare data - ensure same samples for both targets
-        # Remove rows with NaN in either target
-        clean_df = df.dropna(subset=[regression_target, classification_target]).copy()
-        
+
+        classification_target = clf_target_map[self.prediction_horizon]
+
+        clean_df = df.dropna(subset=[classification_target]).copy()
         if clean_df.empty:
-            raise ValueError(f"No valid data available for targets {regression_target}, {classification_target}")
-        
-        X, y_reg = self.prepare_data(clean_df, regression_target)
-        _, y_clf = self.prepare_data(clean_df, classification_target)
-        
-        # Feature selection
-        X_selected = self.feature_selection(X, y_reg, k=config.MODEL_SETTINGS['feature_selection_k'])
-        
-        # Scale features
+            raise ValueError(f"No valid data for target {classification_target}")
+
+        # Prepare features and direction target together
+        X, y_clf = self.prepare_data(clean_df, classification_target)
+
+        # Feature selection driven by direction target
+        X_selected = self.feature_selection(X, y_clf, k=config.MODEL_SETTINGS['feature_selection_k'])
+
+        # Scale
         X_scaled = self.scale_features(X_selected, fit=True)
-        
-        # Train models
-        regression_results = self.train_xgboost_regressor(X_scaled, y_reg)
+
+        # Train classifier only
         classification_results = self.train_xgboost_classifier(X_scaled, y_clf)
-        
-        # Store training metadata
+
         training_info = {
             'timestamp': datetime.now(),
             'crypto': self.crypto_name,
             'horizon': self.prediction_horizon,
             'training_samples': len(X),
             'features_used': len(X_scaled.columns),
-            'regression_results': regression_results,
-            'classification_results': classification_results
+            'classification_results': classification_results,
         }
-        
+
         self.training_history.append(training_info)
-        
-        logger.info(f"Training complete for {self.crypto_name} - {self.prediction_horizon}")
+        logger.info(
+            f"Classifier trained — {self.crypto_name} {self.prediction_horizon} | "
+            f"CV acc: {classification_results['cv_accuracy_mean']:.3f} | "
+            f"train acc: {classification_results['train_accuracy']:.3f}"
+        )
         return training_info
     
     def predict(self, df: pd.DataFrame) -> Dict:
         """
-        Make predictions using trained models
+        Predict direction (UP=1 / DOWN=0) for the latest bar.
+        Returns direction, raw up-probability, and confidence (distance from 0.5).
         """
         if not self.models:
             raise ValueError("No trained models available. Please train first.")
-        
+
         try:
-            # Get latest data point
             latest_data = df.iloc[[-1]].copy()
-            
-            # Prepare features
+
             exclude_cols = [
                 'datetime', 'crypto', 'target_15m', 'target_1h', 'target_4h',
                 'target_return_15m', 'target_return_1h', 'target_return_4h',
                 'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
-                'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h'
+                'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h',
             ]
-            
-            X = latest_data[[col for col in latest_data.columns if col not in exclude_cols]].fillna(0)
-            
-            # Apply feature selection and scaling
+
+            X = latest_data[[c for c in latest_data.columns if c not in exclude_cols]].fillna(0)
+
             selector = self.feature_selectors[f"{self.prediction_horizon}_selector"]
             X_selected = pd.DataFrame(
-                selector.transform(X), 
-                columns=X.columns[selector.get_support()], 
-                index=X.index
+                selector.transform(X),
+                columns=X.columns[selector.get_support()],
+                index=X.index,
             )
-            
+
             scaler = self.scalers[f"{self.prediction_horizon}_scaler"]
             X_scaled = pd.DataFrame(
                 scaler.transform(X_selected),
                 columns=X_selected.columns,
-                index=X_selected.index
+                index=X_selected.index,
             )
-            
-            # Make predictions
-            regressor = self.models[f"{self.prediction_horizon}_xgb_regressor"]
+
             classifier = self.models[f"{self.prediction_horizon}_xgb_classifier"]
-            
-            # Price return prediction
-            predicted_return = regressor.predict(X_scaled)[0]
-            
-            # Direction prediction
-            direction_prob = classifier.predict_proba(X_scaled)[0, 1]  # Probability of price going up
+            direction_prob = classifier.predict_proba(X_scaled)[0, 1]  # P(UP)
             predicted_direction = int(direction_prob > 0.5)
-            
-            # Current price for absolute price prediction
+
             current_price = latest_data['price'].iloc[0]
-            predicted_price = current_price * (1 + predicted_return / 100)
-            
-            # CRITICAL FIX: Use target datetime instead of feature datetime
-            # This represents WHEN the prediction is valid, not when it was made
+
             feature_datetime = latest_data['datetime'].iloc[0]
             if isinstance(feature_datetime, str):
                 feature_datetime = pd.to_datetime(feature_datetime)
-            
-            # Calculate target datetime based on prediction horizon
-            if self.prediction_horizon == '15m':
-                target_datetime = feature_datetime + pd.Timedelta(minutes=15)
-            elif self.prediction_horizon == '1h':
-                target_datetime = feature_datetime + pd.Timedelta(hours=1)
-            elif self.prediction_horizon == '4h':
-                target_datetime = feature_datetime + pd.Timedelta(hours=4)
-            else:
-                target_datetime = feature_datetime  # Fallback
-            
+
+            offsets = {'15m': pd.Timedelta(minutes=15), '1h': pd.Timedelta(hours=1), '4h': pd.Timedelta(hours=4)}
+            target_datetime = feature_datetime + offsets.get(self.prediction_horizon, pd.Timedelta(0))
+
             return {
-                'timestamp': target_datetime,  # FIXED: Now points to prediction target time
-                'feature_timestamp': feature_datetime,  # When the features were from
+                'timestamp': target_datetime,
+                'feature_timestamp': feature_datetime,
                 'crypto': self.crypto_name,
                 'horizon': self.prediction_horizon,
                 'current_price': current_price,
-                'predicted_price': predicted_price,
-                'predicted_return': predicted_return,
-                'predicted_direction': predicted_direction,
-                'direction_confidence': direction_prob,
-                'model_confidence': max(direction_prob, 1 - direction_prob)  # Distance from 0.5
+                'predicted_direction': predicted_direction,   # 1 = UP, 0 = DOWN
+                'direction_prob': direction_prob,             # raw P(UP), 0-1
+                'model_confidence': max(direction_prob, 1 - direction_prob),  # distance from 0.5
             }
-            
+
         except Exception as e:
             logger.error(f"Prediction error for {self.crypto_name} - {self.prediction_horizon}: {e}")
             return None

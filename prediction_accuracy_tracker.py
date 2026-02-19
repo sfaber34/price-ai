@@ -154,10 +154,11 @@ class PredictionAccuracyTracker:
         Evaluate a single prediction and store the results
         """
         try:
-            # Calculate error metrics
-            absolute_error = abs(predicted_price - actual_price)
-            percent_error = (absolute_error / actual_price) * 100 if actual_price != 0 else 0
-            squared_error = (predicted_price - actual_price) ** 2
+            # predicted_price now stores direction_prob (P(UP), range 0–1), not a price.
+            # Price error metrics are meaningless; direction accuracy is the signal.
+            absolute_error = 0.0
+            percent_error = 0.0
+            squared_error = 0.0
             
             # Direction accuracy - compare predicted vs actual price DIRECTION from the price
             # at the time the prediction was made (start_price).
@@ -213,8 +214,8 @@ class PredictionAccuracyTracker:
                 conn.close()
                 
                 if start_price is not None:
-                    # Calculate direction: did the price go up or down from start_price?
-                    predicted_direction = 1 if predicted_price > start_price else 0  # 1=up, 0=down
+                    # predicted_price is direction_prob (P(UP)) — threshold at 0.5
+                    predicted_direction = 1 if predicted_price > 0.5 else 0  # 1=up, 0=down
                     actual_direction = 1 if actual_price > start_price else 0
                     direction_predicted = predicted_direction
                     direction_actual = actual_direction
@@ -520,64 +521,15 @@ class PredictionAccuracyTracker:
             pred_1h = predictions.get('1h') if predictions else None    # Always allow 1h predictions
             pred_4h = predictions.get('4h') if predictions and time_running >= timedelta(hours=4) else None
             
-            # Only calculate errors for predictions made at the appropriate time in the past
+            # Direction accuracy is tracked via prediction_evaluations (batch_evaluate_mature_predictions).
+            # predicted_price_Xm columns store direction_prob (0–1), not prices, so price-error
+            # computations are meaningless here — leave all error columns NULL.
             error_15m = None
             error_1h = None
             error_4h = None
             percent_error_15m = None
             percent_error_1h = None
             percent_error_4h = None
-            
-            # Get mature predictions from the appropriate time windows
-            now = timestamp
-            
-            # Check for 15m predictions made ~15 minutes ago that can now be evaluated
-            if pred_15m is not None:
-                fifteen_min_ago = now - timedelta(minutes=15)
-                cursor.execute('''
-                    SELECT predicted_price_15m FROM prediction_timeseries
-                    WHERE crypto = ? AND 
-                          ABS(julianday(timestamp) - julianday(?)) < (3.0/1440.0)  -- within 3 minutes
-                    ORDER BY ABS(julianday(timestamp) - julianday(?))
-                    LIMIT 1
-                ''', (crypto, fifteen_min_ago.isoformat(), fifteen_min_ago.isoformat()))
-                result = cursor.fetchone()
-                if result and result[0] is not None:
-                    old_pred_15m = result[0]
-                    error_15m = abs(old_pred_15m - actual_price)
-                    percent_error_15m = (error_15m / actual_price * 100) if actual_price != 0 else None
-            
-            # Check for 1h predictions made ~1 hour ago that can now be evaluated
-            if pred_1h is not None:
-                hour_ago = now - timedelta(hours=1)
-                cursor.execute('''
-                    SELECT predicted_price_1h FROM prediction_timeseries
-                    WHERE crypto = ? AND 
-                          ABS(julianday(timestamp) - julianday(?)) < (10.0/1440.0)  -- within 10 minutes
-                    ORDER BY ABS(julianday(timestamp) - julianday(?))
-                    LIMIT 1
-                ''', (crypto, hour_ago.isoformat(), hour_ago.isoformat()))
-                result = cursor.fetchone()
-                if result and result[0] is not None:
-                    old_pred_1h = result[0]
-                    error_1h = abs(old_pred_1h - actual_price)
-                    percent_error_1h = (error_1h / actual_price * 100) if actual_price != 0 else None
-            
-            # Check for 4h predictions made ~4 hours ago that can now be evaluated
-            if pred_4h is not None:
-                four_hours_ago = now - timedelta(hours=4)
-                cursor.execute('''
-                    SELECT predicted_price_4h FROM prediction_timeseries
-                    WHERE crypto = ? AND 
-                          ABS(julianday(timestamp) - julianday(?)) < (15.0/1440.0)  -- within 15 minutes
-                    ORDER BY ABS(julianday(timestamp) - julianday(?))
-                    LIMIT 1
-                ''', (crypto, four_hours_ago.isoformat(), four_hours_ago.isoformat()))
-                result = cursor.fetchone()
-                if result and result[0] is not None:
-                    old_pred_4h = result[0]
-                    error_4h = abs(old_pred_4h - actual_price)
-                    percent_error_4h = (error_4h / actual_price * 100) if actual_price != 0 else None
             
             # Store data with properly calculated errors (or NULL if not ready for evaluation)
             # Only store prediction values for horizons where sufficient time has passed
@@ -643,27 +595,21 @@ class PredictionAccuracyTracker:
             if df.empty:
                 return {}
             
-            # Calculate metrics
+            # Calculate metrics — direction accuracy is the primary signal
+            # (predicted_price column now stores direction_prob; price error fields are 0)
             metrics = {
                 'total_predictions': len(df),
-                'mean_absolute_error': df['absolute_error'].mean(),
-                'median_absolute_error': df['absolute_error'].median(),
-                'mean_percent_error': df['percent_error'].mean(),
-                'median_percent_error': df['percent_error'].median(),
-                'std_percent_error': df['percent_error'].std(),
-                'root_mean_squared_error': np.sqrt((df['absolute_error'] ** 2).mean()),
                 'direction_accuracy': df['direction_correct'].mean(),
-                'min_error': df['absolute_error'].min(),
-                'max_error': df['absolute_error'].max(),
-                'percent_error_percentiles': {
-                    '1st': df['percent_error'].quantile(0.01),
-                    '10th': df['percent_error'].quantile(0.10),
-                    '25th': df['percent_error'].quantile(0.25),
-                    '50th': df['percent_error'].quantile(0.50),  # median
-                    '75th': df['percent_error'].quantile(0.75),
-                    '90th': df['percent_error'].quantile(0.90),
-                    '99th': df['percent_error'].quantile(0.99)
-                }
+                'avg_confidence': df['confidence'].mean() if 'confidence' in df.columns else 0.0,
+                # Keep legacy price-error keys at 0 so callers that read them don't crash
+                'mean_absolute_error': 0.0,
+                'median_absolute_error': 0.0,
+                'mean_percent_error': 0.0,
+                'median_percent_error': 0.0,
+                'std_percent_error': 0.0,
+                'root_mean_squared_error': 0.0,
+                'min_error': 0.0,
+                'max_error': 0.0,
             }
             
             return metrics
@@ -901,18 +847,9 @@ class PredictionAccuracyTracker:
                 if metrics and metrics.get('total_predictions', 0) > 0:
                     crypto_has_data = True
                     report.append(f"\n  ⏱️  {horizon.upper()} Predictions:")
-                    report.append(f"    Total Predictions: {metrics['total_predictions']}")
-                    report.append(f"    Mean Absolute Error: ${metrics['mean_absolute_error']:.2f}")
-                    report.append(f"    Mean Percent Error: {metrics['mean_percent_error']:.2f}%")
+                    report.append(f"    Total Evaluated: {metrics['total_predictions']}")
                     report.append(f"    Direction Accuracy: {metrics['direction_accuracy']:.2%}")
-                    report.append(f"    RMSE: ${metrics['root_mean_squared_error']:.2f}")
-                    report.append(f"    Error Range: ${metrics['min_error']:.2f} - ${metrics['max_error']:.2f}")
-                    
-                    # Add percentile information
-                    percentiles = metrics['percent_error_percentiles']
-                    report.append(f"    Percent Error Percentiles:")
-                    report.append(f"      1st: {percentiles['1st']:.2f}%   10th: {percentiles['10th']:.2f}%   25th: {percentiles['25th']:.2f}%")
-                    report.append(f"     50th: {percentiles['50th']:.2f}%   75th: {percentiles['75th']:.2f}%   90th: {percentiles['90th']:.2f}%   99th: {percentiles['99th']:.2f}%")
+                    report.append(f"    Avg Confidence:     {metrics['avg_confidence']:.2%}")
                 else:
                     report.append(f"\n  ⏱️  {horizon.upper()} Predictions: No data available")
             
@@ -1001,112 +938,32 @@ class PredictionAccuracyTracker:
                 return
             
             plt.figure(figsize=(15, 10))
-            
-            # Use matplotlib's default color cycle for consistent colors
-            
-            # Plot actual vs predicted prices
+
+            # subplot 1: direction prob signal over time (from prediction_timeseries)
             plt.subplot(2, 2, 1)
-            if 'actual_price' in df.columns:
-                plt.plot(df.index, df['actual_price'], label='Actual Price', linewidth=2, color='black')
-            
-            if has_15m_data and 'predicted_price_15m' in df.columns:
-                plt.plot(df.index, df['predicted_price_15m'], label='15m Prediction', alpha=0.8, color='#1f77b4')  # blue
-            if has_1h_data and 'predicted_price_1h' in df.columns:
-                plt.plot(df.index, df['predicted_price_1h'], label='1h Prediction', alpha=0.8, color='#ff7f0e')   # orange
-            if has_4h_data and 'predicted_price_4h' in df.columns:
-                plt.plot(df.index, df['predicted_price_4h'], label='4h Prediction', alpha=0.8, color='#2ca02c')   # green
-            
-            plt.title(f'{crypto.upper()} - Actual vs Predicted Prices')
-            plt.xlabel('Time')
-            plt.ylabel('Price (USD)')
-            plt.legend()
-            self._format_time_axis(plt.gca(), days_back)
-            
-            # Plot absolute errors
+            horizon_colors = {'15m': '#1f77b4', '1h': '#ff7f0e', '4h': '#2ca02c'}
+            plotted_prob = False
+            for horizon_key, col in [('15m', 'predicted_price_15m'), ('1h', 'predicted_price_1h'), ('4h', 'predicted_price_4h')]:
+                if col in df.columns:
+                    prob_data = df[col].dropna()
+                    if not prob_data.empty:
+                        plt.plot(prob_data.index, prob_data, label=f'P(UP) {horizon_key}',
+                                 alpha=0.7, color=horizon_colors[horizon_key])
+                        plotted_prob = True
+            if plotted_prob:
+                plt.axhline(0.5, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+                plt.title(f'{crypto.upper()} — P(UP) Signal Over Time')
+                plt.ylabel('P(UP) direction probability')
+                plt.ylim(0, 1)
+                plt.legend()
+                self._format_time_axis(plt.gca(), days_back)
+            else:
+                plt.text(0.5, 0.5, 'No signal data yet', ha='center', va='center',
+                         transform=plt.gca().transAxes)
+                plt.title(f'{crypto.upper()} — P(UP) Signal (Not Available Yet)')
+
+            # subplot 2: rolling direction accuracy per horizon
             plt.subplot(2, 2, 2)
-            plotted_any_errors = False
-            if has_15m_data and 'error_15m' in df.columns:
-                error_data = df['error_15m'].dropna()
-                if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='15m Error', alpha=0.8, color='#1f77b4')
-                    plotted_any_errors = True
-            if has_1h_data and 'error_1h' in df.columns:
-                error_data = df['error_1h'].dropna()
-                if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='1h Error', alpha=0.8, color='#ff7f0e')
-                    plotted_any_errors = True
-            if has_4h_data and 'error_4h' in df.columns:
-                error_data = df['error_4h'].dropna()
-                if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='4h Error', alpha=0.8, color='#2ca02c')
-                    plotted_any_errors = True
-            
-            if plotted_any_errors:
-                plt.title(f'{crypto.upper()} - Absolute Errors Over Time')
-                plt.xlabel('Time')
-                plt.ylabel('Absolute Error (USD)')
-                plt.legend()
-                self._format_time_axis(plt.gca(), days_back)
-            else:
-                plt.text(0.5, 0.5, 'No error data available yet', 
-                         horizontalalignment='center', verticalalignment='center',
-                         transform=plt.gca().transAxes)
-                plt.title(f'{crypto.upper()} - Absolute Errors (Not Available Yet)')
-            
-            # Plot percent errors
-            plt.subplot(2, 2, 3)
-            plotted_any_percent_errors = False
-            if has_15m_data and 'percent_error_15m' in df.columns:
-                error_data = df['percent_error_15m'].dropna()
-                if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='15m Error %', alpha=0.8, color='#1f77b4')
-                    plotted_any_percent_errors = True
-                    
-                    if '15m' in latest_evaluations:
-                        latest_info = latest_evaluations['15m']
-                        latest_val = latest_info['percent_error']
-                        latest_target_time = latest_info['target_timestamp']
-                        plt.annotate(f'{latest_val:.2f}%',
-                                   xy=(latest_target_time, latest_val),
-                                   xytext=(10, 10), textcoords='offset points',
-                                   bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7),
-                                   fontsize=9, fontweight='bold')
-            if has_1h_data and 'percent_error_1h' in df.columns:
-                error_data = df['percent_error_1h'].dropna()
-                if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='1h Error %', alpha=0.8, color='#ff7f0e')
-                    plotted_any_percent_errors = True
-                    
-                    # Use pre-computed latest evaluation data
-                    if '1h' in latest_evaluations:
-                        latest_info = latest_evaluations['1h']
-                        latest_val = latest_info['percent_error']
-                        latest_target_time = latest_info['target_timestamp']
-                        plt.annotate(f'{latest_val:.2f}%', 
-                                   xy=(latest_target_time, latest_val),
-                                   xytext=(10, 10), textcoords='offset points',
-                                   bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7),
-                                   fontsize=9, fontweight='bold')
-            if has_4h_data and 'percent_error_4h' in df.columns:
-                error_data = df['percent_error_4h'].dropna()
-                if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='4h Error %', alpha=0.8, color='#2ca02c')
-                    plotted_any_percent_errors = True
-            
-            if plotted_any_percent_errors:
-                plt.title(f'{crypto.upper()} - Percent Errors Over Time')
-                plt.xlabel('Time')
-                plt.ylabel('Percent Error (%)')
-                plt.legend()
-                self._format_time_axis(plt.gca(), days_back)
-            else:
-                plt.text(0.5, 0.5, 'No percent error data available yet', 
-                         horizontalalignment='center', verticalalignment='center',
-                         transform=plt.gca().transAxes)
-                plt.title(f'{crypto.upper()} - Percent Errors (Not Available Yet)')
-            
-            # Plot directional accuracy over time
-            plt.subplot(2, 2, 4)
             direction_data = self.get_directional_accuracy_data(crypto, days_back=days_back)
             if not direction_data.empty:
                 # Plot directional accuracy for each horizon
@@ -1151,11 +1008,72 @@ class PredictionAccuracyTracker:
                              transform=plt.gca().transAxes)
                     plt.title(f'{crypto.upper()} - Directional Accuracy (Not Available Yet)')
             else:
-                plt.text(0.5, 0.5, 'No directional accuracy\ndata available yet', 
+                plt.text(0.5, 0.5, 'No directional accuracy\ndata available yet',
                          horizontalalignment='center', verticalalignment='center',
                          transform=plt.gca().transAxes)
                 plt.title(f'{crypto.upper()} - Directional Accuracy (Not Available Yet)')
-            
+
+            # subplot 3: overall direction accuracy bar chart per horizon
+            plt.subplot(2, 2, 3)
+            if not direction_data.empty:
+                bar_horizons, bar_accs, bar_counts = [], [], []
+                for horizon in ['15m', '1h', '4h']:
+                    hd = direction_data[direction_data['prediction_horizon'] == horizon]
+                    if not hd.empty:
+                        bar_horizons.append(horizon.upper())
+                        bar_accs.append(hd['direction_correct'].mean() * 100)
+                        bar_counts.append(len(hd))
+                if bar_horizons:
+                    colors = ['#1f77b4', '#ff7f0e', '#2ca02c'][:len(bar_horizons)]
+                    bars = plt.bar(bar_horizons, bar_accs, color=colors, alpha=0.7, edgecolor='black')
+                    plt.axhline(50, color='red', linestyle='--', alpha=0.6, linewidth=1.5, label='Random (50%)')
+                    for bar, acc, count in zip(bars, bar_accs, bar_counts):
+                        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                                 f'{acc:.1f}%\n(n={count})', ha='center', va='bottom', fontsize=9)
+                    plt.ylim(0, 110)
+                    plt.ylabel('Direction Accuracy (%)')
+                    plt.legend()
+                    plt.title(f'{crypto.upper()} - Accuracy by Horizon')
+                else:
+                    plt.text(0.5, 0.5, 'No data yet', ha='center', va='center',
+                             transform=plt.gca().transAxes)
+                    plt.title(f'{crypto.upper()} - Accuracy by Horizon (Not Available Yet)')
+            else:
+                plt.text(0.5, 0.5, 'No data yet', ha='center', va='center',
+                         transform=plt.gca().transAxes)
+                plt.title(f'{crypto.upper()} - Accuracy by Horizon (Not Available Yet)')
+
+            # subplot 4: confidence distribution
+            plt.subplot(2, 2, 4)
+            try:
+                conn_conf = sqlite3.connect(config.DATABASE_PATH)
+                conf_query = '''
+                    SELECT prediction_horizon, confidence FROM prediction_evaluations
+                    WHERE crypto = ? AND evaluation_timestamp >= ?
+                '''
+                conf_df = pd.read_sql_query(conf_query, conn_conf, params=[
+                    crypto, (datetime.now() - timedelta(days=days_back)).isoformat()
+                ])
+                conn_conf.close()
+                if not conf_df.empty:
+                    for horizon, color in [('15m', '#1f77b4'), ('1h', '#ff7f0e'), ('4h', '#2ca02c')]:
+                        hd = conf_df[conf_df['prediction_horizon'] == horizon]['confidence']
+                        if not hd.empty:
+                            plt.hist(hd, bins=20, alpha=0.5, label=horizon.upper(), color=color)
+                    plt.axvline(0.5, color='gray', linestyle='--', alpha=0.5)
+                    plt.xlabel('Model Confidence')
+                    plt.ylabel('Frequency')
+                    plt.title(f'{crypto.upper()} - Confidence Distribution')
+                    plt.legend()
+                else:
+                    plt.text(0.5, 0.5, 'No confidence data yet', ha='center', va='center',
+                             transform=plt.gca().transAxes)
+                    plt.title(f'{crypto.upper()} - Confidence Distribution (Not Available Yet)')
+            except Exception:
+                plt.text(0.5, 0.5, 'Confidence data unavailable', ha='center', va='center',
+                         transform=plt.gca().transAxes)
+                plt.title(f'{crypto.upper()} - Confidence Distribution')
+
             plt.tight_layout()
             
             if save_path:
@@ -1169,130 +1087,83 @@ class PredictionAccuracyTracker:
     
     def plot_error_histograms(self, crypto: str = None, days_back: int = 30, save_path: str = None):
         """
-        Create histogram plots of prediction errors
+        Plot direction accuracy broken down by confidence bucket (calibration chart).
+        Higher-confidence predictions should be correct more often — this shows whether that holds.
         """
         try:
-            df = self.get_error_distribution_data(crypto, days_back=days_back)
-            
+            conn = sqlite3.connect(config.DATABASE_PATH)
+            where = "WHERE evaluation_timestamp >= ?"
+            params = [(datetime.now() - timedelta(days=days_back)).isoformat()]
+            if crypto:
+                where += " AND crypto = ?"
+                params.append(crypto)
+
+            df = pd.read_sql_query(
+                f"SELECT crypto, prediction_horizon, confidence, direction_correct FROM prediction_evaluations {where}",
+                conn, params=params
+            )
+            conn.close()
+
             if df.empty:
-                logger.warning("No error data available for histogram")
+                logger.warning("No evaluation data available for calibration chart")
                 return
-            
-            plt.figure(figsize=(15, 10))
-            
-            # Group by horizon
-            horizons = df['prediction_horizon'].unique()
+
+            horizons = [h for h in ['15m', '1h', '4h'] if h in df['prediction_horizon'].unique()]
             n_horizons = len(horizons)
-            
+            if n_horizons == 0:
+                return
+
+            plt.figure(figsize=(6 * n_horizons, 5))
+
+            conf_bins = [0.5, 0.55, 0.60, 0.65, 0.70, 0.80, 1.01]
+            bin_labels = ['50-55%', '55-60%', '60-65%', '65-70%', '70-80%', '>80%']
+
             for i, horizon in enumerate(horizons):
-                horizon_data = df[df['prediction_horizon'] == horizon]
-                
-                # Percent error histogram
-                plt.subplot(2, n_horizons, i + 1)
-                
-                if not horizon_data.empty:
-                    # Calculate appropriate bin edges for percent error
-                    percent_errors = horizon_data['percent_error']
-                    min_err = percent_errors.min()
-                    max_err = percent_errors.max()
-                    
-                    # Create nice round bin edges
-                    range_err = max_err - min_err
-                    if range_err < 0.1:
-                        bin_width = 0.01  # Very precise for small ranges
-                    elif range_err < 1:
-                        bin_width = 0.1
-                    elif range_err < 5:
-                        bin_width = 0.25
-                    elif range_err < 10:
-                        bin_width = 0.5
-                    else:
-                        bin_width = 1.0
-                    
-                    # Round bin edges to nice numbers
-                    start_bin = np.floor(min_err / bin_width) * bin_width
-                    end_bin = np.ceil(max_err / bin_width) * bin_width
-                    bins_percent = np.arange(start_bin, end_bin + bin_width, bin_width)
-                    
-                    n, bins, patches = plt.hist(percent_errors, bins=bins_percent, alpha=0.7, 
-                                              edgecolor='black', align='mid')
-                    
-                    # Add percentile lines
-                    q25 = percent_errors.quantile(0.25)
-                    q50 = percent_errors.quantile(0.50)  # median
-                    q75 = percent_errors.quantile(0.75)
-                    
-                    plt.axvline(q25, color='blue', linestyle='--', alpha=0.7, linewidth=1.5)
-                    plt.axvline(q50, color='red', linestyle='--', alpha=0.8, linewidth=2)
-                    plt.axvline(q75, color='blue', linestyle='--', alpha=0.7, linewidth=1.5)
-                    
-                    plt.text(0.98, 0.95, f'Mean: {percent_errors.mean():.2f}%\nStd: {percent_errors.std():.2f}%\nN: {len(percent_errors)}',
-                            transform=plt.gca().transAxes, verticalalignment='top', horizontalalignment='right',
-                            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
-                
-                plt.title(f'{horizon.upper()} - Percent Error Distribution')
-                plt.xlabel('Percent Error (%)')
-                plt.ylabel('Frequency')
-                plt.grid(True, alpha=0.3)
-                
-                # Absolute error histogram
-                plt.subplot(2, n_horizons, i + 1 + n_horizons)
-                
-                if not horizon_data.empty:
-                    # Calculate appropriate bin edges for absolute error
-                    abs_errors = horizon_data['absolute_error']
-                    min_err = abs_errors.min()
-                    max_err = abs_errors.max()
-                    
-                    # Create nice round bin edges for dollar amounts
-                    range_err = max_err - min_err
-                    if range_err < 10:
-                        bin_width = 1  # $1 bins for small ranges
-                    elif range_err < 100:
-                        bin_width = 5  # $5 bins
-                    elif range_err < 500:
-                        bin_width = 25  # $25 bins
-                    elif range_err < 1000:
-                        bin_width = 50  # $50 bins
-                    else:
-                        bin_width = 100  # $100 bins for large ranges
-                    
-                    # Round bin edges to nice numbers
-                    start_bin = np.floor(min_err / bin_width) * bin_width
-                    end_bin = np.ceil(max_err / bin_width) * bin_width
-                    bins_abs = np.arange(start_bin, end_bin + bin_width, bin_width)
-                    
-                    n, bins, patches = plt.hist(abs_errors, bins=bins_abs, alpha=0.7, 
-                                              edgecolor='black', align='mid')
-                    
-                    # Add percentile lines
-                    q25 = abs_errors.quantile(0.25)
-                    q50 = abs_errors.quantile(0.50)  # median
-                    q75 = abs_errors.quantile(0.75)
-                    
-                    plt.axvline(q25, color='blue', linestyle='--', alpha=0.7, linewidth=1.5)
-                    plt.axvline(q50, color='red', linestyle='--', alpha=0.8, linewidth=2)
-                    plt.axvline(q75, color='blue', linestyle='--', alpha=0.7, linewidth=1.5)
-                    
-                    plt.text(0.98, 0.95, f'Mean: ${abs_errors.mean():.0f}\nStd: ${abs_errors.std():.0f}\nN: {len(abs_errors)}',
-                            transform=plt.gca().transAxes, verticalalignment='top', horizontalalignment='right',
-                            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
-                
-                plt.title(f'{horizon.upper()} - Absolute Error Distribution')
-                plt.xlabel('Absolute Error (USD)')
-                plt.ylabel('Frequency')
-                plt.grid(True, alpha=0.3)
-            
+                plt.subplot(1, n_horizons, i + 1)
+                hd = df[df['prediction_horizon'] == horizon].copy()
+                if hd.empty:
+                    plt.text(0.5, 0.5, 'No data yet', ha='center', va='center',
+                             transform=plt.gca().transAxes)
+                    plt.title(f'{horizon.upper()} — Calibration')
+                    continue
+
+                hd['conf_bin'] = pd.cut(hd['confidence'], bins=conf_bins, labels=bin_labels, right=False)
+                grouped = hd.groupby('conf_bin', observed=True)['direction_correct'].agg(['mean', 'count'])
+                grouped = grouped.dropna()
+
+                if grouped.empty:
+                    plt.text(0.5, 0.5, 'No data yet', ha='center', va='center',
+                             transform=plt.gca().transAxes)
+                    plt.title(f'{horizon.upper()} — Calibration')
+                    continue
+
+                bars = plt.bar(range(len(grouped)), grouped['mean'] * 100, alpha=0.7,
+                               edgecolor='black', color='#1f77b4')
+                plt.xticks(range(len(grouped)), grouped.index, rotation=30, ha='right')
+                plt.axhline(50, color='red', linestyle='--', alpha=0.6, linewidth=1.5, label='Random (50%)')
+                plt.ylim(0, 110)
+                plt.ylabel('Direction Accuracy (%)')
+                plt.xlabel('Confidence Bucket')
+                plt.title(f'{horizon.upper()} — Accuracy by Confidence')
+                plt.legend()
+
+                for bar, (_, row) in zip(bars, grouped.iterrows()):
+                    plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                             f'{row["mean"]*100:.0f}%\n(n={int(row["count"])})',
+                             ha='center', va='bottom', fontsize=8)
+
+                plt.grid(True, alpha=0.3, axis='y')
+
             plt.tight_layout()
-            
+
             if save_path:
                 plt.savefig(save_path, dpi=300, bbox_inches='tight')
-                logger.info(f"Histogram saved to {save_path}")
+                logger.info(f"Calibration chart saved to {save_path}")
             else:
                 plt.show()
-            
+
         except Exception as e:
-            logger.error(f"Failed to create error histograms: {e}")
+            logger.error(f"Failed to create calibration chart: {e}")
 
 
 def main():

@@ -6,13 +6,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# API Configuration (Free Tiers)
-COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
-ALPHA_VANTAGE_API_KEY = os.getenv('ALPHA_VANTAGE_API_KEY', '')  # Free: 5 calls/min, 500/day
-ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
-FRED_API_KEY = os.getenv('FRED_API_KEY', '')  # Free: 120 calls/min
-FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
-NEWS_API_KEY = os.getenv('NEWS_API_KEY', '')  # Free: 1000 calls/day
+# Binance public REST API — no API key required for market data
+# Private endpoints (account, trading) would need BINANCE_API_KEY / BINANCE_API_SECRET
 
 # Database Configuration
 DATABASE_PATH = "crypto_predictions.db"

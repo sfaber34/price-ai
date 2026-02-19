@@ -34,8 +34,6 @@ def clear_prediction_history():
     # Tables to preserve (market data)
     preserved_tables = [
         'crypto_data',
-        'traditional_markets', 
-        'economic_indicators'
     ]
     
     try:
@@ -106,9 +104,7 @@ def confirm_clear():
     print("  • All prediction timeseries data")
     print()
     print("This will PRESERVE:")
-    print("  • Historical crypto price data")
-    print("  • Traditional market data")
-    print("  • Economic indicator data")
+    print("  • Historical crypto price data (crypto_data table)")
     print()
     
     response = input("Are you sure you want to continue? (yes/no): ").lower().strip()

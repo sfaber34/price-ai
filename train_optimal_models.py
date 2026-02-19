@@ -49,26 +49,6 @@ class CryptoBacktester:
             except Exception as e:
                 logger.error(f"Failed to collect data for {crypto}: {e}")
         
-        # Collect traditional market data
-        try:
-            market_data = self.data_collector.get_traditional_markets_data(days=days)
-            if not market_data.empty:
-                data['traditional_markets'] = market_data
-                logger.info(f"Collected traditional market data: {len(market_data)} records")
-        except Exception as e:
-            logger.error(f"Failed to collect traditional market data: {e}")
-            data['traditional_markets'] = pd.DataFrame()
-        
-        # Collect economic indicators
-        try:
-            econ_data = self.data_collector.get_economic_indicators()
-            if not econ_data.empty:
-                data['economic_indicators'] = econ_data
-                logger.info(f"Collected economic indicators: {len(econ_data)} records")
-        except Exception as e:
-            logger.error(f"Failed to collect economic indicators: {e}")
-            data['economic_indicators'] = pd.DataFrame()
-        
         return data
     
     def prepare_features_for_backtest(self, raw_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -229,7 +209,7 @@ class CryptoBacktester:
                     model = self.prediction_engine.models[model_key]
                     
                     # Check target variable distribution before training
-                    target_col = f'target_{horizon}'
+                    target_col = f'target_direction_{horizon}'
                     if target_col in train_data.columns:
                         unique_targets = train_data[target_col].nunique()
                         if unique_targets < 2:
@@ -244,25 +224,20 @@ class CryptoBacktester:
                     if prediction:
                         current_price = train_data.iloc[-1]['price']
                         actual_future_price = future_prices[horizon]
-                        predicted_price = prediction['predicted_price']
-                        
-                        # Calculate errors
-                        dollar_error = abs(predicted_price - actual_future_price)
-                        percent_error = (dollar_error / actual_future_price) * 100
-                        
-                        # Direction accuracy
-                        predicted_direction = predicted_price > current_price
-                        actual_direction = actual_future_price > current_price
-                        direction_correct = predicted_direction == actual_direction
-                        
+
+                        # Direction evaluation
+                        predicted_direction = prediction['predicted_direction']  # 1=UP, 0=DOWN
+                        actual_direction = 1 if actual_future_price > current_price else 0
+                        direction_correct = int(predicted_direction == actual_direction)
+
                         results[horizon] = {
                             'prediction_time': prediction_time,
                             'current_price': current_price,
-                            'predicted_price': predicted_price,
                             'actual_price': actual_future_price,
-                            'dollar_error': dollar_error,
-                            'percent_error': percent_error,
+                            'predicted_direction': predicted_direction,
+                            'actual_direction': actual_direction,
                             'direction_correct': direction_correct,
+                            'direction_prob': prediction['direction_prob'],
                             'confidence': prediction['model_confidence'],
                             'horizon': horizon,
                             'training_samples': len(train_data)
@@ -335,15 +310,14 @@ class CryptoBacktester:
         logger.info("Starting training window size experiment...")
         
         # Define training window sizes (in days).
-        # Yahoo Finance caps 15m data to the last ~59 days, so windows are
-        # kept well under that limit to leave room for test/future data.
+        # Binance provides years of 15m history — use large windows to find what trains best.
         training_windows = {
-            '1_week':   7,   # 1 week  = 672  15m intervals
-            '2_weeks':  14,  # 2 weeks = 1344 15m intervals
-            '3_weeks':  21,  # 3 weeks = 2016 15m intervals
-            '1_month':  30,  # 1 month = 2880 15m intervals
-            '6_weeks':  42,  # 6 weeks = 4032 15m intervals
-            '7_weeks':  49,  # 7 weeks = 4704 15m intervals (near maximum)
+            '1_month':  30,   # 1 month  =  2 880 15m bars
+            '2_months': 60,   # 2 months =  5 760 15m bars
+            '3_months': 90,   # 3 months =  8 640 15m bars
+            '6_months': 180,  # 6 months = 17 280 15m bars
+            '9_months': 270,  # 9 months = 25 920 15m bars
+            '1_year':   365,  # 1 year   = 35 040 15m bars
         }
         
         # Collect historical data once
@@ -429,22 +403,13 @@ class CryptoBacktester:
                         horizon_data.append(split_result[horizon])
                 
                 if horizon_data:
-                    # Calculate statistics
-                    dollar_errors = [x['dollar_error'] for x in horizon_data]
-                    percent_errors = [x['percent_error'] for x in horizon_data]
                     direction_accuracy = [x['direction_correct'] for x in horizon_data]
                     confidences = [x['confidence'] for x in horizon_data]
-                    
+
                     crypto_analysis[horizon] = {
                         'total_predictions': len(horizon_data),
-                        'avg_dollar_error': np.mean(dollar_errors),
-                        'median_dollar_error': np.median(dollar_errors),
-                        'avg_percent_error': np.mean(percent_errors),
-                        'median_percent_error': np.median(percent_errors),
                         'direction_accuracy': np.mean(direction_accuracy),
                         'avg_confidence': np.mean(confidences),
-                        'max_error': max(percent_errors),
-                        'min_error': min(percent_errors)
                     }
             
             analysis[crypto] = crypto_analysis
@@ -477,20 +442,14 @@ class CryptoBacktester:
                             horizon_data.append(split_result[horizon])
                     
                     if horizon_data:
-                        # Calculate statistics
-                        dollar_errors = [x['dollar_error'] for x in horizon_data]
-                        percent_errors = [x['percent_error'] for x in horizon_data]
                         direction_accuracy = [x['direction_correct'] for x in horizon_data]
                         confidences = [x['confidence'] for x in horizon_data]
-                        
+
                         crypto_analysis[horizon] = {
                             'total_predictions': len(horizon_data),
-                            'avg_dollar_error': np.mean(dollar_errors),
-                            'avg_percent_error': np.mean(percent_errors),
                             'direction_accuracy': np.mean(direction_accuracy),
+                            'std_direction_accuracy': np.std(direction_accuracy),
                             'avg_confidence': np.mean(confidences),
-                            'std_percent_error': np.std(percent_errors),
-                            'median_percent_error': np.median(percent_errors)
                         }
                 
                 window_analysis[crypto] = crypto_analysis
@@ -522,24 +481,21 @@ class CryptoBacktester:
             for horizon in config.PREDICTION_INTERVALS:
                 print(f"\n📊 {horizon.upper()} PREDICTIONS")
                 print("-" * 75)
-                print(f"{'Window':>12} | {'Count':>5} | {'Avg %Err':>8} | {'Std %Err':>8} | {'Dir Acc':>7} | {'Conf':>6}")
-                print("-" * 75)
-                
-                for window_name in ['1_week', '2_weeks', '3_weeks', '1_month', '6_weeks', '7_weeks']:
-                    if (window_name in analysis and 
-                        crypto in analysis[window_name] and 
+                print(f"{'Window':>12} | {'Count':>5} | {'Dir Acc':>7} | {'Std Acc':>7} | {'Conf':>6}")
+                print("-" * 55)
+
+                for window_name in ['1_month', '2_months', '3_months', '6_months', '9_months', '1_year']:
+                    if (window_name in analysis and
+                        crypto in analysis[window_name] and
                         horizon in analysis[window_name][crypto]):
-                        
+
                         stats = analysis[window_name][crypto][horizon]
-                        
-                        # Format window name for display
                         display_name = window_name.replace('_', ' ').title()
-                        
+
                         print(f"{display_name:>12} | "
                               f"{stats['total_predictions']:>5} | "
-                              f"{stats['avg_percent_error']:>6.2f}% | "
-                              f"{stats['std_percent_error']:>6.2f}% | "
                               f"{stats['direction_accuracy']*100:>5.1f}% | "
+                              f"{stats['std_direction_accuracy']*100:>5.1f}% | "
                               f"{stats['avg_confidence']*100:>4.0f}%")
         
         # Summary insights
@@ -553,25 +509,25 @@ class CryptoBacktester:
                 crypto_emoji = "₿"
             else:
                 crypto_emoji = "♦️"
-            
+
             print(f"\n{crypto_emoji} {crypto.upper()} OPTIMAL TRAINING WINDOWS:")
-            
+
             for horizon in config.PREDICTION_INTERVALS:
                 best_window = None
-                best_error = float('inf')
-                
-                for window_name in ['1_week', '2_weeks', '3_weeks', '1_month', '6_weeks', '7_weeks']:
-                    if (window_name in analysis and 
-                        crypto in analysis[window_name] and 
+                best_accuracy = 0.0
+
+                for window_name in ['1_month', '2_months', '3_months', '6_months', '9_months', '1_year']:
+                    if (window_name in analysis and
+                        crypto in analysis[window_name] and
                         horizon in analysis[window_name][crypto]):
-                        
-                        error = analysis[window_name][crypto][horizon]['avg_percent_error']
-                        if error < best_error:
-                            best_error = error
+
+                        accuracy = analysis[window_name][crypto][horizon]['direction_accuracy']
+                        if accuracy > best_accuracy:
+                            best_accuracy = accuracy
                             best_window = window_name.replace('_', ' ').title()
-                
+
                 if best_window:
-                    print(f"  • {horizon.upper():>2}: {best_window} training window (Avg Error: {best_error:.2f}%)")
+                    print(f"  • {horizon.upper():>2}: {best_window} training window (Dir Acc: {best_accuracy*100:.1f}%)")
         
         print("\n" + "="*100)
     
@@ -593,13 +549,12 @@ class CryptoBacktester:
             
             print(f"\n{crypto_emoji} {crypto.upper()} BACKTEST ANALYSIS")
             print("-" * 60)
-            print(f"{'Horizon':>6} | {'Count':>5} | {'Avg % Err':>9} | {'Dir Acc':>7} | {'Confidence':>10}")
-            print("-" * 60)
-            
+            print(f"{'Horizon':>6} | {'Count':>5} | {'Dir Acc':>7} | {'Confidence':>10}")
+            print("-" * 42)
+
             for horizon, stats in crypto_analysis.items():
                 print(f"{horizon.upper():>6} | "
                       f"{stats['total_predictions']:>5} | "
-                      f"{stats['avg_percent_error']:>7.2f}% | "
                       f"{stats['direction_accuracy']*100:>5.1f}% | "
                       f"{stats['avg_confidence']*100:>8.1f}%")
         
@@ -615,33 +570,35 @@ def train_production_models(backtester: CryptoBacktester, analysis: Dict, days: 
     # Find optimal training windows for each crypto/horizon combination
     optimal_windows = {}
     
+    _window_days = {
+        '1_month': 30, '2_months': 60, '3_months': 90,
+        '6_months': 180, '9_months': 270, '1_year': 365,
+    }
+
     for crypto in ['bitcoin', 'ethereum']:
         optimal_windows[crypto] = {}
-        
+
         for horizon in config.PREDICTION_INTERVALS:
             best_window = None
-            best_error = float('inf')
-            
-            for window_name in ['1_week', '2_weeks', '3_weeks', '1_month', '6_weeks', '7_weeks']:
-                if (window_name in analysis and 
-                    crypto in analysis[window_name] and 
+            best_accuracy = 0.0
+
+            for window_name in _window_days:
+                if (window_name in analysis and
+                    crypto in analysis[window_name] and
                     horizon in analysis[window_name][crypto]):
-                    
-                    error = analysis[window_name][crypto][horizon]['avg_percent_error']
-                    if error < best_error:
-                        best_error = error
+
+                    accuracy = analysis[window_name][crypto][horizon]['direction_accuracy']
+                    if accuracy > best_accuracy:
+                        best_accuracy = accuracy
                         best_window = window_name
-            
+
             if best_window:
                 optimal_windows[crypto][horizon] = {
                     'window_name': best_window,
-                    'window_days': {
-                        '1_week': 7, '2_weeks': 14, '3_weeks': 21,
-                        '1_month': 30, '6_weeks': 42, '7_weeks': 49,
-                    }[best_window],
-                    'expected_error': best_error
+                    'window_days': _window_days[best_window],
+                    'expected_accuracy': best_accuracy,
                 }
-                print(f"📈 {crypto.upper()} {horizon.upper()}: Using {best_window} window (Error: {best_error:.2f}%)")
+                print(f"📈 {crypto.upper()} {horizon.upper()}: Using {best_window} window (Dir Acc: {best_accuracy*100:.1f}%)")
     
     # Collect fresh data for training production models
     print("\n📊 Collecting fresh data for production model training...")
@@ -687,7 +644,7 @@ def train_production_models(backtester: CryptoBacktester, analysis: Dict, days: 
                         'training_window': window_info['window_name'],
                         'training_days': train_days,
                         'training_samples': len(recent_data),
-                        'expected_error': window_info['expected_error']
+                        'expected_accuracy': window_info['expected_accuracy'],
                     }
                     
                     print(f"✅ Saved {crypto} {horizon} model to {model_filepath}")
@@ -710,8 +667,8 @@ def main():
     parser = argparse.ArgumentParser(description='Crypto Price Prediction Backtester')
     parser.add_argument('--runs', type=int, default=30, 
                        help='Number of runs per training window (default: 30)')
-    parser.add_argument('--days', type=int, default=180,
-                       help='Days of historical data to collect (default: 180)')
+    parser.add_argument('--days', type=int, default=730,
+                       help='Days of historical data to collect (default: 730 — 2 years via Binance)')
     parser.add_argument('--quick', action='store_true',
                        help='Quick test mode (3 runs per window)')
     

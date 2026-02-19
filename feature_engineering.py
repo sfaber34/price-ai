@@ -680,6 +680,118 @@ class FeatureEngineer:
         
         return df
     
+    def add_cvd_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add Cumulative Volume Delta (CVD) and OHLC candle features.
+
+        CVD features come from Binance taker_buy_base_vol / taker_sell_base_vol.
+        They capture the net directional pressure of aggressive buyers vs sellers
+        — the single most informative signal for intraday direction prediction.
+
+        OHLC candle features (body, wicks, close position) are also added here
+        because they require open/high/low columns only available from Binance.
+
+        Gracefully no-ops if the required columns are not present.
+        """
+        df = df.copy()
+
+        # ── CVD features ────────────────────────────────────────────────────────
+        has_cvd = ('taker_buy_base_vol' in df.columns and
+                   'taker_sell_base_vol' in df.columns)
+
+        if has_cvd:
+            # Per-bar volume delta: positive = net buying, negative = net selling
+            df['volume_delta'] = df['taker_buy_base_vol'] - df['taker_sell_base_vol']
+
+            # Buy/sell ratio: fraction of volume driven by aggressive buyers (0→1)
+            df['buy_sell_ratio'] = df['taker_buy_base_vol'] / (df['volume'] + 1e-10)
+
+            # Rolling CVD (net order-flow pressure over intraday windows)
+            # 4=1h, 16=4h, 96=1d in 15m bars
+            for window, label in [(4, '1h'), (16, '4h'), (96, '1d')]:
+                df[f'cvd_{label}'] = df['volume_delta'].rolling(window).sum()
+
+            # Normalised CVD: scale by total volume so different size bars are comparable
+            for window, label in [(4, '1h'), (16, '4h'), (96, '1d')]:
+                total = df['volume'].rolling(window).sum()
+                df[f'cvd_norm_{label}'] = df[f'cvd_{label}'] / (total + 1e-10)
+
+            # Rolling buy pressure (fraction of volume from buyers)
+            for window, label in [(4, '1h'), (16, '4h'), (96, '1d')]:
+                df[f'buy_pressure_{label}'] = df['buy_sell_ratio'].rolling(window).mean()
+
+            # CVD momentum: how much CVD changed in the last window
+            df['cvd_1h_change'] = df['cvd_1h'].diff(4)
+            df['cvd_4h_change'] = df['cvd_4h'].diff(16)
+
+            # Price-CVD divergence: price rising but sell pressure dominant → bearish
+            price_chg_1h = df['price'].pct_change(4)
+            price_chg_4h = df['price'].pct_change(16)
+            df['price_cvd_div_1h'] = (
+                ((price_chg_1h > 0) & (df['cvd_1h'] < 0)) |
+                ((price_chg_1h < 0) & (df['cvd_1h'] > 0))
+            ).astype(int)
+            df['price_cvd_div_4h'] = (
+                ((price_chg_4h > 0) & (df['cvd_4h'] < 0)) |
+                ((price_chg_4h < 0) & (df['cvd_4h'] > 0))
+            ).astype(int)
+
+            # Short lags of the key CVD columns (1=15m, 2=30m, 4=1h, 8=2h)
+            for lag in [1, 2, 4, 8]:
+                df[f'volume_delta_lag_{lag}'] = df['volume_delta'].shift(lag)
+                df[f'buy_sell_ratio_lag_{lag}'] = df['buy_sell_ratio'].shift(lag)
+
+            logger.info("Added CVD / volume-delta features")
+        else:
+            logger.warning("taker_buy/sell_base_vol not found — CVD features skipped")
+
+        # ── Trade-count features ────────────────────────────────────────────────
+        if 'num_trades' in df.columns:
+            df['num_trades_ratio_1h'] = (
+                df['num_trades'].rolling(4).mean() /
+                (df['num_trades'].rolling(96).mean() + 1e-10)
+            )
+            df['num_trades_ratio_4h'] = (
+                df['num_trades'].rolling(16).mean() /
+                (df['num_trades'].rolling(96).mean() + 1e-10)
+            )
+
+        # ── OHLC candle features ────────────────────────────────────────────────
+        has_ohlc = all(c in df.columns for c in ['open', 'high', 'low'])
+
+        if has_ohlc:
+            eps = df['open'] + 1e-10
+
+            # Candle body: signed (+ = bullish bar, - = bearish bar)
+            df['candle_body']  = (df['price'] - df['open']) / eps
+
+            # Total candle range
+            df['candle_range'] = (df['high'] - df['low']) / eps
+
+            # Upper and lower wicks
+            candle_top    = df[['price', 'open']].max(axis=1)
+            candle_bottom = df[['price', 'open']].min(axis=1)
+            df['upper_wick'] = (df['high'] - candle_top)    / eps
+            df['lower_wick'] = (candle_bottom - df['low'])  / eps
+
+            # Wick ratio: large lower wick → buying at lows (bullish pressure)
+            df['wick_ratio'] = df['lower_wick'] / (df['upper_wick'] + 1e-10)
+
+            # Close position within the bar (0 = closed at low, 1 = closed at high)
+            candle_range_abs = df['high'] - df['low']
+            df['close_position'] = (df['price'] - df['low']) / (candle_range_abs + 1e-10)
+
+            # Short lags for candle body and close position
+            for lag in [1, 2, 4]:
+                df[f'candle_body_lag_{lag}']     = df['candle_body'].shift(lag)
+                df[f'close_position_lag_{lag}']  = df['close_position'].shift(lag)
+
+            logger.info("Added OHLC candle features")
+        else:
+            logger.warning("open/high/low columns not found — candle features skipped")
+
+        return df
+
     def add_volatility_features(self, df: pd.DataFrame, price_col: str = 'price') -> pd.DataFrame:
         """
         Add volatility features to capture market uncertainty and movement patterns.
@@ -789,13 +901,10 @@ class FeatureEngineer:
         logger.info("Starting feature engineering pipeline...")
         
         # Add all features
-        # NOTE: add_market_correlation_features is intentionally not called here.
-        # Traditional market data (stocks, bonds, forex) comes at 1h resolution and
-        # is too coarse for 15m/1h/4h predictions. The market_df parameter is kept
-        # for backwards compatibility but is no longer used.
         df = self.add_technical_indicators(crypto_df)
         df = self.add_time_features(df)
-        df = self.add_lagged_features(df)
+        df = self.add_cvd_features(df)      # Binance taker volumes → CVD + candle features
+        df = self.add_lagged_features(df)   # lags price, price_change_15m, rsi
         df = self.add_volume_based_features(df)
         df = self.add_momentum_features(df)  # NEW: Better momentum capture
         df = self.add_volatility_features(df)  # NEW: Volatility patterns

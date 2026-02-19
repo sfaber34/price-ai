@@ -368,18 +368,21 @@ class CryptoPredictionBot:
                 feature_timestamp_str = str(prediction.get('feature_timestamp', prediction['timestamp']))
                 
                 # Insert prediction into database with corrected timestamp logic
+                # predicted_price column repurposed: stores raw P(UP) in [0, 1].
+                # Direction = 1 (UP) when value > 0.5, DOWN otherwise.
+                # confidence column stores model_confidence (distance from 0.5).
                 conn.execute('''
-                    INSERT INTO predictions 
+                    INSERT INTO predictions
                     (datetime, crypto, prediction_horizon, predicted_price, current_price, confidence, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    target_timestamp_str,  # FIXED: Use target time, not feature time
+                    target_timestamp_str,
                     str(prediction['crypto']),
                     str(prediction['horizon']),
-                    float(prediction['predicted_price']),
-                    float(prediction.get('current_price', 0)),  # Store current price for direction accuracy
+                    float(prediction.get('direction_prob', 0.5)),   # P(UP)
+                    float(prediction.get('current_price', 0)),
                     float(prediction['model_confidence']),
-                    datetime.now().isoformat()  # When the prediction was actually made
+                    datetime.now().isoformat()
                 ))
             
             conn.commit()
@@ -391,61 +394,51 @@ class CryptoPredictionBot:
     
     def display_predictions(self, predictions: Dict):
         """
-        Display predictions in a formatted way
+        Display direction predictions with confidence scores.
         """
-        print("\n" + "="*80)
-        print(f"CRYPTO PRICE PREDICTIONS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("="*80)
-        
-        # Group predictions by crypto
-        crypto_predictions = {}
+        print("\n" + "="*70)
+        print(f"DIRECTION PREDICTIONS  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("="*70)
+
+        crypto_predictions: Dict[str, list] = {}
         for model_key, prediction in predictions.items():
             crypto = prediction['crypto']
-            if crypto not in crypto_predictions:
-                crypto_predictions[crypto] = []
-            crypto_predictions[crypto].append(prediction)
-        
+            crypto_predictions.setdefault(crypto, []).append(prediction)
+
         for crypto, preds in crypto_predictions.items():
-            # Use distinctive emojis for each crypto
-            if crypto == 'bitcoin':
-                crypto_emoji = "₿"  # Bitcoin symbol
-            elif crypto == 'ethereum':
-                crypto_emoji = "♦️ "  # Diamond (ETH is often called digital diamond)
-            else:
-                crypto_emoji = "📈"  # Default for other cryptos
-            
-            print(f"\n{crypto_emoji} {crypto.upper()}")
-            print("-" * 80)
-            print(f"{'Time':>4} | {'Current':>10} | {'Predicted':>10} | {'Return':>8} | {'Dir':>4} | Confidence")
-            print("-" * 80)
-            
-            # Get real-time current price for this crypto
+            emoji = "₿" if crypto == 'bitcoin' else "♦️ " if crypto == 'ethereum' else "📈"
+            print(f"\n{emoji} {crypto.upper()}")
+            print("-" * 70)
+            print(f"  {'Horizon':>6} | {'Price':>10} | {'Direction':>10} | {'Confidence':>10} | Signal")
+            print("-" * 70)
+
             try:
-                real_time_price = self.data_collector.get_crypto_current_price(crypto)
-                if real_time_price is None:
-                    # Fallback to historical price if real-time fails
-                    real_time_price = preds[0]['current_price']
-            except Exception as e:
-                logger.warning(f"Failed to get real-time price for {crypto}: {e}")
-                real_time_price = preds[0]['current_price']
-            
-            # Sort by horizon
+                live_price = self.data_collector.get_crypto_current_price(crypto) or preds[0]['current_price']
+            except Exception:
+                live_price = preds[0]['current_price']
+
             preds.sort(key=lambda x: {'15m': 1, '1h': 2, '4h': 3}.get(x['horizon'], 99))
-            
+
             for pred in preds:
-                direction_emoji = "🟢" if pred['predicted_direction'] else "🔴"
-                confidence_stars = "⭐" * int(pred['model_confidence'] * 5)
-                
-                # Calculate return based on real-time price vs predicted price
-                actual_return = ((pred['predicted_price'] - real_time_price) / real_time_price) * 100
-                
-                print(f"  {pred['horizon'].upper():>3} | "
-                      f"${real_time_price:>9.2f} | "
-                      f"${pred['predicted_price']:>9.2f} | "
-                      f"{actual_return:>6.2f}% | "
-                      f"{direction_emoji:>4} | {confidence_stars}")
-        
-        print("\n" + "="*80)
+                is_up   = bool(pred['predicted_direction'])
+                conf    = pred['model_confidence'] * 100
+                dir_str = "  UP  " if is_up else " DOWN "
+                arrow   = "▲" if is_up else "▼"
+
+                # Signal strength label
+                if conf >= 65:
+                    signal = "STRONG"
+                elif conf >= 58:
+                    signal = "MODERATE"
+                else:
+                    signal = "WEAK"
+
+                print(f"  {pred['horizon'].upper():>6} | "
+                      f"${live_price:>9.2f} | "
+                      f"{arrow} {dir_str} | "
+                      f"{conf:>8.1f}%   | {signal}")
+
+        print("="*70)
     
     def update_current_prices(self):
         """

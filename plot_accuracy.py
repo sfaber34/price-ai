@@ -145,8 +145,8 @@ def show_accuracy_summary():
                 crypto_has_data = True
                 overall_has_data = True
                 print(f"  {horizon.upper()}: {metrics['total_predictions']} evaluations")
-                print(f"    Mean Error: {metrics['mean_percent_error']:.2f}%")
                 print(f"    Direction Accuracy: {metrics['direction_accuracy']:.1%}")
+                print(f"    Avg Confidence:     {metrics['avg_confidence']:.1%}")
             else:
                 # Check if we have any predictions stored but not yet mature for evaluation
                 # This gives more helpful feedback
