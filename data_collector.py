@@ -35,70 +35,31 @@ class DataCollector:
 
     def get_crypto_data(self, crypto_id: str, days: int = 30) -> pd.DataFrame:
         """
-        Get cryptocurrency data from multiple sources (yfinance fallback for CoinGecko issues)
+        Get cryptocurrency data at 15-minute intervals.
+        Primary source: yfinance (supports 15m intervals up to 60 days back).
+        Fallback: CoinGecko hourly data resampled to 15m.
         """
-        # First try CoinGecko
-        try:
-            self._rate_limit('coingecko', config.RATE_LIMITS['coingecko'])
-            
-            # Try simple price endpoint first (more reliable)
-            simple_url = f"{config.COINGECKO_BASE_URL}/simple/price"
-            simple_params = {
-                'ids': crypto_id,
-                'vs_currencies': 'usd',
-                'include_market_cap': 'true',
-                'include_24hr_vol': 'true'
-            }
-            
-            simple_response = self.session.get(simple_url, params=simple_params)
-            if simple_response.status_code == 200:
-                # If simple endpoint works, try historical data
-                url = f"{config.COINGECKO_BASE_URL}/coins/{crypto_id}/market_chart"
-                params = {
-                    'vs_currency': 'usd',
-                    'days': min(days, 30),  # Limit to 30 days for free tier
-                    'interval': 'hourly'
-                }
-                
-                response = self.session.get(url, params=params)
-                if response.status_code == 200:
-                    data = response.json()
-                    
-                    # Convert to DataFrame
-                    df = pd.DataFrame({
-                        'timestamp': [item[0] for item in data['prices']],
-                        'price': [item[1] for item in data['prices']],
-                        'market_cap': [item[1] for item in data['market_caps']],
-                        'volume': [item[1] for item in data['total_volumes']]
-                    })
-                    
-                    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-                    df['crypto'] = crypto_id
-                    df = df.drop('timestamp', axis=1)
-                    
-                    logger.info(f"Collected {len(df)} records for {crypto_id} from CoinGecko")
-                    return df
-            
-        except Exception as e:
-            logger.warning(f"CoinGecko failed for {crypto_id}: {e}")
-        
-        # Fallback to yfinance for major cryptos
-        try:
-            crypto_symbols = {
-                'bitcoin': 'BTC-USD',
-                'ethereum': 'ETH-USD'
-            }
-            
-            if crypto_id in crypto_symbols:
+        # yfinance only supports 15m data for up to 60 days
+        days = min(days, 59)
+
+        crypto_symbols = {
+            'bitcoin': 'BTC-USD',
+            'ethereum': 'ETH-USD'
+        }
+
+        # Primary: yfinance with 15-minute intervals
+        if crypto_id in crypto_symbols:
+            try:
                 symbol = crypto_symbols[crypto_id]
                 ticker = yf.Ticker(symbol)
-                
-                # Get historical data
+
                 end_date = datetime.now()
-                start_date = end_date - timedelta(days=days)
-                
-                hist = ticker.history(start=start_date, end=end_date, interval='1h')
-                
+                # Yahoo Finance limits 15m interval to the last 60 days
+                effective_days = min(days, 59)
+                start_date = end_date - timedelta(days=effective_days)
+
+                hist = ticker.history(start=start_date, end=end_date, interval='15m')
+
                 if not hist.empty:
                     df = hist.reset_index()
                     df = df.rename(columns={
@@ -107,15 +68,66 @@ class DataCollector:
                         'Volume': 'volume'
                     })
                     df['crypto'] = crypto_id
-                    df['market_cap'] = df['price'] * 1000000  # Dummy market cap
+                    df['market_cap'] = df['price'] * 1000000  # Approximation
                     df = df[['datetime', 'crypto', 'price', 'market_cap', 'volume']]
-                    
-                    logger.info(f"Collected {len(df)} records for {crypto_id} from Yahoo Finance")
+
+                    # Ensure timezone-naive datetimes
+                    if hasattr(df['datetime'].dtype, 'tz') and df['datetime'].dt.tz is not None:
+                        df['datetime'] = df['datetime'].dt.tz_localize(None)
+
+                    logger.info(f"Collected {len(df)} 15m records for {crypto_id} from Yahoo Finance")
                     return df
-            
+
+            except Exception as e:
+                logger.warning(f"Yahoo Finance 15m failed for {crypto_id}: {e}")
+
+        # Fallback: CoinGecko hourly data (resample to 15m via ffill)
+        try:
+            self._rate_limit('coingecko', config.RATE_LIMITS['coingecko'])
+
+            simple_url = f"{config.COINGECKO_BASE_URL}/simple/price"
+            simple_params = {
+                'ids': crypto_id,
+                'vs_currencies': 'usd',
+                'include_market_cap': 'true',
+                'include_24hr_vol': 'true'
+            }
+
+            simple_response = self.session.get(simple_url, params=simple_params)
+            if simple_response.status_code == 200:
+                url = f"{config.COINGECKO_BASE_URL}/coins/{crypto_id}/market_chart"
+                params = {
+                    'vs_currency': 'usd',
+                    'days': min(days, 30),
+                    'interval': 'hourly'
+                }
+
+                response = self.session.get(url, params=params)
+                if response.status_code == 200:
+                    data = response.json()
+
+                    df = pd.DataFrame({
+                        'timestamp': [item[0] for item in data['prices']],
+                        'price': [item[1] for item in data['prices']],
+                        'market_cap': [item[1] for item in data['market_caps']],
+                        'volume': [item[1] for item in data['total_volumes']]
+                    })
+
+                    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df['crypto'] = crypto_id
+                    df = df.drop('timestamp', axis=1)
+
+                    # Resample hourly CoinGecko data to 15-minute intervals via ffill
+                    df = df.set_index('datetime')
+                    df_15m = df.resample('15min').ffill()
+                    df_15m = df_15m.reset_index()
+
+                    logger.info(f"Collected {len(df_15m)} 15m records for {crypto_id} from CoinGecko (resampled)")
+                    return df_15m
+
         except Exception as e:
-            logger.error(f"Yahoo Finance also failed for {crypto_id}: {e}")
-        
+            logger.warning(f"CoinGecko fallback failed for {crypto_id}: {e}")
+
         logger.error(f"All data sources failed for {crypto_id}")
         return pd.DataFrame()
 
@@ -138,12 +150,18 @@ class DataCollector:
             for symbol in all_symbols:
                 try:
                     ticker = yf.Ticker(symbol)
+                    # Yahoo Finance limits 15m data to the last 60 days.
+                    # Traditional markets are auxiliary features, so use 1h interval
+                    # which supports up to 730 days of history.
                     hist = ticker.history(start=start_date, end=end_date, interval='1h')
                     
                     if not hist.empty:
                         df = hist.reset_index()
                         df['symbol'] = symbol
                         df['datetime'] = df['Datetime']
+                        # Ensure timezone-naive datetimes
+                        if hasattr(df['datetime'].dtype, 'tz') and df['datetime'].dt.tz is not None:
+                            df['datetime'] = df['datetime'].dt.tz_localize(None)
                         df = df[['datetime', 'symbol', 'Open', 'High', 'Low', 'Close', 'Volume']]
                         all_data.append(df)
                         
@@ -299,11 +317,20 @@ def initialize_database():
             crypto TEXT,
             prediction_horizon TEXT,
             predicted_price REAL,
+            current_price REAL,
             confidence REAL,
             actual_price REAL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+
+    # Migration: add current_price column to existing predictions tables that pre-date this change
+    try:
+        cursor.execute('ALTER TABLE predictions ADD COLUMN current_price REAL')
+        conn.commit()
+        logger.info("Migration: added current_price column to predictions table")
+    except Exception:
+        pass  # Column already exists — expected on re-runs
     
     conn.commit()
     conn.close()
@@ -319,7 +346,7 @@ if __name__ == "__main__":
     # Test crypto data collection
     btc_data = collector.get_crypto_data('bitcoin', days=7)
     eth_data = collector.get_crypto_data('ethereum', days=7)
-    
+
     # Test traditional market data
     market_data = collector.get_traditional_markets_data(days=7)
     

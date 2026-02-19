@@ -64,14 +64,16 @@ class FeatureEngineer:
             df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
             df['bb_position'] = (df[price_col] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
             
-            # Price momentum and volatility
-            df['price_change_1h'] = df[price_col].pct_change(1)
-            df['price_change_4h'] = df[price_col].pct_change(4)
-            df['price_change_24h'] = df[price_col].pct_change(24)
-            
-            # Rolling volatility (standard deviation of returns)
-            df['volatility_4h'] = df['price_change_1h'].rolling(4).std()
-            df['volatility_24h'] = df['price_change_1h'].rolling(24).std()
+            # Price momentum and volatility (15-minute data: 1 period = 15 minutes)
+            df['price_change_15m'] = df[price_col].pct_change(1)   # 1 period  = 15 min
+            df['price_change_1h'] = df[price_col].pct_change(4)    # 4 periods = 1 hour
+            df['price_change_4h'] = df[price_col].pct_change(16)   # 16 periods = 4 hours
+            df['price_change_1d'] = df[price_col].pct_change(96)   # 96 periods = 1 day
+
+            # Rolling volatility (standard deviation of returns over 15m data)
+            df['volatility_1h'] = df['price_change_15m'].rolling(4).std()    # 4 periods  = 1 hour
+            df['volatility_4h'] = df['price_change_15m'].rolling(16).std()   # 16 periods = 4 hours
+            df['volatility_1d'] = df['price_change_15m'].rolling(96).std()   # 96 periods = 1 day
             
             # Note: Comprehensive volume features are added separately in add_volume_based_features()
             
@@ -159,8 +161,8 @@ class FeatureEngineer:
             market_columns = market_pivot_clean.columns
             df[market_columns] = df[market_columns].ffill()
             
-            # Calculate correlations (rolling window)
-            window = 24  # 24 hours
+            # Calculate correlations (rolling window: 96 periods = 1 day in 15m data)
+            window = 96
             for col in market_columns:
                 if col in df.columns:
                     # Rolling correlation
@@ -180,28 +182,31 @@ class FeatureEngineer:
         
         return df
     
-    def add_lagged_features(self, df: pd.DataFrame, target_col: str = 'price', lags: List[int] = [1, 2, 4, 6, 12, 24]) -> pd.DataFrame:
+    def add_lagged_features(self, df: pd.DataFrame, target_col: str = 'price',
+                           lags: List[int] = [1, 2, 4, 8, 16, 24, 48, 96]) -> pd.DataFrame:
         """
-        Add lagged features for time series prediction
+        Add lagged features for time series prediction.
+        With 15-minute data: lags represent 15m, 30m, 1h, 2h, 4h, 6h, 12h, 24h.
         """
         df = df.copy()
-        
+
         try:
             for lag in lags:
                 df[f'{target_col}_lag_{lag}'] = df[target_col].shift(lag)
-                
-                # Lagged price changes
-                df[f'price_change_lag_{lag}'] = df['price_change_1h'].shift(lag)
-                
+
+                # Lagged price changes (using 15m base change)
+                if 'price_change_15m' in df.columns:
+                    df[f'price_change_lag_{lag}'] = df['price_change_15m'].shift(lag)
+
                 # Lagged RSI
                 if 'rsi' in df.columns:
                     df[f'rsi_lag_{lag}'] = df['rsi'].shift(lag)
-            
+
             logger.info(f"Added lagged features for lags: {lags}")
-            
+
         except Exception as e:
             logger.error(f"Error adding lagged features: {e}")
-        
+
         return df
     
     def add_cross_asset_correlation_features(self, primary_df: pd.DataFrame, secondary_df: pd.DataFrame, 
@@ -241,18 +246,18 @@ class FeatureEngineer:
                 secondary_features[f'{secondary_name}_macd'] = secondary_clean['macd']
             if 'bb_position' in secondary_clean.columns:
                 secondary_features[f'{secondary_name}_bb_position'] = secondary_clean['bb_position']
-            if 'volatility_24h' in secondary_clean.columns:
-                secondary_features[f'{secondary_name}_volatility'] = secondary_clean['volatility_24h']
+            if 'volatility_4h' in secondary_clean.columns:
+                secondary_features[f'{secondary_name}_volatility'] = secondary_clean['volatility_4h']
             
             # Add volume-based indicators for secondary crypto
             if 'obv' in secondary_clean.columns:
                 secondary_features[f'{secondary_name}_obv'] = secondary_clean['obv']
-            if 'vwap_24h' in secondary_clean.columns:
-                secondary_features[f'{secondary_name}_vwap'] = secondary_clean['vwap_24h']
+            if 'vwap_1d' in secondary_clean.columns:
+                secondary_features[f'{secondary_name}_vwap'] = secondary_clean['vwap_1d']
             if 'volume_percentile_7d' in secondary_clean.columns:
                 secondary_features[f'{secondary_name}_volume_percentile'] = secondary_clean['volume_percentile_7d']
-            if 'money_flow_24h' in secondary_clean.columns:
-                secondary_features[f'{secondary_name}_money_flow'] = secondary_clean['money_flow_24h']
+            if 'money_flow_1d' in secondary_clean.columns:
+                secondary_features[f'{secondary_name}_money_flow'] = secondary_clean['money_flow_1d']
             
             # Merge with primary data
             df['datetime'] = pd.to_datetime(df['datetime'])
@@ -263,37 +268,41 @@ class FeatureEngineer:
             df[secondary_cols] = df[secondary_cols].ffill()
             
             # 1. CORRELATION FEATURES
-            correlation_windows = [6, 12, 24, 48, 168]  # 6h, 12h, 1d, 2d, 1w
-            for window in correlation_windows:
+            # Windows in 15m periods: 24=6h, 48=12h, 96=1d, 192=2d, 672=1w
+            correlation_windows = [24, 48, 96, 192, 672]
+            corr_window_labels = ['6h', '12h', '1d', '2d', '1w']
+            for window, label in zip(correlation_windows, corr_window_labels):
                 if len(df) >= window:
                     # Rolling correlation between prices
-                    df[f'corr_{secondary_name}_{window}h'] = (
+                    df[f'corr_{secondary_name}_{label}'] = (
                         df['price'].rolling(window).corr(df[f'{secondary_name}_price'])
                     )
-                    
+
                     # Rolling correlation between returns
-                    if 'price_change_1h' in df.columns:
-                        df[f'return_corr_{secondary_name}_{window}h'] = (
-                            df['price_change_1h'].rolling(window).corr(
+                    if 'price_change_15m' in df.columns:
+                        df[f'return_corr_{secondary_name}_{label}'] = (
+                            df['price_change_15m'].rolling(window).corr(
                                 df[f'{secondary_name}_price'].pct_change()
                             )
                         )
             
-            # Correlation strength (absolute correlation)
-            df[f'corr_strength_{secondary_name}'] = df[f'corr_{secondary_name}_24h'].abs()
-            
+            # Correlation strength (absolute correlation) – use 1d window
+            df[f'corr_strength_{secondary_name}'] = df[f'corr_{secondary_name}_1d'].abs()
+
             # Correlation change (momentum in correlation)
-            df[f'corr_change_{secondary_name}'] = df[f'corr_{secondary_name}_24h'].diff()
-            
+            df[f'corr_change_{secondary_name}'] = df[f'corr_{secondary_name}_1d'].diff()
+
             # 2. LEAD-LAG RELATIONSHIPS
-            lead_lag_periods = [1, 2, 4, 6, 12, 24]  # 1h to 24h
-            for lag in lead_lag_periods:
+            # Lags in 15m periods: 4=1h, 8=2h, 16=4h, 24=6h, 48=12h, 96=24h
+            lead_lag_periods = [4, 8, 16, 24, 48, 96]
+            lead_lag_labels = ['1h', '2h', '4h', '6h', '12h', '24h']
+            for lag, label in zip(lead_lag_periods, lead_lag_labels):
                 # Secondary crypto leading primary (secondary price affecting primary future)
-                df[f'{secondary_name}_price_lead_{lag}h'] = df[f'{secondary_name}_price'].shift(lag)
-                df[f'{secondary_name}_return_lead_{lag}h'] = df[f'{secondary_name}_price'].pct_change().shift(lag)
-                
+                df[f'{secondary_name}_price_lead_{label}'] = df[f'{secondary_name}_price'].shift(lag)
+                df[f'{secondary_name}_return_lead_{label}'] = df[f'{secondary_name}_price'].pct_change().shift(lag)
+
                 # Primary crypto leading secondary (for context)
-                df[f'{primary_name}_to_{secondary_name}_lag_{lag}h'] = df['price'].shift(-lag)
+                df[f'{primary_name}_to_{secondary_name}_lag_{label}'] = df['price'].shift(-lag)
             
             # Momentum transfer indicators
             if 'rsi' in df.columns and f'{secondary_name}_rsi' in df.columns:
@@ -321,14 +330,14 @@ class FeatureEngineer:
                     df[f'{primary_name}_{secondary_name}_ratio'] / sma_denominator, 0.01, 100
                 )
             
-            # Ratio volatility
+            # Ratio volatility (96 periods = 1 day in 15m data)
             df[f'ratio_volatility_{secondary_name}'] = (
-                df[f'{primary_name}_{secondary_name}_ratio'].rolling(24).std()
+                df[f'{primary_name}_{secondary_name}_ratio'].rolling(96).std()
             )
-            
-            # Ratio momentum
-            df[f'ratio_momentum_24h_{secondary_name}'] = (
-                df[f'{primary_name}_{secondary_name}_ratio'].pct_change(24, fill_method=None)
+
+            # Ratio momentum (96 periods = 1 day in 15m data)
+            df[f'ratio_momentum_1d_{secondary_name}'] = (
+                df[f'{primary_name}_{secondary_name}_ratio'].pct_change(96, fill_method=None)
             )
             
             # 4. DIVERGENCE SIGNALS
@@ -351,21 +360,21 @@ class FeatureEngineer:
                 df[f'volume_ratio_{secondary_name}'] = np.clip(
                     df['volume'] / volume_denominator, 1e-6, 1e6
                 )
-                
-                # Combined volume momentum
+
+                # Combined volume momentum (16 periods = 4h, 96 periods = 1d in 15m data)
                 df[f'combined_volume_momentum_{secondary_name}'] = (
-                    (df['volume'].rolling(4).mean() / df['volume'].rolling(24).mean()) *
-                    (df[f'{secondary_name}_volume'].rolling(4).mean() / df[f'{secondary_name}_volume'].rolling(24).mean())
+                    (df['volume'].rolling(16).mean() / df['volume'].rolling(96).mean()) *
+                    (df[f'{secondary_name}_volume'].rolling(16).mean() / df[f'{secondary_name}_volume'].rolling(96).mean())
                 )
             
             # Cross-volatility features
-            if f'{secondary_name}_volatility' in df.columns and 'volatility_24h' in df.columns:
+            if f'{secondary_name}_volatility' in df.columns and 'volatility_4h' in df.columns:
                 df[f'volatility_spread_{secondary_name}'] = (
-                    df['volatility_24h'] - df[f'{secondary_name}_volatility']
+                    df['volatility_4h'] - df[f'{secondary_name}_volatility']
                 )
                 volatility_denominator = df[f'{secondary_name}_volatility'] + 1e-6
                 df[f'volatility_ratio_{secondary_name}'] = np.clip(
-                    df['volatility_24h'] / volatility_denominator, 1e-3, 1e3
+                    df['volatility_4h'] / volatility_denominator, 1e-3, 1e3
                 )
             
             # 6. MARKET REGIME INDICATORS
@@ -373,38 +382,38 @@ class FeatureEngineer:
             df[f'high_correlation_regime_{secondary_name}'] = (
                 df[f'corr_strength_{secondary_name}'] > 0.7
             ).astype(int)
-            
+
             df[f'low_correlation_regime_{secondary_name}'] = (
                 df[f'corr_strength_{secondary_name}'] < 0.3
             ).astype(int)
-            
-            # Correlation breakdown events (when correlation drops significantly)
+
+            # Correlation breakdown events (96 periods = 1 day in 15m data)
             df[f'correlation_breakdown_{secondary_name}'] = (
-                (df[f'corr_{secondary_name}_24h'].shift(24) > 0.5) & 
-                (df[f'corr_{secondary_name}_24h'] < 0.2)
+                (df[f'corr_{secondary_name}_1d'].shift(96) > 0.5) &
+                (df[f'corr_{secondary_name}_1d'] < 0.2)
             ).astype(int)
-            
+
             # 7. RELATIVE STRENGTH
-            # Which crypto is performing better
-            primary_returns_24h = df['price'].pct_change(24, fill_method=None)
-            secondary_returns_24h = df[f'{secondary_name}_price'].pct_change(24, fill_method=None)
-            
+            # Which crypto is performing better (96 periods = 1 day, 672 = 1 week in 15m data)
+            primary_returns_1d = df['price'].pct_change(96, fill_method=None)
+            secondary_returns_1d = df[f'{secondary_name}_price'].pct_change(96, fill_method=None)
+
             df[f'relative_strength_{secondary_name}'] = (
-                primary_returns_24h - secondary_returns_24h
+                primary_returns_1d - secondary_returns_1d
             )
-            
-            # Rolling relative strength
+
+            # Rolling relative strength (672 periods = 7 days in 15m data)
             df[f'relative_strength_7d_{secondary_name}'] = (
-                df[f'relative_strength_{secondary_name}'].rolling(168).mean()  # 7 days
+                df[f'relative_strength_{secondary_name}'].rolling(672).mean()
             )
             
             # 8. CROSS-ASSET VOLUME FEATURES
             if 'volume' in df.columns and f'{secondary_name}_volume' in df.columns:
-                # Volume correlation
-                df[f'volume_correlation_{secondary_name}_24h'] = (
-                    df['volume'].rolling(24).corr(df[f'{secondary_name}_volume'])
+                # Volume correlation (96 periods = 1 day in 15m data)
+                df[f'volume_correlation_{secondary_name}_1d'] = (
+                    df['volume'].rolling(96).corr(df[f'{secondary_name}_volume'])
                 )
-                
+
                 # Volume ratio analysis - safer division
                 volume_denom = df[f'{secondary_name}_volume'] + 1e-3
                 df[f'volume_ratio_{secondary_name}'] = np.clip(
@@ -413,22 +422,22 @@ class FeatureEngineer:
                 df[f'volume_ratio_sma_14_{secondary_name}'] = (
                     df[f'volume_ratio_{secondary_name}'].rolling(14).mean()
                 )
-                
-                # Cross-volume momentum
-                volume_mom_primary = df['volume'].rolling(24).mean() / df['volume'].rolling(168).mean()
+
+                # Cross-volume momentum (96=1d, 672=7d in 15m data)
+                volume_mom_primary = df['volume'].rolling(96).mean() / df['volume'].rolling(672).mean()
                 volume_mom_secondary = (
-                    df[f'{secondary_name}_volume'].rolling(24).mean() / 
-                    df[f'{secondary_name}_volume'].rolling(168).mean()
+                    df[f'{secondary_name}_volume'].rolling(96).mean() /
+                    df[f'{secondary_name}_volume'].rolling(672).mean()
                 )
                 df[f'volume_momentum_divergence_{secondary_name}'] = volume_mom_primary - volume_mom_secondary
-                
-                # Combined volume strength (when both have high volume)
-                primary_vol_percentile = df['volume'].rolling(168).rank(pct=True)
-                secondary_vol_percentile = df[f'{secondary_name}_volume'].rolling(168).rank(pct=True)
+
+                # Combined volume strength (when both have high volume, 672=7d in 15m)
+                primary_vol_percentile = df['volume'].rolling(672).rank(pct=True)
+                secondary_vol_percentile = df[f'{secondary_name}_volume'].rolling(672).rank(pct=True)
                 df[f'combined_high_volume_{secondary_name}'] = (
                     (primary_vol_percentile > 0.8) & (secondary_vol_percentile > 0.8)
                 ).astype(int)
-                
+
                 # Volume divergence signals (when volumes move opposite directions)
                 primary_vol_change = df['volume'].pct_change(fill_method=None)
                 secondary_vol_change = df[f'{secondary_name}_volume'].pct_change(fill_method=None)
@@ -437,10 +446,10 @@ class FeatureEngineer:
                     (primary_vol_change < 0) & (secondary_vol_change > 0)
                 ).astype(int)
             
-            # Cross-OBV features
+            # Cross-OBV features (96 periods = 1 day in 15m data)
             if 'obv' in df.columns and f'{secondary_name}_obv' in df.columns:
-                df[f'obv_correlation_{secondary_name}_24h'] = (
-                    df['obv'].rolling(24).corr(df[f'{secondary_name}_obv'])
+                df[f'obv_correlation_{secondary_name}_1d'] = (
+                    df['obv'].rolling(96).corr(df[f'{secondary_name}_obv'])
                 )
                 df[f'obv_divergence_{secondary_name}'] = (
                     (df['obv'].diff() > 0) & (df[f'{secondary_name}_obv'].diff() < 0) |
@@ -448,23 +457,23 @@ class FeatureEngineer:
                 ).astype(int)
             
             # Cross-VWAP features
-            if 'vwap_24h' in df.columns and f'{secondary_name}_vwap' in df.columns:
+            if 'vwap_1d' in df.columns and f'{secondary_name}_vwap' in df.columns:
                 df[f'vwap_ratio_{secondary_name}'] = (
-                    df['vwap_24h'] / df[f'{secondary_name}_vwap']
+                    df['vwap_1d'] / df[f'{secondary_name}_vwap']
                 )
                 df[f'both_above_vwap_{secondary_name}'] = (
-                    (df['price'] > df['vwap_24h']) & 
+                    (df['price'] > df['vwap_1d']) &
                     (df[f'{secondary_name}_price'] > df[f'{secondary_name}_vwap'])
                 ).astype(int)
-            
-            # Cross-money flow features
-            if 'money_flow_24h' in df.columns and f'{secondary_name}_money_flow' in df.columns:
+
+            # Cross-money flow features (96 periods = 1 day in 15m data)
+            if 'money_flow_1d' in df.columns and f'{secondary_name}_money_flow' in df.columns:
                 df[f'money_flow_correlation_{secondary_name}'] = (
-                    df['money_flow_24h'].rolling(24).corr(df[f'{secondary_name}_money_flow'])
+                    df['money_flow_1d'].rolling(96).corr(df[f'{secondary_name}_money_flow'])
                 )
                 df[f'money_flow_divergence_{secondary_name}'] = (
-                    (df['money_flow_24h'] > 0) & (df[f'{secondary_name}_money_flow'] < 0) |
-                    (df['money_flow_24h'] < 0) & (df[f'{secondary_name}_money_flow'] > 0)
+                    (df['money_flow_1d'] > 0) & (df[f'{secondary_name}_money_flow'] < 0) |
+                    (df['money_flow_1d'] < 0) & (df[f'{secondary_name}_money_flow'] > 0)
                 ).astype(int)
             
             logger.info(f"Added cross-asset correlation features with {secondary_name}")
@@ -497,102 +506,97 @@ class FeatureEngineer:
         try:
             # ==== VOLUME MOVING AVERAGES AND RATIOS ====
             if 'volume' in df.columns:
+                # Standard TA period counts (independent of timeframe)
                 volume_windows = [7, 14, 30, 50]
                 for window in volume_windows:
                     # Volume moving averages
                     df[f'volume_sma_{window}'] = df['volume'].rolling(window).mean()
                     df[f'volume_ema_{window}'] = df['volume'].ewm(span=window).mean()
-                    
+
                     # Volume ratio to moving average
                     df[f'volume_ratio_sma_{window}'] = df['volume'] / (df[f'volume_sma_{window}'] + 1e-6)
                     df[f'volume_ratio_ema_{window}'] = df['volume'] / (df[f'volume_ema_{window}'] + 1e-6)
-                
+
                 # Volume percentiles (relative volume strength)
-                df['volume_percentile_30d'] = df['volume'].rolling(720).rank(pct=True)  # 30 days in hours
-                df['volume_percentile_7d'] = df['volume'].rolling(168).rank(pct=True)   # 7 days in hours
-                
+                # 2880 periods = 30 days in 15m data, 672 = 7 days
+                df['volume_percentile_30d'] = df['volume'].rolling(2880).rank(pct=True)
+                df['volume_percentile_7d'] = df['volume'].rolling(672).rank(pct=True)
+
                 # ==== ON-BALANCE VOLUME (OBV) ====
-                # OBV accumulates volume based on price direction
                 price_change = df['price'].diff()
-                volume_direction = np.where(price_change > 0, df['volume'], 
+                volume_direction = np.where(price_change > 0, df['volume'],
                                           np.where(price_change < 0, -df['volume'], 0))
                 df['obv'] = volume_direction.cumsum()
-                
+
                 # OBV moving averages and momentum
                 df['obv_sma_14'] = df['obv'].rolling(14).mean()
                 df['obv_ema_14'] = df['obv'].ewm(span=14).mean()
-                df['obv_momentum'] = df['obv'].diff(24)  # 24h OBV change
+                df['obv_momentum'] = df['obv'].diff(96)   # 96 periods = 1 day in 15m data
                 df['obv_acceleration'] = df['obv_momentum'].diff()
-                
-                # OBV relative to price (divergence detection)
-                df['obv_price_correlation_24h'] = df['obv'].rolling(24).corr(df['price'])
+
+                # OBV relative to price (divergence detection, 96 periods = 1 day in 15m)
+                df['obv_price_correlation_1d'] = df['obv'].rolling(96).corr(df['price'])
                 df['obv_price_divergence'] = (
-                    (df['price'].pct_change(24) > 0) & (df['obv_momentum'] < 0) |
-                    (df['price'].pct_change(24) < 0) & (df['obv_momentum'] > 0)
+                    (df['price'].pct_change(96) > 0) & (df['obv_momentum'] < 0) |
+                    (df['price'].pct_change(96) < 0) & (df['obv_momentum'] > 0)
                 ).astype(int)
-                
+
                 # ==== VOLUME WEIGHTED AVERAGE PRICE (VWAP) ====
-                # Calculate VWAP for different periods
-                vwap_periods = [24, 168, 720]  # 1 day, 1 week, 1 month
-                for period in vwap_periods:
-                    # VWAP = Sum(Price * Volume) / Sum(Volume)
+                # Periods: 96=1d, 672=7d, 2880=30d in 15m data
+                vwap_periods = [(96, '1d'), (672, '7d'), (2880, '30d')]
+                for period, label in vwap_periods:
                     pv = df['price'] * df['volume']
-                    df[f'vwap_{period}h'] = (
+                    df[f'vwap_{label}'] = (
                         pv.rolling(period).sum() / df['volume'].rolling(period).sum()
                     )
-                    
-                    # Price relative to VWAP (above/below VWAP)
-                    df[f'price_vs_vwap_{period}h'] = df['price'] / df[f'vwap_{period}h']
-                    df[f'above_vwap_{period}h'] = (df['price'] > df[f'vwap_{period}h']).astype(int)
-                
+                    df[f'price_vs_vwap_{label}'] = df['price'] / df[f'vwap_{label}']
+                    df[f'above_vwap_{label}'] = (df['price'] > df[f'vwap_{label}']).astype(int)
+
                 # ==== VOLUME MOMENTUM AND ACCELERATION ====
-                # Volume rate of change
-                volume_roc_periods = [1, 4, 12, 24, 168]
-                for period in volume_roc_periods:
-                    df[f'volume_roc_{period}h'] = df['volume'].pct_change(period)
-                
-                # Volume acceleration (rate of change of rate of change)
-                df['volume_acceleration_24h'] = df['volume_roc_24h'].diff()
-                
-                # Volume momentum indicators
+                # Periods: 1=15m, 4=1h, 16=4h, 96=1d, 672=7d in 15m data
+                volume_roc_periods = [(1, '15m'), (4, '1h'), (16, '4h'), (96, '1d'), (672, '7d')]
+                for period, label in volume_roc_periods:
+                    df[f'volume_roc_{label}'] = df['volume'].pct_change(period)
+
+                # Volume acceleration
+                df['volume_acceleration_1d'] = df['volume_roc_1d'].diff()
+
+                # Volume momentum indicators (96=1d, 672=7d in 15m)
                 df['volume_momentum_7d'] = (
-                    df['volume'].rolling(24).mean() / df['volume'].rolling(168).mean()
+                    df['volume'].rolling(96).mean() / df['volume'].rolling(672).mean()
                 )
-                df['volume_trend_strength'] = df['volume'].rolling(24).apply(
+                df['volume_trend_strength'] = df['volume'].rolling(96).apply(
                     lambda x: np.corrcoef(np.arange(len(x)), x)[0, 1] if len(x) > 1 else 0
                 )
-                
+
                 # ==== VOLUME SPIKES AND ANOMALIES ====
-                # Volume spike detection (volume significantly above average)
                 df['volume_spike_2x'] = (df['volume'] > 2 * df['volume_sma_30']).astype(int)
                 df['volume_spike_3x'] = (df['volume'] > 3 * df['volume_sma_30']).astype(int)
-                
-                # Volume drought detection (volume significantly below average)
                 df['volume_drought'] = (df['volume'] < 0.5 * df['volume_sma_30']).astype(int)
-                
-                # Volume volatility
-                df['volume_volatility_7d'] = df['volume_roc_1h'].rolling(168).std()
-                df['volume_volatility_30d'] = df['volume_roc_1h'].rolling(720).std()
-                
-                # Z-score of volume (how many standard deviations from mean)
-                volume_mean_30d = df['volume'].rolling(720).mean()
-                volume_std_30d = df['volume'].rolling(720).std()
+
+                # Volume volatility (2880=30d, 672=7d in 15m)
+                df['volume_volatility_7d'] = df['volume_roc_15m'].rolling(672).std()
+                df['volume_volatility_30d'] = df['volume_roc_15m'].rolling(2880).std()
+
+                # Z-score of volume (2880 = 30 days in 15m)
+                volume_mean_30d = df['volume'].rolling(2880).mean()
+                volume_std_30d = df['volume'].rolling(2880).std()
                 df['volume_zscore_30d'] = (df['volume'] - volume_mean_30d) / (volume_std_30d + 1e-6)
-                
+
                 # ==== PRICE-VOLUME RELATIONSHIPS ====
-                # Price-volume correlation
-                df['price_volume_corr_24h'] = df['price'].rolling(24).corr(df['volume'])
-                df['price_volume_corr_7d'] = df['price'].rolling(168).corr(df['volume'])
-                
-                # Volume-weighted price changes
-                df['volume_weighted_return_1h'] = df['price_change_1h'] * df['volume_ratio_sma_14']
-                df['volume_weighted_return_24h'] = df['price'].pct_change(24) * df['volume_ratio_sma_14']
-                
-                # Price impact per unit volume (efficiency measure)
+                # 96=1d, 672=7d in 15m data
+                df['price_volume_corr_1d'] = df['price'].rolling(96).corr(df['volume'])
+                df['price_volume_corr_7d'] = df['price'].rolling(672).corr(df['volume'])
+
+                # Volume-weighted price changes (using 15m base change)
+                df['volume_weighted_return_15m'] = df['price_change_15m'] * df['volume_ratio_sma_14']
+                df['volume_weighted_return_1d'] = df['price'].pct_change(96) * df['volume_ratio_sma_14']
+
+                # Price impact per unit volume
                 df['price_impact_per_volume'] = (
-                    df['price_change_1h'].abs() / (df['volume_ratio_sma_14'] + 1e-6)
+                    df['price_change_15m'].abs() / (df['volume_ratio_sma_14'] + 1e-6)
                 )
-                
+
                 # Volume distribution analysis
                 df['high_volume_regime'] = (df['volume_percentile_30d'] > 0.8).astype(int)
                 df['low_volume_regime'] = (df['volume_percentile_30d'] < 0.2).astype(int)
@@ -604,56 +608,55 @@ class FeatureEngineer:
                 for window in mc_windows:
                     df[f'market_cap_sma_{window}'] = df['market_cap'].rolling(window).mean()
                     df[f'market_cap_ratio_sma_{window}'] = df['market_cap'] / df[f'market_cap_sma_{window}']
-                
-                # Market cap rate of change
-                mc_roc_periods = [1, 24, 168]
-                for period in mc_roc_periods:
-                    df[f'market_cap_roc_{period}h'] = df['market_cap'].pct_change(period)
-                
-                # Market cap momentum
+
+                # Market cap rate of change (1=15m, 96=1d, 672=7d in 15m data)
+                mc_roc_periods = [(1, '15m'), (96, '1d'), (672, '7d')]
+                for period, label in mc_roc_periods:
+                    df[f'market_cap_roc_{label}'] = df['market_cap'].pct_change(period)
+
+                # Market cap momentum (96=1d, 672=7d in 15m)
                 df['market_cap_momentum_7d'] = (
-                    df['market_cap'].rolling(24).mean() / df['market_cap'].rolling(168).mean()
+                    df['market_cap'].rolling(96).mean() / df['market_cap'].rolling(672).mean()
                 )
-                
-                # Market cap volatility
-                df['market_cap_volatility_7d'] = df['market_cap_roc_1h'].rolling(168).std()
-                
-                # Market cap vs volume relationship
+
+                # Market cap volatility (672 = 7 days in 15m)
+                df['market_cap_volatility_7d'] = df['market_cap_roc_15m'].rolling(672).std()
+
+                # Market cap vs volume relationship (96 = 1 day in 15m)
                 if 'volume' in df.columns:
                     df['market_cap_volume_ratio'] = df['market_cap'] / (df['volume'] + 1e-6)
-                    df['mc_volume_correlation_24h'] = df['market_cap'].rolling(24).corr(df['volume'])
-                
-                # Market cap percentile
-                df['market_cap_percentile_30d'] = df['market_cap'].rolling(720).rank(pct=True)
+                    df['mc_volume_correlation_1d'] = df['market_cap'].rolling(96).corr(df['volume'])
+
+                # Market cap percentile (2880 = 30 days in 15m)
+                df['market_cap_percentile_30d'] = df['market_cap'].rolling(2880).rank(pct=True)
             
             # ==== ADVANCED VOLUME FEATURES ====
             if 'volume' in df.columns:
-                # Volume rate of change acceleration
-                df['volume_roc_acceleration'] = df['volume_roc_24h'].diff()
-                
-                # Volume efficiency (price change per unit of volume)
+                # Volume rate of change acceleration (1d label)
+                df['volume_roc_acceleration'] = df['volume_roc_1d'].diff()
+
+                # Volume efficiency (96=1d in 15m)
                 df['volume_efficiency'] = (
-                    df['price'].pct_change(24).abs() / (df['volume_ratio_sma_30'] + 1e-6)
+                    df['price'].pct_change(96).abs() / (df['volume_ratio_sma_30'] + 1e-6)
                 )
-                
-                # Cumulative volume over different periods
-                df['cumulative_volume_7d'] = df['volume'].rolling(168).sum()
-                df['cumulative_volume_30d'] = df['volume'].rolling(720).sum()
-                
-                # Volume concentration (what % of recent volume happened in last period)
-                df['volume_concentration_24h'] = (
-                    df['volume'].rolling(24).sum() / df['cumulative_volume_7d']
+
+                # Cumulative volume (672=7d, 2880=30d in 15m)
+                df['cumulative_volume_7d'] = df['volume'].rolling(672).sum()
+                df['cumulative_volume_30d'] = df['volume'].rolling(2880).sum()
+
+                # Volume concentration (96=1d in 15m)
+                df['volume_concentration_1d'] = (
+                    df['volume'].rolling(96).sum() / df['cumulative_volume_7d']
                 )
-                
-                # Money flow approximation (price * volume direction)
-                price_direction = np.where(df['price'].diff() > 0, 1, 
+
+                # Money flow approximation (96=1d, 672=7d in 15m)
+                price_direction = np.where(df['price'].diff() > 0, 1,
                                          np.where(df['price'].diff() < 0, -1, 0))
                 df['money_flow_raw'] = df['volume'] * price_direction
-                df['money_flow_24h'] = df['money_flow_raw'].rolling(24).sum()
-                df['money_flow_7d'] = df['money_flow_raw'].rolling(168).sum()
-                
+                df['money_flow_1d'] = df['money_flow_raw'].rolling(96).sum()
+                df['money_flow_7d'] = df['money_flow_raw'].rolling(672).sum()
+
                 # Volume-based support/resistance
-                # High volume periods often indicate support/resistance levels
                 df['high_volume_price_level'] = np.where(
                     df['volume_percentile_7d'] > 0.9, df['price'], np.nan
                 )
@@ -672,45 +675,52 @@ class FeatureEngineer:
     
     def add_momentum_features(self, df: pd.DataFrame, price_col: str = 'price') -> pd.DataFrame:
         """
-        Add momentum features to better capture price movement patterns
+        Add momentum features to better capture price movement patterns.
+        With 15-minute data: periods are in 15-minute units.
+        1h=4, 2h=8, 4h=16, 6h=24, 12h=48, 24h=96
         """
         try:
             logger.info("Adding momentum features...")
-            
-            # Price momentum indicators
-            for period in [3, 6, 12, 24]:  # Hours
-                df[f'momentum_{period}h'] = df[price_col].pct_change(period) * 100
-                df[f'momentum_abs_{period}h'] = df[f'momentum_{period}h'].abs()
-            
-            # Rate of change acceleration
-            df['roc_3h'] = df[price_col].pct_change(3) * 100
-            df['roc_6h'] = df[price_col].pct_change(6) * 100
-            df['roc_acceleration'] = df['roc_3h'] - df['roc_6h']
-            
-            # Moving average momentum
-            for window in [12, 24, 48]:
+
+            # Price momentum indicators (in 15m periods)
+            # 4=1h, 16=4h, 48=12h, 96=24h
+            momentum_configs = [(4, '1h'), (16, '4h'), (48, '12h'), (96, '1d')]
+            for period, label in momentum_configs:
+                df[f'momentum_{label}'] = df[price_col].pct_change(period) * 100
+                df[f'momentum_abs_{label}'] = df[f'momentum_{label}'].abs()
+
+            # Defragment the DataFrame to avoid pandas PerformanceWarning
+            df = df.copy()
+
+            # Rate of change acceleration (4=1h, 16=4h in 15m)
+            df['roc_1h'] = df[price_col].pct_change(4) * 100
+            df['roc_4h'] = df[price_col].pct_change(16) * 100
+            df['roc_acceleration'] = df['roc_1h'] - df['roc_4h']
+
+            # Moving average momentum (48=12h, 96=1d, 192=2d in 15m)
+            for window, label in [(48, '12h'), (96, '1d'), (192, '2d')]:
                 ma = df[price_col].rolling(window=window).mean()
-                df[f'ma_momentum_{window}h'] = ((df[price_col] - ma) / ma * 100).fillna(0)
-            
-            # Velocity indicators (rate of price change)
-            df['velocity_1h'] = df[price_col].diff(1)
-            df['velocity_3h'] = df[price_col].diff(3)
-            df['velocity_6h'] = df[price_col].diff(6)
-            
+                df[f'ma_momentum_{label}'] = ((df[price_col] - ma) / ma * 100).fillna(0)
+
+            # Velocity indicators (rate of price change in 15m periods)
+            df['velocity_15m'] = df[price_col].diff(1)
+            df['velocity_1h'] = df[price_col].diff(4)
+            df['velocity_4h'] = df[price_col].diff(16)
+
             # Momentum strength
             df['momentum_strength'] = (
-                df['momentum_3h'].abs() + 
-                df['momentum_6h'].abs() + 
+                df['momentum_1h'].abs() +
+                df['momentum_4h'].abs() +
                 df['momentum_12h'].abs()
             ) / 3
-            
-            # Trend consistency (how consistent is the direction)
-            for window in [6, 12, 24]:
+
+            # Trend consistency (24=6h, 48=12h, 96=1d in 15m)
+            for window, label in [(24, '6h'), (48, '12h'), (96, '1d')]:
                 returns = df[price_col].pct_change()
-                df[f'trend_consistency_{window}h'] = returns.rolling(window=window).apply(
+                df[f'trend_consistency_{label}'] = returns.rolling(window=window).apply(
                     lambda x: (x > 0).sum() / len(x) if len(x) > 0 else 0.5
                 )
-            
+
             logger.info("Added momentum features")
             
         except Exception as e:
@@ -720,43 +730,48 @@ class FeatureEngineer:
     
     def add_volatility_features(self, df: pd.DataFrame, price_col: str = 'price') -> pd.DataFrame:
         """
-        Add volatility features to capture market uncertainty and movement patterns
+        Add volatility features to capture market uncertainty and movement patterns.
+        With 15-minute data: 1h=4, 4h=16, 12h=48, 1d=96, 2d=192 periods.
         """
         try:
             logger.info("Adding volatility features...")
-            
+
+            # Defragment the DataFrame to avoid pandas PerformanceWarning
+            df = df.copy()
+
             # Rolling volatility (standard deviation of returns)
             returns = df[price_col].pct_change()
-            for window in [6, 12, 24, 48]:
-                df[f'volatility_{window}h'] = returns.rolling(window=window).std() * 100
-                
-            # Historical volatility
-            for window in [24, 48, 168]:  # 1 day, 2 days, 1 week
-                df[f'hist_vol_{window}h'] = (
-                    df[price_col].rolling(window=window).std() / 
+            # 24=6h, 48=12h, 96=1d, 192=2d in 15m
+            for window, label in [(24, '6h'), (48, '12h'), (96, '1d'), (192, '2d')]:
+                df[f'volatility_{label}'] = returns.rolling(window=window).std() * 100
+
+            # Historical volatility (96=1d, 192=2d, 672=7d in 15m)
+            for window, label in [(96, '1d'), (192, '2d'), (672, '7d')]:
+                df[f'hist_vol_{label}'] = (
+                    df[price_col].rolling(window=window).std() /
                     df[price_col].rolling(window=window).mean() * 100
                 ).fillna(0)
-            
+
             # Volatility ratios (short vs long term)
-            df['vol_ratio_6_24'] = df['volatility_6h'] / df['volatility_24h']
-            df['vol_ratio_12_48'] = df['volatility_12h'] / df['volatility_48h']
-            
-            # Price range indicators
+            df['vol_ratio_6h_1d'] = df['volatility_6h'] / (df['volatility_1d'] + 1e-10)
+            df['vol_ratio_12h_2d'] = df['volatility_12h'] / (df['volatility_2d'] + 1e-10)
+
+            # Price range indicators (24=6h, 48=12h, 96=1d in 15m)
             high_col = 'high' if 'high' in df.columns else price_col
             low_col = 'low' if 'low' in df.columns else price_col
-            
-            for window in [6, 12, 24]:
+
+            for window, label in [(24, '6h'), (48, '12h'), (96, '1d')]:
                 rolling_high = df[high_col].rolling(window=window).max()
                 rolling_low = df[low_col].rolling(window=window).min()
-                df[f'price_range_{window}h'] = (
+                df[f'price_range_{label}'] = (
                     (rolling_high - rolling_low) / rolling_low * 100
                 ).fillna(0)
-            
+
             # Volatility breakout indicators
             df['vol_breakout'] = (
-                df['volatility_6h'] > df['volatility_24h'].shift(1) * 1.5
+                df['volatility_6h'] > df['volatility_1d'].shift(1) * 1.5
             ).astype(int)
-            
+
             # Average True Range (ATR) approximation
             if 'high' in df.columns and 'low' in df.columns:
                 tr = pd.DataFrame({
@@ -764,10 +779,10 @@ class FeatureEngineer:
                     'hc': abs(df['high'] - df[price_col].shift(1)),
                     'lc': abs(df['low'] - df[price_col].shift(1))
                 }).max(axis=1)
-                
-                for window in [14, 24]:
-                    df[f'atr_{window}h'] = tr.rolling(window=window).mean()
-            
+
+                for window, label in [(14, '14p'), (96, '1d')]:
+                    df[f'atr_{label}'] = tr.rolling(window=window).mean()
+
             logger.info("Added volatility features")
             
         except Exception as e:
@@ -777,42 +792,41 @@ class FeatureEngineer:
     
     def create_target_variables(self, df: pd.DataFrame, price_col: str = 'price') -> pd.DataFrame:
         """
-        Create target variables for different prediction horizons
+        Create target variables for different prediction horizons.
+        With 15-minute data:
+          15m  → shift(-1)   = 1 period ahead
+          1h   → shift(-4)   = 4 periods ahead
+          4h   → shift(-16)  = 16 periods ahead
         CRITICAL: This creates targets that look FORWARD in time to avoid data leakage
         """
         df = df.copy()
-        
+
         try:
-            # IMPORTANT: For time series prediction, we want to predict FUTURE prices
-            # Using shift(-n) means we're looking n periods into the future
-            # This is correct as long as during training we drop rows where targets are NaN
-            
             # Target variables for different horizons (future prices)
-            df['target_1h'] = df[price_col].shift(-1)   # Price 1 hour in the future
-            df['target_1d'] = df[price_col].shift(-24)  # Price 24 hours in the future  
-            df['target_1w'] = df[price_col].shift(-24*7)  # Price 7 days in the future
-            
+            df['target_15m'] = df[price_col].shift(-1)    # Price 15 minutes in the future
+            df['target_1h'] = df[price_col].shift(-4)     # Price 1 hour in the future
+            df['target_4h'] = df[price_col].shift(-16)    # Price 4 hours in the future
+
             # Target returns (percentage change)
+            df['target_return_15m'] = (df['target_15m'] / df[price_col] - 1) * 100
             df['target_return_1h'] = (df['target_1h'] / df[price_col] - 1) * 100
-            df['target_return_1d'] = (df['target_1d'] / df[price_col] - 1) * 100
-            df['target_return_1w'] = (df['target_1w'] / df[price_col] - 1) * 100
-            
+            df['target_return_4h'] = (df['target_4h'] / df[price_col] - 1) * 100
+
             # Binary classification targets (up/down)
+            df['target_direction_15m'] = (df['target_return_15m'] > 0).astype(int)
             df['target_direction_1h'] = (df['target_return_1h'] > 0).astype(int)
-            df['target_direction_1d'] = (df['target_return_1d'] > 0).astype(int)
-            df['target_direction_1w'] = (df['target_return_1w'] > 0).astype(int)
-            
+            df['target_direction_4h'] = (df['target_return_4h'] > 0).astype(int)
+
             # CRITICAL: Create future datetime stamps for proper evaluation
-            # These represent the actual TIME that our predictions are targeting
+            df['target_datetime_15m'] = df['datetime'] + pd.Timedelta(minutes=15)
             df['target_datetime_1h'] = df['datetime'] + pd.Timedelta(hours=1)
-            df['target_datetime_1d'] = df['datetime'] + pd.Timedelta(days=1)
-            df['target_datetime_1w'] = df['datetime'] + pd.Timedelta(weeks=1)
-            
-            logger.info("Created target variables for 1h, 1d, 1w horizons")
-            
+            df['target_datetime_4h'] = df['datetime'] + pd.Timedelta(hours=4)
+
+            logger.info("Created target variables for 15m, 1h, 4h horizons")
+
         except Exception as e:
             logger.error(f"Error creating target variables: {e}")
-        
+
         return df
     
     def prepare_features(self, crypto_df: pd.DataFrame, market_df: pd.DataFrame = None) -> pd.DataFrame:
@@ -837,26 +851,33 @@ class FeatureEngineer:
         # Clean data: replace infinity and extreme values
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], np.nan)
-        
+
         # Replace extreme values (beyond 3 standard deviations) with NaN
+        _target_cols_set = {
+            'target_15m', 'target_1h', 'target_4h',
+            'target_return_15m', 'target_return_1h', 'target_return_4h',
+            'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
+        }
         for col in numeric_cols:
-            if col not in ['datetime', 'target_1h', 'target_1d', 'target_1w', 
-                          'target_return_1h', 'target_return_1d', 'target_return_1w',
-                          'target_direction_1h', 'target_direction_1d', 'target_direction_1w']:
+            if col not in _target_cols_set:
                 mean_val = df[col].mean()
                 std_val = df[col].std()
                 if not pd.isna(std_val) and std_val > 0:
                     df.loc[np.abs(df[col] - mean_val) > 3 * std_val, col] = np.nan
-        
+
         # Store feature column names (excluding targets and metadata)
-        exclude_cols = ['datetime', 'crypto', 'target_1h', 'target_1d', 'target_1w', 
-                       'target_return_1h', 'target_return_1d', 'target_return_1w',
-                       'target_direction_1h', 'target_direction_1d', 'target_direction_1w',
-                       'target_datetime_1h', 'target_datetime_1d', 'target_datetime_1w']
+        exclude_cols = [
+            'datetime', 'crypto',
+            'target_15m', 'target_1h', 'target_4h',
+            'target_return_15m', 'target_return_1h', 'target_return_4h',
+            'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
+            'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h',
+        ]
         
         self.feature_columns = [col for col in df.columns if col not in exclude_cols]
         
-        # CRITICAL: Data leakage validation
+        # CRITICAL: Data leakage validation (re-derive feature columns after cross-asset enrichment)
+        self.feature_columns = [col for col in df.columns if col not in exclude_cols]
         self.validate_no_data_leakage(df)
         
         logger.info(f"Feature engineering complete. Total features: {len(self.feature_columns)}")
@@ -870,14 +891,24 @@ class FeatureEngineer:
         """
         logger.info("🔍 Validating dataset for data leakage...")
         
-        # Check 1: Ensure target variables are properly shifted into the future
-        target_cols = ['target_1h', 'target_1d', 'target_1w']
-        for target in target_cols:
+        # Check 1: Ensure target variables are properly shifted into the future.
+        # shift(-n) produces NaN in the LAST n rows (not the first), so a valid
+        # value at index 0 is completely correct.  We verify the tail is NaN.
+        target_shift_map = {
+            'target_15m': 1,   # shift(-1)
+            'target_1h':  4,   # shift(-4)
+            'target_4h':  16,  # shift(-16)
+        }
+        for target, shift_n in target_shift_map.items():
             if target in df.columns:
-                # Check that target values appear later in time
-                first_valid_idx = df[target].first_valid_index()
-                if first_valid_idx is not None and first_valid_idx == 0:
-                    logger.warning(f"⚠️  {target} has valid value at index 0 - possible data leakage!")
+                tail_nans = df[target].iloc[-shift_n:].isna().sum()
+                if tail_nans < shift_n:
+                    logger.warning(
+                        f"⚠️  {target}: expected {shift_n} NaN(s) at tail "
+                        f"but only found {tail_nans} — shift may not have been applied!"
+                    )
+                else:
+                    logger.info(f"✅ {target}: tail NaN check passed ({tail_nans}/{shift_n})")
         
         # Check 2: Verify datetime ordering
         if 'datetime' in df.columns:
@@ -968,25 +999,29 @@ class FeatureEngineer:
                 
                 # Replace extremely large values that could cause overflow
                 for col in numeric_cols:
-                    if col not in ['datetime', 'target_1h', 'target_1d', 'target_1w', 
-                                  'target_return_1h', 'target_return_1d', 'target_return_1w',
-                                  'target_direction_1h', 'target_direction_1d', 'target_direction_1w']:
-                        
+                    if col not in [
+                        'datetime',
+                        'target_15m', 'target_1h', 'target_4h',
+                        'target_return_15m', 'target_return_1h', 'target_return_4h',
+                        'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
+                    ]:
                         # Check for extremely large values (beyond reasonable float64 range)
                         max_safe_value = 1e10  # 10 billion - reasonable upper bound
                         crypto_df.loc[crypto_df[col].abs() > max_safe_value, col] = np.nan
-                        
+
                         # Also clean values that are too close to zero in division results
-                        # This prevents near-zero denominators from creating unstable features
                         if any(substring in col for substring in ['_ratio', '_vs_', 'divergence', 'correlation']):
-                            # For ratio and correlation features, cap extreme values
                             crypto_df.loc[crypto_df[col].abs() > 1000, col] = np.nan
-                
+
                 # Fill remaining NaN values with forward fill, then backward fill, then zero
+                _exclude_fill = {
+                    'datetime',
+                    'target_15m', 'target_1h', 'target_4h',
+                    'target_return_15m', 'target_return_1h', 'target_return_4h',
+                    'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
+                }
                 for col in numeric_cols:
-                    if col not in ['datetime', 'target_1h', 'target_1d', 'target_1w', 
-                                  'target_return_1h', 'target_return_1d', 'target_return_1w',
-                                  'target_direction_1h', 'target_direction_1d', 'target_direction_1w']:
+                    if col not in _exclude_fill:
                         # Forward fill
                         crypto_df[col] = crypto_df[col].ffill()
                         # Backward fill
@@ -1005,10 +1040,13 @@ class FeatureEngineer:
         # Update feature columns for the enhanced datasets
         for crypto_name, crypto_df in prepared_data.items():
             if not crypto_df.empty:
-                exclude_cols = ['datetime', 'crypto', 'target_1h', 'target_1d', 'target_1w', 
-                               'target_return_1h', 'target_return_1d', 'target_return_1w',
-                               'target_direction_1h', 'target_direction_1d', 'target_direction_1w',
-                               'target_datetime_1h', 'target_datetime_1d', 'target_datetime_1w']
+                exclude_cols = [
+                    'datetime', 'crypto',
+                    'target_15m', 'target_1h', 'target_4h',
+                    'target_return_15m', 'target_return_1h', 'target_return_4h',
+                    'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
+                    'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h',
+                ]
                 
                 feature_cols = [col for col in crypto_df.columns if col not in exclude_cols]
                 

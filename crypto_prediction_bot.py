@@ -370,13 +370,14 @@ class CryptoPredictionBot:
                 # Insert prediction into database with corrected timestamp logic
                 conn.execute('''
                     INSERT INTO predictions 
-                    (datetime, crypto, prediction_horizon, predicted_price, confidence, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (datetime, crypto, prediction_horizon, predicted_price, current_price, confidence, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     target_timestamp_str,  # FIXED: Use target time, not feature time
                     str(prediction['crypto']),
                     str(prediction['horizon']),
                     float(prediction['predicted_price']),
+                    float(prediction.get('current_price', 0)),  # Store current price for direction accuracy
                     float(prediction['model_confidence']),
                     datetime.now().isoformat()  # When the prediction was actually made
                 ))
@@ -429,7 +430,7 @@ class CryptoPredictionBot:
                 real_time_price = preds[0]['current_price']
             
             # Sort by horizon
-            preds.sort(key=lambda x: {'1h': 1, '1d': 2, '1w': 3}[x['horizon']])
+            preds.sort(key=lambda x: {'15m': 1, '1h': 2, '4h': 3}.get(x['horizon'], 99))
             
             for pred in preds:
                 direction_emoji = "🟢" if pred['predicted_direction'] else "🔴"
@@ -506,15 +507,15 @@ class CryptoPredictionBot:
                 
                 # Define evaluation windows that match the prediction horizons
                 can_evaluate = False
-                # FIXED: More flexible evaluation windows that work with 10-minute prediction schedule
-                if horizon == '1h' and time_since_created >= timedelta(minutes=50):
-                    # Evaluate 1h predictions any time 50+ minutes after creation (was 55-65 minutes)
+                # FIXED: More flexible evaluation windows that work with 5-minute prediction schedule
+                if horizon == '15m' and time_since_created >= timedelta(minutes=5):
+                    # Evaluate 15m predictions any time 5+ minutes after creation
                     can_evaluate = True
-                elif horizon == '1d' and time_since_created >= timedelta(hours=20):
-                    # Evaluate 1d predictions any time 20+ hours after creation (was 22-26 hours)
+                elif horizon == '1h' and time_since_created >= timedelta(minutes=50):
+                    # Evaluate 1h predictions any time 50+ minutes after creation
                     can_evaluate = True
-                elif horizon == '1w' and time_since_created >= timedelta(days=6):
-                    # Evaluate 1w predictions any time 6+ days after creation (was 6-8 days)
+                elif horizon == '4h' and time_since_created >= timedelta(hours=3, minutes=30):
+                    # Evaluate 4h predictions any time 3.5+ hours after creation
                     can_evaluate = True
                 
                 # Only evaluate if within the time window and we have current price
@@ -609,7 +610,7 @@ class CryptoPredictionBot:
                 print("-" * 100)
                 
                 # Get latest evaluation for each horizon
-                for horizon in ['1h', '1d', '1w']:
+                for horizon in ['15m', '1h', '4h']:
                     horizon_data = crypto_data[crypto_data['prediction_horizon'] == horizon]
                     
                     if not horizon_data.empty:
@@ -760,19 +761,18 @@ class CryptoPredictionBot:
             
             for horizon in config.PREDICTION_INTERVALS:
                 # Define time windows for when predictions can be compared to current prices
-                # FIXED: More flexible evaluation windows that work with 10-minute prediction schedule
-                if horizon == '1h':
-                    # Compare 1h predictions made 50+ minutes ago (was 55-65 minutes)
+                if horizon == '15m':
+                    # Compare 15m predictions made 5+ minutes ago
+                    min_age = timedelta(minutes=5)
+                    max_age = timedelta(hours=1)  # Up to 1 hour old
+                elif horizon == '1h':
+                    # Compare 1h predictions made 50+ minutes ago
                     min_age = timedelta(minutes=50)
                     max_age = timedelta(hours=4)  # Up to 4 hours old
-                elif horizon == '1d':
-                    # Compare 1d predictions made 20+ hours ago (was 22-26 hours)
-                    min_age = timedelta(hours=20)
-                    max_age = timedelta(hours=48)  # Up to 48 hours old
-                elif horizon == '1w':
-                    # Compare 1w predictions made 6+ days ago (was 6-8 days)
-                    min_age = timedelta(days=6)
-                    max_age = timedelta(days=14)  # Up to 14 days old
+                elif horizon == '4h':
+                    # Compare 4h predictions made 3.5+ hours ago
+                    min_age = timedelta(hours=3, minutes=30)
+                    max_age = timedelta(hours=24)  # Up to 24 hours old
                 else:
                     continue
                 
@@ -850,15 +850,15 @@ class CryptoPredictionBot:
         self.train_models()
         
         # Don't wait for boundaries - start checking immediately
-        logger.info(f"Starting immediately at {datetime.now().strftime('%H:%M:%S')} - will catch next 10-minute boundary")
+        logger.info(f"Starting immediately at {datetime.now().strftime('%H:%M:%S')} - will catch next 5-minute boundary")
         
         # Set up variables for tracking other scheduled tasks
         last_price_update = datetime.now()
         last_model_training = datetime.now()
-        last_prediction_run = datetime.now() - timedelta(minutes=15)  # Initialize to 15 min ago
+        last_prediction_run = datetime.now() - timedelta(minutes=10)  # Initialize to 10 min ago
         
-        logger.info(f"Bot started - Predictions every 10 minutes at clock boundaries (XX:00, XX:10, XX:20, etc.)")
-        logger.info("Checking system clock every second for 10-minute boundaries...")
+        logger.info(f"Bot started - Predictions every 5 minutes at clock boundaries (XX:00, XX:05, XX:10, etc.)")
+        logger.info("Checking system clock every second for 5-minute boundaries...")
         
         try:
             while True:
@@ -866,12 +866,12 @@ class CryptoPredictionBot:
                 current_minute = now.minute
                 current_second = now.second
                 
-                # Check if we're at a 10-minute boundary (XX:00, XX:10, XX:20, etc.)
-                is_ten_minute_boundary = (current_minute % 10 == 0)
+                # Check if we're at a 5-minute boundary (XX:00, XX:05, XX:10, etc.)
+                is_five_minute_boundary = (current_minute % 5 == 0)
                 
-                # Only run if we're at boundary AND haven't run in the last 5 minutes (prevent double-runs)
+                # Only run if we're at boundary AND haven't run in the last 2.5 minutes (prevent double-runs)
                 time_since_last_prediction = (now - last_prediction_run).total_seconds()
-                should_run_prediction = is_ten_minute_boundary and time_since_last_prediction > 300
+                should_run_prediction = is_five_minute_boundary and time_since_last_prediction > 150
                 
                 if should_run_prediction:
                     logger.info(f"🎯 BOUNDARY HIT! Running scheduled prediction at {now.strftime('%H:%M:%S')}")
@@ -923,7 +923,7 @@ def main():
     print("🚀 Crypto Price Prediction Bot")
     print("="*50)
     print("Free ML-powered Bitcoin & Ethereum price predictions")
-    print("Horizons: 1 hour, 1 day, 1 week")
+    print("Horizons: 15 minutes, 1 hour, 4 hours")
     print("="*50)
     
     bot = CryptoPredictionBot()

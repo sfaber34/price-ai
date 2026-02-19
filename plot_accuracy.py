@@ -126,9 +126,9 @@ def show_accuracy_summary():
     print("PREDICTION ACCURACY SUMMARY")
     print("="*80)
     print("Note: Predictions can only be evaluated after their target time:")
+    print("  • 15M predictions: evaluated 15 minutes after prediction")
     print("  • 1H predictions: evaluated 1 hour after prediction")
-    print("  • 1D predictions: evaluated 1 day after prediction") 
-    print("  • 1W predictions: evaluated 1 week after prediction")
+    print("  • 4H predictions: evaluated 4 hours after prediction")
     print("-" * 80)
     
     overall_has_data = False
@@ -150,12 +150,12 @@ def show_accuracy_summary():
             else:
                 # Check if we have any predictions stored but not yet mature for evaluation
                 # This gives more helpful feedback
-                if horizon == '1h':
+                if horizon == '15m':
+                    time_needed = "15 minutes"
+                elif horizon == '1h':
                     time_needed = "1 hour"
-                elif horizon == '1d':
-                    time_needed = "1 day"
-                elif horizon == '1w':
-                    time_needed = "1 week"
+                elif horizon == '4h':
+                    time_needed = "4 hours"
                 else:
                     time_needed = "target time"
                     
@@ -168,9 +168,9 @@ def show_accuracy_summary():
     if not overall_has_data:
         print(f"\n⏳ IMPORTANT: No mature prediction evaluations are available yet.")
         print(f"   This is normal if the model has been running for less than:")
+        print(f"   • 15 minutes (for 15M predictions)")
         print(f"   • 1 hour (for 1H predictions)")
-        print(f"   • 1 day (for 1D predictions)")
-        print(f"   • 1 week (for 1W predictions)")
+        print(f"   • 4 hours (for 4H predictions)")
     
     print("\n" + "="*80)
 

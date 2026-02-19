@@ -134,8 +134,8 @@ class CryptoBacktester:
             
             return prepared_data
     
-    def create_time_splits(self, data: pd.DataFrame, train_days: int = 90, 
-                          step_days: int = 7, min_future_days: int = 8) -> List[Tuple[int, int]]:
+    def create_time_splits(self, data: pd.DataFrame, train_days: int = 30, 
+                          step_days: int = 7, min_future_days: int = 2) -> List[Tuple[int, int]]:
         """
         Create time-based train/test splits for backtesting
         
@@ -151,10 +151,10 @@ class CryptoBacktester:
         data = data.sort_values('datetime').reset_index(drop=True)
         total_records = len(data)
         
-        # Calculate indices for splits
-        train_records = int(train_days * 24)  # Assuming hourly data
-        step_records = int(step_days * 24)
-        min_future_records = int(min_future_days * 24)
+        # Calculate indices for splits (15-minute intervals: 4 per hour, 96 per day)
+        train_records = int(train_days * 24 * 4)
+        step_records = int(step_days * 24 * 4)
+        min_future_records = int(min_future_days * 24 * 4)
         
         splits = []
         
@@ -195,15 +195,15 @@ class CryptoBacktester:
             # Get the prediction timestamp (start of test period)
             prediction_time = data.iloc[test_start]['datetime']
             
-            # Find future prices for evaluation
+            # Find future prices for evaluation (15-minute intervals: 4 per hour)
             future_prices = {}
             for horizon in config.PREDICTION_INTERVALS:
-                if horizon == '1h':
-                    future_idx = test_start + 1
-                elif horizon == '1d':
-                    future_idx = test_start + 24
-                elif horizon == '1w':
-                    future_idx = test_start + (24 * 7)
+                if horizon == '15m':
+                    future_idx = test_start + 1         # 1 × 15m interval
+                elif horizon == '1h':
+                    future_idx = test_start + 4         # 4 × 15m intervals
+                elif horizon == '4h':
+                    future_idx = test_start + 16        # 16 × 15m intervals
                 else:
                     continue
                 
@@ -334,14 +334,16 @@ class CryptoBacktester:
         """
         logger.info("Starting training window size experiment...")
         
-        # Define training window sizes (in days) - ensuring sufficient data diversity
+        # Define training window sizes (in days).
+        # Yahoo Finance caps 15m data to the last ~59 days, so windows are
+        # kept well under that limit to leave room for test/future data.
         training_windows = {
-            '1_month': 30,       # 1 month = 720 hours (minimum reliable)
-            '6_weeks': 42,       # 6 weeks = 1008 hours (solid foundation)
-            '2_months': 60,      # 2 months = 1440 hours (good baseline)
-            '10_weeks': 70,      # 10 weeks = 1680 hours (extended range)
-            '3_months': 90,      # 3 months = 2160 hours (current bot standard)
-            '4_months': 120      # 4 months = 2880 hours (maximum context)
+            '1_week':   7,   # 1 week  = 672  15m intervals
+            '2_weeks':  14,  # 2 weeks = 1344 15m intervals
+            '3_weeks':  21,  # 3 weeks = 2016 15m intervals
+            '1_month':  30,  # 1 month = 2880 15m intervals
+            '6_weeks':  42,  # 6 weeks = 4032 15m intervals
+            '7_weeks':  49,  # 7 weeks = 4704 15m intervals (near maximum)
         }
         
         # Collect historical data once
@@ -378,7 +380,7 @@ class CryptoBacktester:
                 data = prepared_data[crypto]
                 
                 # Create splits for this window size, step by 1 day to get more samples
-                splits = self.create_time_splits(data, window_days, step_days=1, min_future_days=8)
+                splits = self.create_time_splits(data, window_days, step_days=1, min_future_days=2)
                 
                 # Limit to requested number of runs
                 if len(splits) > runs_per_window:
@@ -523,7 +525,7 @@ class CryptoBacktester:
                 print(f"{'Window':>12} | {'Count':>5} | {'Avg %Err':>8} | {'Std %Err':>8} | {'Dir Acc':>7} | {'Conf':>6}")
                 print("-" * 75)
                 
-                for window_name in ['1_month', '6_weeks', '2_months', '10_weeks', '3_months', '4_months']:
+                for window_name in ['1_week', '2_weeks', '3_weeks', '1_month', '6_weeks', '7_weeks']:
                     if (window_name in analysis and 
                         crypto in analysis[window_name] and 
                         horizon in analysis[window_name][crypto]):
@@ -558,7 +560,7 @@ class CryptoBacktester:
                 best_window = None
                 best_error = float('inf')
                 
-                for window_name in ['1_month', '6_weeks', '2_months', '10_weeks', '3_months', '4_months']:
+                for window_name in ['1_week', '2_weeks', '3_weeks', '1_month', '6_weeks', '7_weeks']:
                     if (window_name in analysis and 
                         crypto in analysis[window_name] and 
                         horizon in analysis[window_name][crypto]):
@@ -620,7 +622,7 @@ def train_production_models(backtester: CryptoBacktester, analysis: Dict, days: 
             best_window = None
             best_error = float('inf')
             
-            for window_name in ['1_month', '6_weeks', '2_months', '10_weeks', '3_months', '4_months']:
+            for window_name in ['1_week', '2_weeks', '3_weeks', '1_month', '6_weeks', '7_weeks']:
                 if (window_name in analysis and 
                     crypto in analysis[window_name] and 
                     horizon in analysis[window_name][crypto]):
@@ -634,8 +636,8 @@ def train_production_models(backtester: CryptoBacktester, analysis: Dict, days: 
                 optimal_windows[crypto][horizon] = {
                     'window_name': best_window,
                     'window_days': {
-                        '1_month': 30, '6_weeks': 42, '2_months': 60, 
-                        '10_weeks': 70, '3_months': 90, '4_months': 120
+                        '1_week': 7, '2_weeks': 14, '3_weeks': 21,
+                        '1_month': 30, '6_weeks': 42, '7_weeks': 49,
                     }[best_window],
                     'expected_error': best_error
                 }
@@ -663,8 +665,8 @@ def train_production_models(backtester: CryptoBacktester, analysis: Dict, days: 
                 
                 print(f"\n🔧 Training {crypto.upper()} {horizon.upper()} model with {window_info['window_name']} window...")
                 
-                # Use the full recent data for training (last N days)
-                recent_data = data.tail(int(train_days * 24)).copy()
+                # Use the full recent data for training (last N days, 96 × 15m intervals per day)
+                recent_data = data.tail(int(train_days * 24 * 4)).copy()
                 
                 # Create model and train
                 model_key = f"{crypto}_{horizon}"

@@ -39,10 +39,10 @@ class CryptoPredictionModel:
         
         # Separate features and target
         exclude_cols = [
-            'datetime', 'crypto', 'target_1h', 'target_1d', 'target_1w', 
-            'target_return_1h', 'target_return_1d', 'target_return_1w',
-            'target_direction_1h', 'target_direction_1d', 'target_direction_1w',
-            'target_datetime_1h', 'target_datetime_1d', 'target_datetime_1w'
+            'datetime', 'crypto', 'target_15m', 'target_1h', 'target_4h',
+            'target_return_15m', 'target_return_1h', 'target_return_4h',
+            'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
+            'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h'
         ]
         
         feature_cols = [col for col in clean_df.columns if col not in exclude_cols]
@@ -302,9 +302,9 @@ class CryptoPredictionModel:
         
         # Define target columns based on prediction horizon
         target_mapping = {
-            '1h': ('target_return_1h', 'target_direction_1h'),
-            '1d': ('target_return_1d', 'target_direction_1d'),
-            '1w': ('target_return_1w', 'target_direction_1w')
+            '15m': ('target_return_15m', 'target_direction_15m'),
+            '1h':  ('target_return_1h',  'target_direction_1h'),
+            '4h':  ('target_return_4h',  'target_direction_4h')
         }
         
         if self.prediction_horizon not in target_mapping:
@@ -361,10 +361,10 @@ class CryptoPredictionModel:
             
             # Prepare features
             exclude_cols = [
-                'datetime', 'crypto', 'target_1h', 'target_1d', 'target_1w', 
-                'target_return_1h', 'target_return_1d', 'target_return_1w',
-                'target_direction_1h', 'target_direction_1d', 'target_direction_1w',
-                'target_datetime_1h', 'target_datetime_1d', 'target_datetime_1w'
+                'datetime', 'crypto', 'target_15m', 'target_1h', 'target_4h',
+                'target_return_15m', 'target_return_1h', 'target_return_4h',
+                'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
+                'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h'
             ]
             
             X = latest_data[[col for col in latest_data.columns if col not in exclude_cols]].fillna(0)
@@ -406,12 +406,12 @@ class CryptoPredictionModel:
                 feature_datetime = pd.to_datetime(feature_datetime)
             
             # Calculate target datetime based on prediction horizon
-            if self.prediction_horizon == '1h':
+            if self.prediction_horizon == '15m':
+                target_datetime = feature_datetime + pd.Timedelta(minutes=15)
+            elif self.prediction_horizon == '1h':
                 target_datetime = feature_datetime + pd.Timedelta(hours=1)
-            elif self.prediction_horizon == '1d':
-                target_datetime = feature_datetime + pd.Timedelta(days=1)
-            elif self.prediction_horizon == '1w':
-                target_datetime = feature_datetime + pd.Timedelta(weeks=1)
+            elif self.prediction_horizon == '4h':
+                target_datetime = feature_datetime + pd.Timedelta(hours=4)
             else:
                 target_datetime = feature_datetime  # Fallback
             
@@ -559,7 +559,7 @@ if __name__ == "__main__":
     btc_features = fe.prepare_features(btc_data, market_data)
     
     # Create and train model
-    model = CryptoPredictionModel('bitcoin', '1h')
+    model = CryptoPredictionModel('bitcoin', '15m')
     training_results = model.train(btc_features)
     
     print("Training Results:")

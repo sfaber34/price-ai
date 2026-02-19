@@ -19,8 +19,8 @@ DATABASE_PATH = "crypto_predictions.db"
 
 # Prediction Settings
 CRYPTOCURRENCIES = ['bitcoin', 'ethereum']
-PREDICTION_INTERVALS = ['1h', '1d', '1w']
-UPDATE_FREQUENCY_MINUTES = 10
+PREDICTION_INTERVALS = ['15m', '1h', '4h']
+UPDATE_FREQUENCY_MINUTES = 5
 
 # Technical Indicators Settings
 TECHNICAL_INDICATORS = {

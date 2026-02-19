@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.ticker as mticker
 import seaborn as sns
 from datetime import datetime, timedelta
 import logging
@@ -87,20 +88,42 @@ class PredictionAccuracyTracker:
                 crypto TEXT,
                 timestamp TIMESTAMP,
                 actual_price REAL,
+                predicted_price_15m REAL,
                 predicted_price_1h REAL,
-                predicted_price_1d REAL,
-                predicted_price_1w REAL,
+                predicted_price_4h REAL,
+                error_15m REAL,
                 error_1h REAL,
-                error_1d REAL,
-                error_1w REAL,
+                error_4h REAL,
+                percent_error_15m REAL,
                 percent_error_1h REAL,
-                percent_error_1d REAL,
-                percent_error_1w REAL,
+                percent_error_4h REAL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(crypto, timestamp)
             )
         ''')
         
+        # Migration: delete evaluations that were stored with the broken direction-accuracy
+        # fallback (direction_predicted was always 1 when start_price was unavailable).
+        # Those rows have direction_predicted = 1 AND direction_actual = 1, making direction_correct
+        # appear inflated.  We can only reliably identify bad rows by checking whether the
+        # originating prediction had current_price = 0 or NULL (the old schema default).
+        # Simplest safe approach: delete all evaluations whose linked prediction has no current_price,
+        # so they will be re-evaluated correctly next time the bot runs.
+        try:
+            cursor.execute('''
+                DELETE FROM prediction_evaluations
+                WHERE prediction_id IN (
+                    SELECT id FROM predictions
+                    WHERE current_price IS NULL OR current_price = 0
+                )
+            ''')
+            deleted = cursor.rowcount
+            if deleted > 0:
+                logger.info(f"Migration: removed {deleted} evaluations with unreliable direction data "
+                            f"(predictions lacked current_price). They will be re-evaluated.")
+        except Exception:
+            pass  # Table may not exist yet on first run
+
         conn.commit()
         conn.close()
         logger.info("Prediction accuracy tracking tables initialized")
@@ -136,48 +159,77 @@ class PredictionAccuracyTracker:
             percent_error = (absolute_error / actual_price) * 100 if actual_price != 0 else 0
             squared_error = (predicted_price - actual_price) ** 2
             
-            # FIXED: Direction accuracy - compare predicted vs actual price DIRECTION from start price
+            # Direction accuracy - compare predicted vs actual price DIRECTION from the price
+            # at the time the prediction was made (start_price).
             direction_predicted = None
             direction_actual = None
             direction_correct = 0
             
-            # Get the starting price (at prediction time) to calculate direction
+            # Get the starting price (at prediction time) to calculate direction.
+            # Priority: (1) current_price stored with the prediction row,
+            #           (2) actual_prices_at_targets near prediction_timestamp,
+            #           (3) crypto_data near prediction_timestamp.
+            start_price = None
             try:
                 conn = sqlite3.connect(config.DATABASE_PATH)
                 cursor = conn.cursor()
                 
-                # Find price close to prediction timestamp
-                cursor.execute('''
-                    SELECT price FROM crypto_data
-                    WHERE crypto = ? AND 
-                          ABS(julianday(datetime) - julianday(?)) < (30.0/1440.0)
-                    ORDER BY ABS(julianday(datetime) - julianday(?))
-                    LIMIT 1
-                ''', (crypto, prediction_timestamp.isoformat(), prediction_timestamp.isoformat()))
+                # 1. Use current_price stored directly in the predictions row (most reliable)
+                if prediction_id is not None:
+                    cursor.execute(
+                        'SELECT current_price FROM predictions WHERE id = ?',
+                        (prediction_id,)
+                    )
+                    row = cursor.fetchone()
+                    if row and row[0] and row[0] > 0:
+                        start_price = row[0]
                 
-                result = cursor.fetchone()
+                # 2. Fall back to actual_prices_at_targets near prediction_timestamp
+                if start_price is None:
+                    cursor.execute('''
+                        SELECT actual_price FROM actual_prices_at_targets
+                        WHERE crypto = ? AND 
+                              ABS(julianday(target_timestamp) - julianday(?)) < (30.0/1440.0)
+                        ORDER BY ABS(julianday(target_timestamp) - julianday(?))
+                        LIMIT 1
+                    ''', (crypto, prediction_timestamp.isoformat(), prediction_timestamp.isoformat()))
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        start_price = row[0]
+                
+                # 3. Fall back to crypto_data table (populated by historical data loads)
+                if start_price is None:
+                    cursor.execute('''
+                        SELECT price FROM crypto_data
+                        WHERE crypto = ? AND 
+                              ABS(julianday(datetime) - julianday(?)) < (30.0/1440.0)
+                        ORDER BY ABS(julianday(datetime) - julianday(?))
+                        LIMIT 1
+                    ''', (crypto, prediction_timestamp.isoformat(), prediction_timestamp.isoformat()))
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        start_price = row[0]
+
                 conn.close()
                 
-                if result:
-                    start_price = result[0]
-                    
-                    # Calculate direction predictions vs reality
-                    predicted_direction = 1 if predicted_price > start_price else 0  # 1 = up, 0 = down
+                if start_price is not None:
+                    # Calculate direction: did the price go up or down from start_price?
+                    predicted_direction = 1 if predicted_price > start_price else 0  # 1=up, 0=down
                     actual_direction = 1 if actual_price > start_price else 0
-                    
                     direction_predicted = predicted_direction
                     direction_actual = actual_direction
                     direction_correct = 1 if predicted_direction == actual_direction else 0
                 else:
-                    # Fallback: if no start price found, use simple comparison
-                    direction_predicted = 1  # Assume up prediction if no baseline
-                    direction_actual = 1 if actual_price > predicted_price else 0
-                    direction_correct = 1 if direction_predicted == direction_actual else 0
+                    # Cannot determine direction without a reliable start price — leave as unknown
+                    logger.debug(f"No start price found for {crypto} at {prediction_timestamp}; direction marked unknown")
+                    direction_predicted = None
+                    direction_actual = None
+                    direction_correct = 0
                     
             except Exception as e:
                 logger.warning(f"Could not calculate direction accuracy: {e}")
-                direction_predicted = 1
-                direction_actual = 1
+                direction_predicted = None
+                direction_actual = None
                 direction_correct = 0
             
             # Store evaluation
@@ -232,20 +284,20 @@ class PredictionAccuracyTracker:
             
             # Define time windows for when predictions should be evaluated
             evaluation_windows = {
+                '15m': {
+                    'lookback_time': now - timedelta(minutes=15),
+                    'window_size': timedelta(minutes=2),  # ±2 minutes for accurate 15m evaluation
+                    'description': '15 minutes ago'
+                },
                 '1h': {
                     'lookback_time': now - timedelta(hours=1),
                     'window_size': timedelta(minutes=3),  # ±3 minutes for accurate 1-hour evaluation
                     'description': '1 hour ago'
                 },
-                '1d': {
-                    'lookback_time': now - timedelta(days=1),
-                    'window_size': timedelta(hours=1),  # ±1 hour for more accurate 1-day evaluation
-                    'description': '1 day ago'
-                },
-                '1w': {
-                    'lookback_time': now - timedelta(weeks=1),
-                    'window_size': timedelta(hours=12),  # ±12 hours for more accurate 1-week evaluation
-                    'description': '1 week ago'
+                '4h': {
+                    'lookback_time': now - timedelta(hours=4),
+                    'window_size': timedelta(minutes=15),  # ±15 minutes for accurate 4-hour evaluation
+                    'description': '4 hours ago'
                 }
             }
             
@@ -464,20 +516,36 @@ class PredictionAccuracyTracker:
             
             # Only store prediction values for horizons where enough time has passed
             # This prevents showing meaningless prediction traces
-            pred_1h = predictions.get('1h') if predictions else None  # Always allow 1h predictions
-            pred_1d = predictions.get('1d') if predictions and time_running >= timedelta(days=1) else None
-            pred_1w = predictions.get('1w') if predictions and time_running >= timedelta(weeks=1) else None
+            pred_15m = predictions.get('15m') if predictions else None  # Always allow 15m predictions
+            pred_1h = predictions.get('1h') if predictions else None    # Always allow 1h predictions
+            pred_4h = predictions.get('4h') if predictions and time_running >= timedelta(hours=4) else None
             
             # Only calculate errors for predictions made at the appropriate time in the past
+            error_15m = None
             error_1h = None
-            error_1d = None
-            error_1w = None
+            error_4h = None
+            percent_error_15m = None
             percent_error_1h = None
-            percent_error_1d = None
-            percent_error_1w = None
+            percent_error_4h = None
             
             # Get mature predictions from the appropriate time windows
             now = timestamp
+            
+            # Check for 15m predictions made ~15 minutes ago that can now be evaluated
+            if pred_15m is not None:
+                fifteen_min_ago = now - timedelta(minutes=15)
+                cursor.execute('''
+                    SELECT predicted_price_15m FROM prediction_timeseries
+                    WHERE crypto = ? AND 
+                          ABS(julianday(timestamp) - julianday(?)) < (3.0/1440.0)  -- within 3 minutes
+                    ORDER BY ABS(julianday(timestamp) - julianday(?))
+                    LIMIT 1
+                ''', (crypto, fifteen_min_ago.isoformat(), fifteen_min_ago.isoformat()))
+                result = cursor.fetchone()
+                if result and result[0] is not None:
+                    old_pred_15m = result[0]
+                    error_15m = abs(old_pred_15m - actual_price)
+                    percent_error_15m = (error_15m / actual_price * 100) if actual_price != 0 else None
             
             # Check for 1h predictions made ~1 hour ago that can now be evaluated
             if pred_1h is not None:
@@ -495,49 +563,33 @@ class PredictionAccuracyTracker:
                     error_1h = abs(old_pred_1h - actual_price)
                     percent_error_1h = (error_1h / actual_price * 100) if actual_price != 0 else None
             
-            # Check for 1d predictions made ~1 day ago that can now be evaluated
-            if pred_1d is not None:
-                day_ago = now - timedelta(days=1)
+            # Check for 4h predictions made ~4 hours ago that can now be evaluated
+            if pred_4h is not None:
+                four_hours_ago = now - timedelta(hours=4)
                 cursor.execute('''
-                    SELECT predicted_price_1d FROM prediction_timeseries
+                    SELECT predicted_price_4h FROM prediction_timeseries
                     WHERE crypto = ? AND 
-                          ABS(julianday(timestamp) - julianday(?)) < (1.0/24.0)  -- within 1 hour
+                          ABS(julianday(timestamp) - julianday(?)) < (15.0/1440.0)  -- within 15 minutes
                     ORDER BY ABS(julianday(timestamp) - julianday(?))
                     LIMIT 1
-                ''', (crypto, day_ago.isoformat(), day_ago.isoformat()))
+                ''', (crypto, four_hours_ago.isoformat(), four_hours_ago.isoformat()))
                 result = cursor.fetchone()
                 if result and result[0] is not None:
-                    old_pred_1d = result[0]
-                    error_1d = abs(old_pred_1d - actual_price)
-                    percent_error_1d = (error_1d / actual_price * 100) if actual_price != 0 else None
-            
-            # Check for 1w predictions made ~1 week ago that can now be evaluated
-            if pred_1w is not None:
-                week_ago = now - timedelta(weeks=1)
-                cursor.execute('''
-                    SELECT predicted_price_1w FROM prediction_timeseries
-                    WHERE crypto = ? AND 
-                          ABS(julianday(timestamp) - julianday(?)) < (0.5)  -- within 0.5 days
-                    ORDER BY ABS(julianday(timestamp) - julianday(?))
-                    LIMIT 1
-                ''', (crypto, week_ago.isoformat(), week_ago.isoformat()))
-                result = cursor.fetchone()
-                if result and result[0] is not None:
-                    old_pred_1w = result[0]
-                    error_1w = abs(old_pred_1w - actual_price)
-                    percent_error_1w = (error_1w / actual_price * 100) if actual_price != 0 else None
+                    old_pred_4h = result[0]
+                    error_4h = abs(old_pred_4h - actual_price)
+                    percent_error_4h = (error_4h / actual_price * 100) if actual_price != 0 else None
             
             # Store data with properly calculated errors (or NULL if not ready for evaluation)
             # Only store prediction values for horizons where sufficient time has passed
             cursor.execute('''
                 INSERT OR REPLACE INTO prediction_timeseries
-                (crypto, timestamp, actual_price, predicted_price_1h, predicted_price_1d, 
-                 predicted_price_1w, error_1h, error_1d, error_1w, 
-                 percent_error_1h, percent_error_1d, percent_error_1w)
+                (crypto, timestamp, actual_price, predicted_price_15m, predicted_price_1h,
+                 predicted_price_4h, error_15m, error_1h, error_4h,
+                 percent_error_15m, percent_error_1h, percent_error_4h)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                crypto, timestamp.isoformat(), actual_price, pred_1h, pred_1d, pred_1w,
-                error_1h, error_1d, error_1w, percent_error_1h, percent_error_1d, percent_error_1w
+                crypto, timestamp.isoformat(), actual_price, pred_15m, pred_1h, pred_4h,
+                error_15m, error_1h, error_4h, percent_error_15m, percent_error_1h, percent_error_4h
             ))
             
             conn.commit()
@@ -659,9 +711,10 @@ class PredictionAccuracyTracker:
             if df.empty:
                 return pd.DataFrame(), {}
             
-            # Convert timestamps to datetime
-            df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
-            df['evaluation_timestamp'] = pd.to_datetime(df['evaluation_timestamp'], format='ISO8601')
+            # Convert timestamps to datetime — use errors='coerce' so bad values become NaT
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce', utc=False)
+            df['evaluation_timestamp'] = pd.to_datetime(df['evaluation_timestamp'], errors='coerce', utc=False)
+            df = df.dropna(subset=['timestamp'])
             
             # Find the most recently evaluated prediction for each horizon
             latest_evaluations = {}
@@ -688,16 +741,16 @@ class PredictionAccuracyTracker:
             df_pivoted.columns = [f"{col[0]}_{col[1]}" for col in df_pivoted.columns]
             
             # Add a single actual_price column (take from any horizon since it's the same)
-            if 'actual_price_1h' in df_pivoted.columns:
+            if 'actual_price_15m' in df_pivoted.columns:
+                df_pivoted['actual_price'] = df_pivoted['actual_price_15m']
+            elif 'actual_price_1h' in df_pivoted.columns:
                 df_pivoted['actual_price'] = df_pivoted['actual_price_1h']
-            elif 'actual_price_1d' in df_pivoted.columns:
-                df_pivoted['actual_price'] = df_pivoted['actual_price_1d']
-            elif 'actual_price_1w' in df_pivoted.columns:
-                df_pivoted['actual_price'] = df_pivoted['actual_price_1w']
+            elif 'actual_price_4h' in df_pivoted.columns:
+                df_pivoted['actual_price'] = df_pivoted['actual_price_4h']
             
             # Rename columns to match expected format
             rename_map = {}
-            for horizon in ['1h', '1d', '1w']:
+            for horizon in ['15m', '1h', '4h']:
                 if f'predicted_price_{horizon}' in df_pivoted.columns:
                     rename_map[f'predicted_price_{horizon}'] = f'predicted_price_{horizon}'
                 if f'absolute_error_{horizon}' in df_pivoted.columns:
@@ -796,8 +849,12 @@ class PredictionAccuracyTracker:
             if df.empty:
                 return pd.DataFrame()
             
-            # Convert timestamps to datetime
-            df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
+            # Convert timestamps to datetime — use errors='coerce' so bad values become NaT
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce', utc=False)
+            df = df.dropna(subset=['timestamp'])
+
+            # Drop rows where direction_correct is NULL (start price was unavailable)
+            df = df.dropna(subset=['direction_correct'])
             
             return df
             
@@ -888,6 +945,11 @@ class PredictionAccuracyTracker:
         ax.tick_params(axis='x', which='major', colors='black', width=1.2, length=6)
         ax.tick_params(axis='x', which='minor', colors='gray', width=0.8, length=3)
 
+        # Limit Y-axis to at most ~8 nice ticks to avoid the "MAXTICKS exceeded" warning
+        # that occurs when price range spans thousands of dollars at $1 intervals.
+        ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=8, prune='both'))
+        ax.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
+
     def plot_prediction_timeseries(self, crypto: str, days_back: int = 30, save_path: str = None):
         """
         Create timeseries plots of actual vs predicted prices
@@ -901,11 +963,11 @@ class PredictionAccuracyTracker:
                 return
             
             # Check which horizons have evaluation data available
-            has_1h_data = f'error_1h' in df.columns and df[f'error_1h'].notna().any()
-            has_1d_data = f'error_1d' in df.columns and df[f'error_1d'].notna().any()  
-            has_1w_data = f'error_1w' in df.columns and df[f'error_1w'].notna().any()
+            has_15m_data = 'error_15m' in df.columns and df['error_15m'].notna().any()
+            has_1h_data  = 'error_1h'  in df.columns and df['error_1h'].notna().any()
+            has_4h_data  = 'error_4h'  in df.columns and df['error_4h'].notna().any()
             
-            if not (has_1h_data or has_1d_data or has_1w_data):
+            if not (has_15m_data or has_1h_data or has_4h_data):
                 logger.warning(f"No prediction evaluations available for {crypto} yet")
                 plt.figure(figsize=(15, 8))
                 
@@ -921,9 +983,9 @@ class PredictionAccuracyTracker:
                 plt.subplot(2, 1, 2)
                 plt.text(0.5, 0.5, 'No prediction evaluations available yet.\n\n' +
                          'Evaluations require waiting for target times:\n' +
+                         '• 15m predictions: evaluated 15 minutes after prediction\n' +
                          '• 1h predictions: evaluated 1 hour after prediction\n' +
-                         '• 1d predictions: evaluated 1 day after prediction\n' +
-                         '• 1w predictions: evaluated 1 week after prediction',
+                         '• 4h predictions: evaluated 4 hours after prediction',
                          horizontalalignment='center', verticalalignment='center',
                          transform=plt.gca().transAxes, fontsize=11,
                          bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
@@ -947,12 +1009,12 @@ class PredictionAccuracyTracker:
             if 'actual_price' in df.columns:
                 plt.plot(df.index, df['actual_price'], label='Actual Price', linewidth=2, color='black')
             
+            if has_15m_data and 'predicted_price_15m' in df.columns:
+                plt.plot(df.index, df['predicted_price_15m'], label='15m Prediction', alpha=0.8, color='#1f77b4')  # blue
             if has_1h_data and 'predicted_price_1h' in df.columns:
-                plt.plot(df.index, df['predicted_price_1h'], label='1h Prediction', alpha=0.8)
-            if has_1d_data and 'predicted_price_1d' in df.columns:
-                plt.plot(df.index, df['predicted_price_1d'], label='1d Prediction', alpha=0.8)
-            if has_1w_data and 'predicted_price_1w' in df.columns:
-                plt.plot(df.index, df['predicted_price_1w'], label='1w Prediction', alpha=0.8)
+                plt.plot(df.index, df['predicted_price_1h'], label='1h Prediction', alpha=0.8, color='#ff7f0e')   # orange
+            if has_4h_data and 'predicted_price_4h' in df.columns:
+                plt.plot(df.index, df['predicted_price_4h'], label='4h Prediction', alpha=0.8, color='#2ca02c')   # green
             
             plt.title(f'{crypto.upper()} - Actual vs Predicted Prices')
             plt.xlabel('Time')
@@ -963,20 +1025,20 @@ class PredictionAccuracyTracker:
             # Plot absolute errors
             plt.subplot(2, 2, 2)
             plotted_any_errors = False
+            if has_15m_data and 'error_15m' in df.columns:
+                error_data = df['error_15m'].dropna()
+                if not error_data.empty:
+                    plt.plot(error_data.index, error_data, label='15m Error', alpha=0.8, color='#1f77b4')
+                    plotted_any_errors = True
             if has_1h_data and 'error_1h' in df.columns:
                 error_data = df['error_1h'].dropna()
                 if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='1h Error', alpha=0.8)
+                    plt.plot(error_data.index, error_data, label='1h Error', alpha=0.8, color='#ff7f0e')
                     plotted_any_errors = True
-            if has_1d_data and 'error_1d' in df.columns:
-                error_data = df['error_1d'].dropna()
+            if has_4h_data and 'error_4h' in df.columns:
+                error_data = df['error_4h'].dropna()
                 if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='1d Error', alpha=0.8)
-                    plotted_any_errors = True
-            if has_1w_data and 'error_1w' in df.columns:
-                error_data = df['error_1w'].dropna()
-                if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='1w Error', alpha=0.8)
+                    plt.plot(error_data.index, error_data, label='4h Error', alpha=0.8, color='#2ca02c')
                     plotted_any_errors = True
             
             if plotted_any_errors:
@@ -994,32 +1056,41 @@ class PredictionAccuracyTracker:
             # Plot percent errors
             plt.subplot(2, 2, 3)
             plotted_any_percent_errors = False
+            if has_15m_data and 'percent_error_15m' in df.columns:
+                error_data = df['percent_error_15m'].dropna()
+                if not error_data.empty:
+                    plt.plot(error_data.index, error_data, label='15m Error %', alpha=0.8, color='#1f77b4')
+                    plotted_any_percent_errors = True
+                    
+                    if '15m' in latest_evaluations:
+                        latest_info = latest_evaluations['15m']
+                        latest_val = latest_info['percent_error']
+                        latest_target_time = latest_info['target_timestamp']
+                        plt.annotate(f'{latest_val:.2f}%',
+                                   xy=(latest_target_time, latest_val),
+                                   xytext=(10, 10), textcoords='offset points',
+                                   bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7),
+                                   fontsize=9, fontweight='bold')
             if has_1h_data and 'percent_error_1h' in df.columns:
                 error_data = df['percent_error_1h'].dropna()
                 if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='1h Error %', alpha=0.8)
+                    plt.plot(error_data.index, error_data, label='1h Error %', alpha=0.8, color='#ff7f0e')
                     plotted_any_percent_errors = True
                     
-                    # FIXED: Use pre-computed latest evaluation data
+                    # Use pre-computed latest evaluation data
                     if '1h' in latest_evaluations:
                         latest_info = latest_evaluations['1h']
                         latest_val = latest_info['percent_error']
                         latest_target_time = latest_info['target_timestamp']
-                        
                         plt.annotate(f'{latest_val:.2f}%', 
                                    xy=(latest_target_time, latest_val),
                                    xytext=(10, 10), textcoords='offset points',
                                    bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7),
                                    fontsize=9, fontweight='bold')
-            if has_1d_data and 'percent_error_1d' in df.columns:
-                error_data = df['percent_error_1d'].dropna()
+            if has_4h_data and 'percent_error_4h' in df.columns:
+                error_data = df['percent_error_4h'].dropna()
                 if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='1d Error %', alpha=0.8)
-                    plotted_any_percent_errors = True
-            if has_1w_data and 'percent_error_1w' in df.columns:
-                error_data = df['percent_error_1w'].dropna()
-                if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='1w Error %', alpha=0.8)
+                    plt.plot(error_data.index, error_data, label='4h Error %', alpha=0.8, color='#2ca02c')
                     plotted_any_percent_errors = True
             
             if plotted_any_percent_errors:
@@ -1041,7 +1112,7 @@ class PredictionAccuracyTracker:
                 # Plot directional accuracy for each horizon
                 plotted_any_direction = False
                 
-                for horizon in ['1h', '1d', '1w']:
+                for horizon in ['15m', '1h', '4h']:
                     horizon_data = direction_data[direction_data['prediction_horizon'] == horizon]
                     if not horizon_data.empty:
                         # Calculate rolling accuracy (window of 5 predictions)

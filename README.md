@@ -4,7 +4,7 @@ A free, local ML-powered bot that predicts Bitcoin and Ethereum prices using mul
 
 ## 🎯 Features
 
-- **Multi-horizon predictions**: 1 hour, 1 day, and 1 week forecasts
+- **Multi-horizon predictions**: 15 minute, 1 hour, and 4 hour forecasts
 - **Multiple data sources**: Crypto prices, traditional markets, economic indicators
 - **Advanced ML models**: XGBoost ensemble with feature selection and cross-validation
 - **Technical indicators**: 50+ features including RSI, MACD, Bollinger Bands
@@ -188,7 +188,7 @@ This bot uses an optimized two-script workflow:
 - **XGBoost models**: Separate regression and classification models
 - **Feature selection**: Selects top 50 most predictive features
 - **Time series validation**: Prevents data leakage with proper splits
-- **Multi-horizon**: Different models for 1h, 1d, and 1w predictions
+- **Multi-horizon**: Different models for 15m, 1h, and 4h predictions
 - **Ensemble approach**: Combines price and direction predictions
 
 ### Prediction Types
@@ -215,12 +215,12 @@ crypto-price-prediction-bot/
 ├── optimal_training_results.json # Training optimization results
 └── models/                      # Trained models & metadata
     ├── production_models.json   # Model metadata & paths
+    ├── bitcoin_15m_production.pkl
     ├── bitcoin_1h_production.pkl
-    ├── bitcoin_1d_production.pkl
-    ├── bitcoin_1w_production.pkl
+    ├── bitcoin_4h_production.pkl
+    ├── ethereum_15m_production.pkl
     ├── ethereum_1h_production.pkl
-    ├── ethereum_1d_production.pkl
-    └── ethereum_1w_production.pkl
+    └── ethereum_4h_production.pkl
 ```
 
 ## ⚙️ Configuration
