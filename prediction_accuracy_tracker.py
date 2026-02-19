@@ -6,6 +6,7 @@ import sqlite3
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import seaborn as sns
 from datetime import datetime, timedelta
 import logging
@@ -135,11 +136,49 @@ class PredictionAccuracyTracker:
             percent_error = (absolute_error / actual_price) * 100 if actual_price != 0 else 0
             squared_error = (predicted_price - actual_price) ** 2
             
-            # Direction accuracy (simplified - compare predicted vs actual change from prediction time)
-            # For this we need the price at prediction time
-            direction_predicted = 1 if predicted_price > 0 else 0  # Simplified
-            direction_actual = 1 if actual_price > 0 else 0  # Will be properly calculated
-            direction_correct = 1 if direction_predicted == direction_actual else 0
+            # FIXED: Direction accuracy - compare predicted vs actual price DIRECTION from start price
+            direction_predicted = None
+            direction_actual = None
+            direction_correct = 0
+            
+            # Get the starting price (at prediction time) to calculate direction
+            try:
+                conn = sqlite3.connect(config.DATABASE_PATH)
+                cursor = conn.cursor()
+                
+                # Find price close to prediction timestamp
+                cursor.execute('''
+                    SELECT price FROM crypto_data
+                    WHERE crypto = ? AND 
+                          ABS(julianday(datetime) - julianday(?)) < (30.0/1440.0)
+                    ORDER BY ABS(julianday(datetime) - julianday(?))
+                    LIMIT 1
+                ''', (crypto, prediction_timestamp.isoformat(), prediction_timestamp.isoformat()))
+                
+                result = cursor.fetchone()
+                conn.close()
+                
+                if result:
+                    start_price = result[0]
+                    
+                    # Calculate direction predictions vs reality
+                    predicted_direction = 1 if predicted_price > start_price else 0  # 1 = up, 0 = down
+                    actual_direction = 1 if actual_price > start_price else 0
+                    
+                    direction_predicted = predicted_direction
+                    direction_actual = actual_direction
+                    direction_correct = 1 if predicted_direction == actual_direction else 0
+                else:
+                    # Fallback: if no start price found, use simple comparison
+                    direction_predicted = 1  # Assume up prediction if no baseline
+                    direction_actual = 1 if actual_price > predicted_price else 0
+                    direction_correct = 1 if direction_predicted == direction_actual else 0
+                    
+            except Exception as e:
+                logger.warning(f"Could not calculate direction accuracy: {e}")
+                direction_predicted = 1
+                direction_actual = 1
+                direction_correct = 0
             
             # Store evaluation
             conn = sqlite3.connect(config.DATABASE_PATH)
@@ -254,21 +293,24 @@ class PredictionAccuracyTracker:
                             created_at = pd.to_datetime(created_at_str)
                             target_time = pd.to_datetime(target_time_str)
                             
-                            # Get current price as the "actual" price for evaluation
-                            current_price = data_collector.get_crypto_current_price(crypto)
-                            if current_price is None:
-                                logger.warning(f"Could not get current price for {crypto}")
+                            # FIXED: Get actual price at the TARGET TIME, not current price
+                            actual_price_at_target = self.get_actual_price_at_time(
+                                crypto, target_time, data_collector, pred_horizon
+                            )
+                            
+                            if actual_price_at_target is None:
+                                logger.debug(f"Could not get historical price for {crypto} at {target_time}")
                                 continue
                             
-                            # Evaluate the prediction (prediction made at created_at, compared to current price)
+                            # Evaluate the prediction using actual price at target time
                             evaluation = self.evaluate_prediction(
                                 prediction_id=pred_id,
                                 crypto=crypto,
                                 prediction_horizon=pred_horizon,
                                 predicted_price=predicted_price,
-                                actual_price=current_price,
+                                actual_price=actual_price_at_target,  # FIXED: Use target time price
                                 prediction_timestamp=created_at,  # When prediction was made
-                                target_timestamp=now,  # Current time (when we're evaluating)
+                                target_timestamp=target_time,  # FIXED: Use actual target time
                                 confidence=confidence
                             )
                             
@@ -280,7 +322,7 @@ class PredictionAccuracyTracker:
                                 evaluated_count += 1
                                 
                                 logger.debug(f"✅ Evaluated {crypto} {pred_horizon} prediction: "
-                                           f"predicted ${predicted_price:.2f}, actual ${current_price:.2f}, "
+                                           f"predicted ${predicted_price:.2f}, actual ${actual_price_at_target:.2f}, "
                                            f"error {evaluation['percent_error']:.2f}%")
                         
                         except Exception as e:
@@ -309,65 +351,86 @@ class PredictionAccuracyTracker:
     
     def get_actual_price_at_time(self, crypto: str, target_time: datetime, data_collector, horizon: str) -> Optional[float]:
         """
-        Get actual price at a specific time, either from database or by fetching
+        Get actual price at a specific time using stored historical data
         """
         try:
-            # First check if we have it stored
+            # First check if we have it stored in actual_prices_at_targets
             conn = sqlite3.connect(config.DATABASE_PATH)
             cursor = conn.cursor()
             
-            # Look for actual price within a reasonable window
+            # Look for actual price within a reasonable window (±6 minutes)
             cursor.execute('''
                 SELECT actual_price FROM actual_prices_at_targets
                 WHERE crypto = ? AND 
-                      ABS(julianday(target_timestamp) - julianday(?)) < 0.1
+                      ABS(julianday(target_timestamp) - julianday(?)) < (6.0/1440.0)
                 ORDER BY ABS(julianday(target_timestamp) - julianday(?))
                 LIMIT 1
             ''', (crypto, target_time.isoformat(), target_time.isoformat()))
             
             result = cursor.fetchone()
-            conn.close()
-            
             if result:
+                conn.close()
                 return result[0]
             
-            # If not stored, try to get current price (if target time is recent)
-            # Different time windows for different prediction horizons
+            # Check historical crypto data stored during collection
+            cursor.execute('''
+                SELECT price FROM crypto_data
+                WHERE crypto = ? AND 
+                      ABS(julianday(datetime) - julianday(?)) < (30.0/1440.0)
+                ORDER BY ABS(julianday(datetime) - julianday(?))
+                LIMIT 1
+            ''', (crypto, target_time.isoformat(), target_time.isoformat()))
+            
+            result = cursor.fetchone()
+            if result:
+                historical_price = result[0]
+                # Store this for future reference
+                self.store_actual_price_at_target(crypto, target_time, historical_price)
+                conn.close()
+                return historical_price
+            
+            conn.close()
+            
+            # If no stored data, try to fetch from external API with backoff
             now = datetime.now()
-            time_diff = abs((now - target_time).total_seconds())
+            time_diff_hours = abs((now - target_time).total_seconds()) / 3600
             
-            # Determine appropriate evaluation window based on how recent the target time is
-            can_use_current_price = False
+            # Only fetch if target time is within reasonable range
+            if 1 <= time_diff_hours <= 168:  # Between 1 hour and 1 week ago
+                try:
+                    # Calculate how many days back to fetch
+                    days_back = max(1, int(time_diff_hours / 24) + 1)
+                    
+                    # Fetch recent historical data
+                    historical_data = data_collector.get_crypto_data(crypto, days=days_back)
+                    
+                    if not historical_data.empty:
+                        # Find closest price to target time
+                        historical_data['time_diff'] = abs(
+                            pd.to_datetime(historical_data['datetime']) - target_time
+                        ).dt.total_seconds()
+                        
+                        closest_idx = historical_data['time_diff'].idxmin()
+                        closest_price = historical_data.loc[closest_idx, 'price']
+                        closest_time_diff = historical_data.loc[closest_idx, 'time_diff']
+                        
+                        # Only use if within 2 hours
+                        if closest_time_diff <= 7200:  # 2 hours in seconds
+                            # Store for future reference
+                            self.store_actual_price_at_target(crypto, target_time, closest_price)
+                            logger.info(f"Found historical price for {crypto} at {target_time}: ${closest_price:.2f}")
+                            return closest_price
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to fetch historical price for {crypto}: {e}")
             
-            # Precise evaluation windows that match the batch evaluation logic
-            if horizon == '1h':
-                # Evaluate 1h predictions when target is 57-63 minutes ago (±3 minutes)
-                min_wait_time = 57 * 60  # 57 minutes in seconds
-                max_wait_time = 63 * 60  # 63 minutes in seconds
-                if min_wait_time <= time_diff <= max_wait_time:
-                    can_use_current_price = True
-            elif horizon == '1d':
-                # Evaluate 1d predictions when target is 23-25 hours ago (±1 hour)
-                min_wait_time = 23 * 60 * 60  # 23 hours in seconds
-                max_wait_time = 25 * 60 * 60  # 25 hours in seconds
-                if min_wait_time <= time_diff <= max_wait_time:
-                    can_use_current_price = True
-            elif horizon == '1w':
-                # Evaluate 1w predictions when target is 6.5-7.5 days ago (±12 hours)
-                min_wait_time = int(6.5 * 24 * 60 * 60)  # 6.5 days in seconds
-                max_wait_time = int(7.5 * 24 * 60 * 60)  # 7.5 days in seconds
-                if min_wait_time <= time_diff <= max_wait_time:
-                    can_use_current_price = True
-            
-            if can_use_current_price:
+            # If target time is very recent (< 1 hour), can use current price
+            if time_diff_hours < 1:
                 current_price = data_collector.get_crypto_current_price(crypto)
                 if current_price:
-                    # Store for future reference
                     self.store_actual_price_at_target(crypto, target_time, current_price)
                     return current_price
             
-            # For historical prices, we'd need to implement historical data fetching
-            # For now, return None to indicate we can't evaluate this prediction yet
             return None
             
         except Exception as e:
@@ -698,6 +761,49 @@ class PredictionAccuracyTracker:
         except Exception as e:
             logger.error(f"Failed to get error distribution data: {e}")
             return pd.DataFrame()
+
+    def get_directional_accuracy_data(self, crypto: str, days_back: int = 30) -> pd.DataFrame:
+        """
+        Get directional accuracy data for timeseries plotting
+        Returns data showing how well predictions predict price direction over time
+        """
+        try:
+            conn = sqlite3.connect(config.DATABASE_PATH)
+            
+            # Get directional accuracy data with deduplication
+            query = '''
+                SELECT 
+                    target_timestamp as timestamp,
+                    prediction_horizon,
+                    direction_correct,
+                    evaluation_timestamp,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY target_timestamp, prediction_horizon 
+                        ORDER BY evaluation_timestamp DESC
+                    ) as rn
+                FROM prediction_evaluations
+                WHERE crypto = ? AND evaluation_timestamp >= ?
+                ORDER BY target_timestamp
+            '''
+            
+            params = [crypto, (datetime.now() - timedelta(days=days_back)).isoformat()]
+            df = pd.read_sql_query(query, conn, params=params)
+            conn.close()
+            
+            # Keep only the most recent evaluation for each target_timestamp + horizon
+            df = df[df['rn'] == 1].drop('rn', axis=1)
+            
+            if df.empty:
+                return pd.DataFrame()
+            
+            # Convert timestamps to datetime
+            df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601')
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Failed to get directional accuracy data: {e}")
+            return pd.DataFrame()
     
     def generate_accuracy_report(self, crypto: str = None, days_back: int = 30) -> str:
         """
@@ -760,6 +866,28 @@ class PredictionAccuracyTracker:
         
         return "\n".join(report)
     
+    def _format_time_axis(self, ax, days_back=30):
+        """Helper function to format x-axis for time series plots"""
+        # Format dates without year and without leading zeros
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%-m/%d'))
+        
+        # Always label each day for major ticks
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
+        
+        # Add minor ticks every 6 hours (4 ticks between each day: 6am, 12pm, 6pm, 12am)
+        ax.xaxis.set_minor_locator(mdates.HourLocator(byhour=[6, 12, 18]))
+        
+        # Rotate labels at 45 degrees and align right
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        
+        # Configure grid with different styles for major and minor ticks
+        ax.grid(True, which='major', alpha=0.6, color='gray', linewidth=0.8)  # Darker major grid
+        ax.grid(True, which='minor', alpha=0.45, color='lightgray', linewidth=0.4)  # 25% darker minor grid
+        
+        # Make major ticks darker and more visible
+        ax.tick_params(axis='x', which='major', colors='black', width=1.2, length=6)
+        ax.tick_params(axis='x', which='minor', colors='gray', width=0.8, length=3)
+
     def plot_prediction_timeseries(self, crypto: str, days_back: int = 30, save_path: str = None):
         """
         Create timeseries plots of actual vs predicted prices
@@ -788,7 +916,7 @@ class PredictionAccuracyTracker:
                 plt.xlabel('Time')
                 plt.ylabel('Price (USD)')
                 plt.legend()
-                plt.grid(True, alpha=0.3)
+                self._format_time_axis(plt.gca(), days_back)
                 
                 plt.subplot(2, 1, 2)
                 plt.text(0.5, 0.5, 'No prediction evaluations available yet.\n\n' +
@@ -812,23 +940,25 @@ class PredictionAccuracyTracker:
             
             plt.figure(figsize=(15, 10))
             
+            # Use matplotlib's default color cycle for consistent colors
+            
             # Plot actual vs predicted prices
             plt.subplot(2, 2, 1)
             if 'actual_price' in df.columns:
                 plt.plot(df.index, df['actual_price'], label='Actual Price', linewidth=2, color='black')
             
             if has_1h_data and 'predicted_price_1h' in df.columns:
-                plt.plot(df.index, df['predicted_price_1h'], label='1h Prediction', alpha=0.7)
+                plt.plot(df.index, df['predicted_price_1h'], label='1h Prediction', alpha=0.8)
             if has_1d_data and 'predicted_price_1d' in df.columns:
-                plt.plot(df.index, df['predicted_price_1d'], label='1d Prediction', alpha=0.7)
+                plt.plot(df.index, df['predicted_price_1d'], label='1d Prediction', alpha=0.8)
             if has_1w_data and 'predicted_price_1w' in df.columns:
-                plt.plot(df.index, df['predicted_price_1w'], label='1w Prediction', alpha=0.7)
+                plt.plot(df.index, df['predicted_price_1w'], label='1w Prediction', alpha=0.8)
             
             plt.title(f'{crypto.upper()} - Actual vs Predicted Prices')
             plt.xlabel('Time')
             plt.ylabel('Price (USD)')
             plt.legend()
-            plt.grid(True, alpha=0.3)
+            self._format_time_axis(plt.gca(), days_back)
             
             # Plot absolute errors
             plt.subplot(2, 2, 2)
@@ -836,17 +966,17 @@ class PredictionAccuracyTracker:
             if has_1h_data and 'error_1h' in df.columns:
                 error_data = df['error_1h'].dropna()
                 if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='1h Error', alpha=0.7, marker='o', markersize=4)
+                    plt.plot(error_data.index, error_data, label='1h Error', alpha=0.8)
                     plotted_any_errors = True
             if has_1d_data and 'error_1d' in df.columns:
                 error_data = df['error_1d'].dropna()
                 if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='1d Error', alpha=0.7, marker='s', markersize=4)
+                    plt.plot(error_data.index, error_data, label='1d Error', alpha=0.8)
                     plotted_any_errors = True
             if has_1w_data and 'error_1w' in df.columns:
                 error_data = df['error_1w'].dropna()
                 if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='1w Error', alpha=0.7, marker='^', markersize=4)
+                    plt.plot(error_data.index, error_data, label='1w Error', alpha=0.8)
                     plotted_any_errors = True
             
             if plotted_any_errors:
@@ -854,7 +984,7 @@ class PredictionAccuracyTracker:
                 plt.xlabel('Time')
                 plt.ylabel('Absolute Error (USD)')
                 plt.legend()
-                plt.grid(True, alpha=0.3)
+                self._format_time_axis(plt.gca(), days_back)
             else:
                 plt.text(0.5, 0.5, 'No error data available yet', 
                          horizontalalignment='center', verticalalignment='center',
@@ -867,7 +997,7 @@ class PredictionAccuracyTracker:
             if has_1h_data and 'percent_error_1h' in df.columns:
                 error_data = df['percent_error_1h'].dropna()
                 if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='1h Error %', alpha=0.7, marker='o', markersize=4)
+                    plt.plot(error_data.index, error_data, label='1h Error %', alpha=0.8)
                     plotted_any_percent_errors = True
                     
                     # FIXED: Use pre-computed latest evaluation data
@@ -884,12 +1014,12 @@ class PredictionAccuracyTracker:
             if has_1d_data and 'percent_error_1d' in df.columns:
                 error_data = df['percent_error_1d'].dropna()
                 if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='1d Error %', alpha=0.7, marker='s', markersize=4)
+                    plt.plot(error_data.index, error_data, label='1d Error %', alpha=0.8)
                     plotted_any_percent_errors = True
             if has_1w_data and 'percent_error_1w' in df.columns:
                 error_data = df['percent_error_1w'].dropna()
                 if not error_data.empty:
-                    plt.plot(error_data.index, error_data, label='1w Error %', alpha=0.7, marker='^', markersize=4)
+                    plt.plot(error_data.index, error_data, label='1w Error %', alpha=0.8)
                     plotted_any_percent_errors = True
             
             if plotted_any_percent_errors:
@@ -897,65 +1027,63 @@ class PredictionAccuracyTracker:
                 plt.xlabel('Time')
                 plt.ylabel('Percent Error (%)')
                 plt.legend()
-                plt.grid(True, alpha=0.3)
+                self._format_time_axis(plt.gca(), days_back)
             else:
                 plt.text(0.5, 0.5, 'No percent error data available yet', 
                          horizontalalignment='center', verticalalignment='center',
                          transform=plt.gca().transAxes)
                 plt.title(f'{crypto.upper()} - Percent Errors (Not Available Yet)')
             
-            # Plot error distribution (histogram)
+            # Plot directional accuracy over time
             plt.subplot(2, 2, 4)
-            error_data = self.get_error_distribution_data(crypto, days_back=days_back)
-            if not error_data.empty:
-                # Calculate appropriate bin edges for percent error
-                percent_errors = error_data['percent_error']
-                min_err = percent_errors.min()
-                max_err = percent_errors.max()
+            direction_data = self.get_directional_accuracy_data(crypto, days_back=days_back)
+            if not direction_data.empty:
+                # Plot directional accuracy for each horizon
+                plotted_any_direction = False
                 
-                # Create nice round bin edges
-                range_err = max_err - min_err
-                if range_err < 0.1:
-                    bin_width = 0.01  # Very precise for small ranges
-                elif range_err < 1:
-                    bin_width = 0.1
-                elif range_err < 5:
-                    bin_width = 0.25
-                elif range_err < 10:
-                    bin_width = 0.5
+                for horizon in ['1h', '1d', '1w']:
+                    horizon_data = direction_data[direction_data['prediction_horizon'] == horizon]
+                    if not horizon_data.empty:
+                        # Calculate rolling accuracy (window of 5 predictions)
+                        horizon_data = horizon_data.sort_values('timestamp')
+                        rolling_accuracy = horizon_data['direction_correct'].rolling(window=min(5, len(horizon_data)), 
+                                                                                   min_periods=1).mean()
+                        
+                        plt.plot(horizon_data['timestamp'], rolling_accuracy, 
+                               label=f'{horizon.upper()} Accuracy (rolling)', 
+                               alpha=0.8, linewidth=2)
+                        
+                        plotted_any_direction = True
+                
+                if plotted_any_direction:
+                    plt.title(f'{crypto.upper()} - Directional Accuracy Over Time')
+                    plt.xlabel('Time')
+                    plt.ylabel('Direction Accuracy (1=Correct, 0=Wrong)')
+                    plt.ylim(-0.1, 1.1)  # Set y-limits to show 0-1 range clearly
+                    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                    
+                    # Add reference lines
+                    plt.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+                    plt.axhline(y=1.0, color='green', linestyle='--', alpha=0.3, linewidth=1)
+                    plt.axhline(y=0.0, color='red', linestyle='--', alpha=0.3, linewidth=1)
+                    
+                    # Calculate and display overall accuracy
+                    overall_accuracy = direction_data['direction_correct'].mean()
+                    plt.text(0.02, 0.98, f'Overall: {overall_accuracy:.1%}', 
+                            transform=plt.gca().transAxes, verticalalignment='top',
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='lightblue', alpha=0.8))
+                    
+                    self._format_time_axis(plt.gca(), days_back)
                 else:
-                    bin_width = 1.0
-                
-                # Round bin edges to nice numbers
-                start_bin = np.floor(min_err / bin_width) * bin_width
-                end_bin = np.ceil(max_err / bin_width) * bin_width
-                bins_percent = np.arange(start_bin, end_bin + bin_width, bin_width)
-                
-                n, bins, patches = plt.hist(percent_errors, bins=bins_percent, alpha=0.7, 
-                                          edgecolor='black', align='mid')
-                
-                plt.title(f'{crypto.upper()} - Error Distribution')
-                plt.xlabel('Percent Error (%)')
-                plt.ylabel('Frequency')
-                plt.grid(True, alpha=0.3)
-                
-                # Add percentile lines
-                q25 = percent_errors.quantile(0.25)
-                q50 = percent_errors.quantile(0.50)  # median
-                q75 = percent_errors.quantile(0.75)
-                
-                plt.axvline(q25, color='blue', linestyle='--', alpha=0.7, linewidth=1.5)
-                plt.axvline(q50, color='red', linestyle='--', alpha=0.8, linewidth=2)
-                plt.axvline(q75, color='blue', linestyle='--', alpha=0.7, linewidth=1.5)
-                
-                plt.text(0.98, 0.95, f'Mean: {percent_errors.mean():.2f}%\nStd: {percent_errors.std():.2f}%\nN: {len(percent_errors)}',
-                        transform=plt.gca().transAxes, verticalalignment='top', horizontalalignment='right',
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+                    plt.text(0.5, 0.5, 'No directional accuracy data available yet', 
+                             horizontalalignment='center', verticalalignment='center',
+                             transform=plt.gca().transAxes)
+                    plt.title(f'{crypto.upper()} - Directional Accuracy (Not Available Yet)')
             else:
-                plt.text(0.5, 0.5, 'No evaluations\navailable for histogram', 
+                plt.text(0.5, 0.5, 'No directional accuracy\ndata available yet', 
                          horizontalalignment='center', verticalalignment='center',
                          transform=plt.gca().transAxes)
-                plt.title(f'{crypto.upper()} - Error Distribution (Not Available Yet)')
+                plt.title(f'{crypto.upper()} - Directional Accuracy (Not Available Yet)')
             
             plt.tight_layout()
             

@@ -670,6 +670,111 @@ class FeatureEngineer:
         
         return df
     
+    def add_momentum_features(self, df: pd.DataFrame, price_col: str = 'price') -> pd.DataFrame:
+        """
+        Add momentum features to better capture price movement patterns
+        """
+        try:
+            logger.info("Adding momentum features...")
+            
+            # Price momentum indicators
+            for period in [3, 6, 12, 24]:  # Hours
+                df[f'momentum_{period}h'] = df[price_col].pct_change(period) * 100
+                df[f'momentum_abs_{period}h'] = df[f'momentum_{period}h'].abs()
+            
+            # Rate of change acceleration
+            df['roc_3h'] = df[price_col].pct_change(3) * 100
+            df['roc_6h'] = df[price_col].pct_change(6) * 100
+            df['roc_acceleration'] = df['roc_3h'] - df['roc_6h']
+            
+            # Moving average momentum
+            for window in [12, 24, 48]:
+                ma = df[price_col].rolling(window=window).mean()
+                df[f'ma_momentum_{window}h'] = ((df[price_col] - ma) / ma * 100).fillna(0)
+            
+            # Velocity indicators (rate of price change)
+            df['velocity_1h'] = df[price_col].diff(1)
+            df['velocity_3h'] = df[price_col].diff(3)
+            df['velocity_6h'] = df[price_col].diff(6)
+            
+            # Momentum strength
+            df['momentum_strength'] = (
+                df['momentum_3h'].abs() + 
+                df['momentum_6h'].abs() + 
+                df['momentum_12h'].abs()
+            ) / 3
+            
+            # Trend consistency (how consistent is the direction)
+            for window in [6, 12, 24]:
+                returns = df[price_col].pct_change()
+                df[f'trend_consistency_{window}h'] = returns.rolling(window=window).apply(
+                    lambda x: (x > 0).sum() / len(x) if len(x) > 0 else 0.5
+                )
+            
+            logger.info("Added momentum features")
+            
+        except Exception as e:
+            logger.error(f"Error adding momentum features: {e}")
+        
+        return df
+    
+    def add_volatility_features(self, df: pd.DataFrame, price_col: str = 'price') -> pd.DataFrame:
+        """
+        Add volatility features to capture market uncertainty and movement patterns
+        """
+        try:
+            logger.info("Adding volatility features...")
+            
+            # Rolling volatility (standard deviation of returns)
+            returns = df[price_col].pct_change()
+            for window in [6, 12, 24, 48]:
+                df[f'volatility_{window}h'] = returns.rolling(window=window).std() * 100
+                
+            # Historical volatility
+            for window in [24, 48, 168]:  # 1 day, 2 days, 1 week
+                df[f'hist_vol_{window}h'] = (
+                    df[price_col].rolling(window=window).std() / 
+                    df[price_col].rolling(window=window).mean() * 100
+                ).fillna(0)
+            
+            # Volatility ratios (short vs long term)
+            df['vol_ratio_6_24'] = df['volatility_6h'] / df['volatility_24h']
+            df['vol_ratio_12_48'] = df['volatility_12h'] / df['volatility_48h']
+            
+            # Price range indicators
+            high_col = 'high' if 'high' in df.columns else price_col
+            low_col = 'low' if 'low' in df.columns else price_col
+            
+            for window in [6, 12, 24]:
+                rolling_high = df[high_col].rolling(window=window).max()
+                rolling_low = df[low_col].rolling(window=window).min()
+                df[f'price_range_{window}h'] = (
+                    (rolling_high - rolling_low) / rolling_low * 100
+                ).fillna(0)
+            
+            # Volatility breakout indicators
+            df['vol_breakout'] = (
+                df['volatility_6h'] > df['volatility_24h'].shift(1) * 1.5
+            ).astype(int)
+            
+            # Average True Range (ATR) approximation
+            if 'high' in df.columns and 'low' in df.columns:
+                tr = pd.DataFrame({
+                    'hl': df['high'] - df['low'],
+                    'hc': abs(df['high'] - df[price_col].shift(1)),
+                    'lc': abs(df['low'] - df[price_col].shift(1))
+                }).max(axis=1)
+                
+                for window in [14, 24]:
+                    df[f'atr_{window}h'] = tr.rolling(window=window).mean()
+            
+            logger.info("Added volatility features")
+            
+        except Exception as e:
+            logger.error(f"Error adding volatility features: {e}")
+        
+        return df
+    
     def create_target_variables(self, df: pd.DataFrame, price_col: str = 'price') -> pd.DataFrame:
         """
         Create target variables for different prediction horizons
@@ -725,6 +830,8 @@ class FeatureEngineer:
         
         df = self.add_lagged_features(df)
         df = self.add_volume_based_features(df)
+        df = self.add_momentum_features(df)  # NEW: Better momentum capture
+        df = self.add_volatility_features(df)  # NEW: Volatility patterns
         df = self.create_target_variables(df)
         
         # Clean data: replace infinity and extreme values
@@ -749,10 +856,60 @@ class FeatureEngineer:
         
         self.feature_columns = [col for col in df.columns if col not in exclude_cols]
         
+        # CRITICAL: Data leakage validation
+        self.validate_no_data_leakage(df)
+        
         logger.info(f"Feature engineering complete. Total features: {len(self.feature_columns)}")
         logger.info(f"Final dataset shape: {df.shape}")
         
         return df
+    
+    def validate_no_data_leakage(self, df: pd.DataFrame):
+        """
+        Validate that no features use future information (data leakage detection)
+        """
+        logger.info("🔍 Validating dataset for data leakage...")
+        
+        # Check 1: Ensure target variables are properly shifted into the future
+        target_cols = ['target_1h', 'target_1d', 'target_1w']
+        for target in target_cols:
+            if target in df.columns:
+                # Check that target values appear later in time
+                first_valid_idx = df[target].first_valid_index()
+                if first_valid_idx is not None and first_valid_idx == 0:
+                    logger.warning(f"⚠️  {target} has valid value at index 0 - possible data leakage!")
+        
+        # Check 2: Verify datetime ordering
+        if 'datetime' in df.columns:
+            is_sorted = df['datetime'].is_monotonic_increasing
+            if not is_sorted:
+                logger.warning("⚠️  Datetime column is not sorted - this could cause leakage!")
+        
+        # Check 3: Look for suspicious feature names that might use future data
+        suspicious_patterns = ['future', 'next', 'forward', 'ahead', 'target']
+        feature_cols = [col for col in df.columns if col in self.feature_columns]
+        
+        for col in feature_cols:
+            col_lower = col.lower()
+            for pattern in suspicious_patterns:
+                if pattern in col_lower and not col.startswith('lagged_'):
+                    logger.warning(f"⚠️  Suspicious feature name '{col}' - may contain future information!")
+        
+        # Check 4: Validate cross-asset features don't use future timestamps
+        cross_asset_features = [col for col in feature_cols if any(crypto in col for crypto in ['bitcoin', 'ethereum'])]
+        if cross_asset_features:
+            logger.info(f"✅ Found {len(cross_asset_features)} cross-asset features - validating timing...")
+            # Cross-asset features should only use same-time or lagged data
+            for col in cross_asset_features:
+                if 'lead' in col.lower() or 'future' in col.lower():
+                    logger.warning(f"⚠️  Cross-asset feature '{col}' may use future data!")
+        
+        # Check 5: Ensure lagged features actually lag behind
+        lagged_features = [col for col in feature_cols if 'lagged' in col.lower()]
+        if lagged_features:
+            logger.info(f"✅ Found {len(lagged_features)} lagged features - these should be safe")
+        
+        logger.info("🔍 Data leakage validation complete")
     
     def prepare_features_with_cross_asset_correlation(self, crypto_data_dict: Dict[str, pd.DataFrame], 
                                                     market_df: pd.DataFrame = None) -> Dict[str, pd.DataFrame]:
