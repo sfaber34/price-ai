@@ -4,6 +4,7 @@ Trains on historical data, makes predictions, and evaluates against known future
 """
 import pandas as pd
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta
 import logging
 from typing import Dict, List, Tuple
@@ -34,10 +35,10 @@ class CryptoBacktester:
         Collect extended historical data for backtesting
         """
         logger.info(f"Collecting {days} days of historical data for backtesting...")
-        
+
         data = {}
-        
-        # Collect crypto data
+
+        # Collect crypto OHLCV data
         for crypto in config.CRYPTOCURRENCIES:
             try:
                 crypto_data = self.data_collector.get_crypto_data(crypto, days=days)
@@ -48,7 +49,28 @@ class CryptoBacktester:
                     logger.warning(f"No data collected for {crypto}")
             except Exception as e:
                 logger.error(f"Failed to collect data for {crypto}: {e}")
-        
+
+        # External data — parallel fetch with hard timeout (same pattern as bot)
+        _EXT_TIMEOUT = 60  # longer timeout for backtest (not time-critical)
+        ext_tasks = {'fear_greed': (self.data_collector.get_fear_greed, (days,))}
+        for crypto in config.CRYPTOCURRENCIES:
+            ext_tasks[f'{crypto}_funding_rate']  = (self.data_collector.get_funding_rate,  (crypto, days))
+            ext_tasks[f'{crypto}_open_interest'] = (self.data_collector.get_open_interest, (crypto, days))
+
+        with ThreadPoolExecutor(max_workers=len(ext_tasks)) as pool:
+            futures = {key: pool.submit(fn, *args) for key, (fn, args) in ext_tasks.items()}
+            for key, fut in futures.items():
+                try:
+                    result = fut.result(timeout=_EXT_TIMEOUT)
+                    data[key] = result
+                    logger.info(f"Collected {len(result)} {key} records")
+                except FuturesTimeout:
+                    logger.warning(f"External data '{key}' timed out — skipping")
+                    data[key] = pd.DataFrame()
+                except Exception as e:
+                    logger.warning(f"External data '{key}' failed: {e} — skipping")
+                    data[key] = pd.DataFrame()
+
         return data
     
     def prepare_features_for_backtest(self, raw_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -69,49 +91,62 @@ class CryptoBacktester:
             logger.warning("No crypto data available for backtest feature preparation")
             return {}
         
+        # Build per-crypto external data dict (funding rate, OI, Fear & Greed)
+        fng_df = raw_data.get('fear_greed', pd.DataFrame())
+        external_data_by_crypto = {
+            crypto: {
+                'funding_rate':  raw_data.get(f'{crypto}_funding_rate', pd.DataFrame()),
+                'open_interest': raw_data.get(f'{crypto}_open_interest', pd.DataFrame()),
+                'fear_greed':    fng_df,
+            }
+            for crypto in config.CRYPTOCURRENCIES
+        }
+
         try:
             # Use the new cross-asset correlation feature preparation
             prepared_data = self.feature_engineer.prepare_features_with_cross_asset_correlation(
-                crypto_data, 
-                market_data
+                crypto_data,
+                market_data,
+                external_data_by_crypto=external_data_by_crypto,
             )
-            
+
             # Log feature counts for each crypto
             for crypto, features_df in prepared_data.items():
                 # Count cross-asset features specifically
-                cross_asset_features = [col for col in features_df.columns 
-                                      if any(other_crypto in col for other_crypto in config.CRYPTOCURRENCIES 
+                cross_asset_features = [col for col in features_df.columns
+                                      if any(other_crypto in col for other_crypto in config.CRYPTOCURRENCIES
                                            if other_crypto != crypto)]
-                
+
                 logger.info(f"🔬 Backtest {crypto}: {features_df.shape[1]} total features "
                            f"({len(cross_asset_features)} cross-asset)")
-            
+
             return prepared_data
-            
+
         except Exception as e:
             logger.error(f"Cross-asset backtest feature preparation failed: {e}")
-            
+
             # Fallback to individual feature preparation
             logger.info("Falling back to individual feature preparation for backtest...")
             prepared_data = {}
             for crypto in config.CRYPTOCURRENCIES:
                 if crypto in raw_data and not raw_data[crypto].empty:
                     try:
-                        # Prepare features using the same pipeline as the main bot
+                        ext = external_data_by_crypto.get(crypto, {})
                         crypto_features = self.feature_engineer.prepare_features(
                             raw_data[crypto],
-                            market_data
+                            market_data,
+                            ext,
                         )
-                        
+
                         if not crypto_features.empty:
                             prepared_data[crypto] = crypto_features
                             logger.info(f"Features prepared for {crypto}: {crypto_features.shape}")
                         else:
                             logger.warning(f"No features prepared for {crypto}")
-                            
+
                     except Exception as crypto_error:
                         logger.error(f"Feature preparation failed for {crypto}: {crypto_error}")
-            
+
             return prepared_data
     
     def create_time_splits(self, data: pd.DataFrame, train_days: int = 30, 
@@ -320,9 +355,10 @@ class CryptoBacktester:
             '1_year':   365,  # 1 year   = 35 040 15m bars
         }
         
-        # Collect historical data once
+        # Collect historical data once — reused by both the experiment and production training
         raw_data = self.collect_backtest_data(days)
         prepared_data = self.prepare_features_for_backtest(raw_data)
+        self._last_prepared_data = prepared_data  # stash for caller to reuse
         
         # Results organized by training window size
         experiment_results = {}
@@ -560,103 +596,88 @@ class CryptoBacktester:
         
         print("\n" + "="*80)
 
-def train_production_models(backtester: CryptoBacktester, analysis: Dict, days: int) -> Dict:
+def train_production_models(backtester: CryptoBacktester, analysis: Dict,
+                            prepared_data: Dict[str, pd.DataFrame]) -> Dict:
     """
-    Train final production models using optimal training windows and save them
+    Train final production models on a fixed training window and save them.
+
+    Why a fixed window instead of selecting based on backtest accuracy?
+    The window-selection experiment runs ~50 samples per window size.  Picking
+    the "best" window from those noisy estimates is test-set selection bias —
+    the winner is mostly chosen by luck, and its reported accuracy is inflated.
+    Using a fixed 365-day window (config.MODEL_SETTINGS['production_training_days'])
+    is unbiased, captures recent market regime, and provides enough data for the
+    calibrated XGBoost to learn robust patterns.
+
+    The backtest analysis passed in `analysis` is still printed/saved for
+    informational purposes so you can see which windows generalised best.
+
+    `prepared_data` is passed in from the caller so we do NOT re-fetch or
+    re-engineer features — that work was already done for the backtest run.
     """
     import os
     os.makedirs('models', exist_ok=True)
-    
-    # Find optimal training windows for each crypto/horizon combination
-    optimal_windows = {}
-    
-    _window_days = {
-        '1_month': 30, '2_months': 60, '3_months': 90,
-        '6_months': 180, '9_months': 270, '1_year': 365,
-    }
 
-    for crypto in ['bitcoin', 'ethereum']:
-        optimal_windows[crypto] = {}
+    production_window_days = config.MODEL_SETTINGS.get('production_training_days', 365)
 
-        for horizon in config.PREDICTION_INTERVALS:
-            best_window = None
-            best_accuracy = 0.0
+    print(f"\n  Fixed training window: {production_window_days} days "
+          f"(not selected from backtest — avoids selection bias)")
 
-            for window_name in _window_days:
-                if (window_name in analysis and
-                    crypto in analysis[window_name] and
-                    horizon in analysis[window_name][crypto]):
-
-                    accuracy = analysis[window_name][crypto][horizon]['direction_accuracy']
-                    if accuracy > best_accuracy:
-                        best_accuracy = accuracy
-                        best_window = window_name
-
-            if best_window:
-                optimal_windows[crypto][horizon] = {
-                    'window_name': best_window,
-                    'window_days': _window_days[best_window],
-                    'expected_accuracy': best_accuracy,
-                }
-                print(f"📈 {crypto.upper()} {horizon.upper()}: Using {best_window} window (Dir Acc: {best_accuracy*100:.1f}%)")
-    
-    # Collect fresh data for training production models
-    print("\n📊 Collecting fresh data for production model training...")
-    raw_data = backtester.collect_backtest_data(days)
-    prepared_data = backtester.prepare_features_for_backtest(raw_data)
-    
-    # Train and save optimal models
     production_models = {}
-    
+
     for crypto in config.CRYPTOCURRENCIES:
         if crypto not in prepared_data:
+            logger.warning(f"No prepared data for {crypto}, skipping")
             continue
-            
+
         production_models[crypto] = {}
         data = prepared_data[crypto]
-        
+
+        # Use the most recent `production_window_days` of data
+        n_bars = int(production_window_days * 24 * 4)
+        recent_data = data.tail(n_bars).copy()
+        print(f"\n  {crypto.upper()}: {len(recent_data)} training samples "
+              f"({production_window_days} days × 96 bars/day)")
+
         for horizon in config.PREDICTION_INTERVALS:
-            if crypto in optimal_windows and horizon in optimal_windows[crypto]:
-                window_info = optimal_windows[crypto][horizon]
-                train_days = window_info['window_days']
-                
-                print(f"\n🔧 Training {crypto.upper()} {horizon.upper()} model with {window_info['window_name']} window...")
-                
-                # Use the full recent data for training (last N days, 96 × 15m intervals per day)
-                recent_data = data.tail(int(train_days * 24 * 4)).copy()
-                
-                # Create model and train
-                model_key = f"{crypto}_{horizon}"
-                if model_key not in backtester.prediction_engine.models:
-                    backtester.prediction_engine.add_model(crypto, horizon)
-                
-                model = backtester.prediction_engine.models[model_key]
-                
-                try:
-                    model.train(recent_data)
-                    
-                    # Save the trained model
-                    model_filepath = f"models/{crypto}_{horizon}_production.pkl"
-                    model.save_model(model_filepath)
-                    
-                    production_models[crypto][horizon] = {
-                        'model_path': model_filepath,
-                        'training_window': window_info['window_name'],
-                        'training_days': train_days,
-                        'training_samples': len(recent_data),
-                        'expected_accuracy': window_info['expected_accuracy'],
-                    }
-                    
-                    print(f"✅ Saved {crypto} {horizon} model to {model_filepath}")
-                    
-                except Exception as e:
-                    print(f"❌ Failed to train {crypto} {horizon} model: {e}")
-    
-    # Save production model metadata
+            print(f"\n🔧 Training {crypto.upper()} {horizon.upper()}...")
+
+            model_key = f"{crypto}_{horizon}"
+            if model_key not in backtester.prediction_engine.models:
+                backtester.prediction_engine.add_model(crypto, horizon)
+
+            model = backtester.prediction_engine.models[model_key]
+
+            try:
+                training_info = model.train(recent_data)
+                clf_results = training_info.get('classification_results', {})
+
+                model_filepath = f"models/{crypto}_{horizon}_production.pkl"
+                model.save_model(model_filepath)
+
+                production_models[crypto][horizon] = {
+                    'model_path': model_filepath,
+                    'training_window': f'{production_window_days}_days_fixed',
+                    'training_days': production_window_days,
+                    'training_samples': len(recent_data),
+                    'model_type': clf_results.get('model_type', 'unknown'),
+                    'cv_accuracy': clf_results.get('cv_accuracy_mean', 0.0),
+                    'best_n_estimators': clf_results.get('best_n_estimators', 0),
+                }
+
+                cv_acc = clf_results.get('cv_accuracy_mean', 0.0)
+                n_est = clf_results.get('best_n_estimators', '?')
+                print(f"  ✅ Saved → {model_filepath}  "
+                      f"(CV acc: {cv_acc:.3f}, n_estimators: {n_est})")
+
+            except Exception as e:
+                print(f"  ❌ Failed to train {crypto} {horizon}: {e}")
+                logger.exception(f"Production training failed for {crypto} {horizon}")
+
     with open('models/production_models.json', 'w') as f:
         json.dump(production_models, f, indent=2)
-    
-    print(f"\n🎯 Production models metadata saved to models/production_models.json")
+
+    print(f"\n🎯 Production models saved → models/production_models.json")
     return production_models
 
 def main():
@@ -668,7 +689,9 @@ def main():
     parser.add_argument('--runs', type=int, default=30, 
                        help='Number of runs per training window (default: 30)')
     parser.add_argument('--days', type=int, default=730,
-                       help='Days of historical data to collect (default: 730 — 2 years via Binance)')
+                       help='Days of history for the backtest experiment (default: 730). '
+                            'Production models always train on the most recent '
+                            'production_training_days (config, default 365) of this data.')
     parser.add_argument('--quick', action='store_true',
                        help='Quick test mode (3 runs per window)')
     
@@ -697,13 +720,16 @@ def main():
         days=args.days,
         runs_per_window=runs_per_window
     )
-    
+    # Reuse the data that was already fetched and feature-engineered inside the
+    # experiment — no second download or feature pass needed.
+    prepared_data = backtester._last_prepared_data
+
     # Analyze experiment results
     analysis = backtester.analyze_training_optimization(experiment_results)
-    
+
     # Display comprehensive results
     backtester.display_training_window_results(analysis)
-    
+
     # Save detailed results
     with open('optimal_training_results.json', 'w') as f:
         # Convert numpy types for JSON serialization
@@ -714,15 +740,15 @@ def main():
                 json_analysis[window_name][crypto] = {}
                 for horizon, stats in crypto_data.items():
                     json_analysis[window_name][crypto][horizon] = {
-                        k: float(v) if isinstance(v, (np.floating, np.integer)) else v 
+                        k: float(v) if isinstance(v, (np.floating, np.integer)) else v
                         for k, v in stats.items()
                     }
-        
+
         json.dump(json_analysis, f, indent=2)
-    
-    # Find and train optimal models for production use
-    print("\n🔥 TRAINING PRODUCTION MODELS WITH OPTIMAL WINDOWS...")
-    optimal_models = train_production_models(backtester, analysis, args.days)
+
+    # Train production models on fixed window using already-prepared data
+    print("\n🔥 TRAINING PRODUCTION MODELS...")
+    optimal_models = train_production_models(backtester, analysis, prepared_data)
     
     logger.info("Optimal training results saved to optimal_training_results.json")
     print("\n✅ Optimal model training complete!")

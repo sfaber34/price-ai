@@ -7,6 +7,7 @@ import pandas as pd
 import schedule
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta
 from typing import Dict, List
 import json
@@ -72,7 +73,7 @@ class CryptoPredictionBot:
         except Exception as e:
             logger.error(f"Failed to collect traditional market data: {e}")
             data['traditional_markets'] = pd.DataFrame()
-        
+
         # Collect economic indicators
         try:
             econ_data = self.data_collector.get_economic_indicators()
@@ -82,7 +83,30 @@ class CryptoPredictionBot:
         except Exception as e:
             logger.error(f"Failed to collect economic indicators: {e}")
             data['economic_indicators'] = pd.DataFrame()
-        
+
+        # External data (Fear & Greed, funding rate, open interest) — fetched in parallel
+        # with a hard wall-clock timeout so a slow/hung OKX request can never block
+        # prediction cycles.  Cached results return immediately on subsequent calls.
+        _EXT_TIMEOUT = 45  # seconds per source before giving up
+        ext_tasks = {'fear_greed': (self.data_collector.get_fear_greed, (days,))}
+        for crypto in config.CRYPTOCURRENCIES:
+            ext_tasks[f'{crypto}_funding_rate']  = (self.data_collector.get_funding_rate,  (crypto, days))
+            ext_tasks[f'{crypto}_open_interest'] = (self.data_collector.get_open_interest, (crypto, days))
+
+        with ThreadPoolExecutor(max_workers=len(ext_tasks)) as pool:
+            futures = {key: pool.submit(fn, *args) for key, (fn, args) in ext_tasks.items()}
+            for key, fut in futures.items():
+                try:
+                    result = fut.result(timeout=_EXT_TIMEOUT)
+                    data[key] = result
+                    logger.info(f"Collected {len(result)} {key} records")
+                except FuturesTimeout:
+                    logger.warning(f"External data '{key}' timed out after {_EXT_TIMEOUT}s — skipping")
+                    data[key] = pd.DataFrame()
+                except Exception as e:
+                    logger.warning(f"External data '{key}' failed: {e} — skipping")
+                    data[key] = pd.DataFrame()
+
         return data
     
     def prepare_features_for_all_cryptos(self, raw_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -103,44 +127,58 @@ class CryptoPredictionBot:
             logger.warning("No crypto data available for feature preparation")
             return {}
         
+        # Build per-crypto external data dict (funding rate, OI, Fear & Greed)
+        fng_df = raw_data.get('fear_greed', pd.DataFrame())
+        external_data_by_crypto = {
+            crypto: {
+                'funding_rate':  raw_data.get(f'{crypto}_funding_rate', pd.DataFrame()),
+                'open_interest': raw_data.get(f'{crypto}_open_interest', pd.DataFrame()),
+                'fear_greed':    fng_df,
+            }
+            for crypto in config.CRYPTOCURRENCIES
+        }
+
         try:
             # Use the new cross-asset correlation feature preparation
             prepared_data = self.feature_engineer.prepare_features_with_cross_asset_correlation(
-                crypto_data, 
-                market_data
+                crypto_data,
+                market_data,
+                external_data_by_crypto=external_data_by_crypto,
             )
-            
+
             # Log feature counts for each crypto
             for crypto, features_df in prepared_data.items():
                 # Count cross-asset features specifically
-                cross_asset_features = [col for col in features_df.columns 
-                                      if any(other_crypto in col for other_crypto in config.CRYPTOCURRENCIES 
+                cross_asset_features = [col for col in features_df.columns
+                                      if any(other_crypto in col for other_crypto in config.CRYPTOCURRENCIES
                                            if other_crypto != crypto)]
-                
+
                 logger.info(f"✅ {crypto}: {features_df.shape[1]} total features "
                            f"({len(cross_asset_features)} cross-asset)")
-            
+
             return prepared_data
-            
+
         except Exception as e:
             logger.error(f"Cross-asset feature preparation failed: {e}")
-            
+
             # Fallback to individual feature preparation
             logger.info("Falling back to individual feature preparation...")
             prepared_data = {}
             for crypto in config.CRYPTOCURRENCIES:
                 if crypto in raw_data:
                     try:
+                        ext = external_data_by_crypto.get(crypto, {})
                         features_df = self.feature_engineer.prepare_features(
-                            raw_data[crypto], 
-                            market_data
+                            raw_data[crypto],
+                            market_data,
+                            ext,
                         )
                         prepared_data[crypto] = features_df
                         logger.info(f"Features prepared for {crypto}: {features_df.shape}")
-                        
+
                     except Exception as crypto_error:
                         logger.error(f"Feature preparation failed for {crypto}: {crypto_error}")
-            
+
             return prepared_data
     
     def load_production_models(self) -> bool:
@@ -227,9 +265,8 @@ class CryptoPredictionBot:
                 if 'error' in result:
                     logger.error(f"Training failed for {model_key}: {result['error']}")
                 else:
-                    reg_mse = result.get('regression_results', {}).get('train_mse', 'N/A')
                     clf_acc = result.get('classification_results', {}).get('train_accuracy', 'N/A')
-                    logger.info(f"Training completed for {model_key} - MSE: {reg_mse}, Accuracy: {clf_acc}")
+                    logger.info(f"Training completed for {model_key} - Accuracy: {clf_acc}")
             
             # Save models
             self.prediction_engine.save_ensemble('models')
@@ -276,8 +313,8 @@ class CryptoPredictionBot:
                         if current_price:
                             # Get current predictions for this crypto
                             current_predictions = {
-                                pred['horizon']: pred['predicted_price'] 
-                                for model_key, pred in predictions.items() 
+                                pred['horizon']: pred['direction_prob']
+                                for model_key, pred in predictions.items()
                                 if pred['crypto'] == crypto
                             }
                             
@@ -454,237 +491,115 @@ class CryptoPredictionBot:
             except Exception as e:
                 logger.error(f"Failed to get current price for {crypto}: {e}")
     
-    def evaluate_past_predictions(self):
-        """
-        Evaluate how well past predictions performed against actual prices
-        """
-        try:
-            conn = sqlite3.connect(config.DATABASE_PATH)
-            
-            # Get predictions that should have matured by now
-            query = '''
-                SELECT * FROM predictions 
-                WHERE datetime(created_at) <= datetime('now', '-1 hours')
-                ORDER BY created_at DESC
-                LIMIT 100
-            '''
-            
-            df = pd.read_sql_query(query, conn)
-            conn.close()
-            
-            if df.empty:
-                return None
-            
-            # Current real-time prices for comparison
-            current_prices = {}
-            for crypto in config.CRYPTOCURRENCIES:
-                try:
-                    current_prices[crypto] = self.data_collector.get_crypto_current_price(crypto)
-                except Exception as e:
-                    logger.warning(f"Failed to get current price for {crypto}: {e}")
-                    current_prices[crypto] = None
-            
-            # Evaluate predictions by timeframe
-            evaluations = {}
-            
-            for _, pred in df.iterrows():
-                crypto = pred['crypto']
-                horizon = pred['prediction_horizon']
-                predicted_price = pred['predicted_price']
-                confidence = pred['confidence']
-                created_at = pd.to_datetime(pred['created_at'])
-                
-                # Calculate time windows for evaluation (more flexible)
-                now = datetime.now()
-                time_since_created = now - created_at
-                
-                # Define evaluation windows that match the prediction horizons
-                can_evaluate = False
-                # FIXED: More flexible evaluation windows that work with 5-minute prediction schedule
-                if horizon == '15m' and time_since_created >= timedelta(minutes=5):
-                    # Evaluate 15m predictions any time 5+ minutes after creation
-                    can_evaluate = True
-                elif horizon == '1h' and time_since_created >= timedelta(minutes=50):
-                    # Evaluate 1h predictions any time 50+ minutes after creation
-                    can_evaluate = True
-                elif horizon == '4h' and time_since_created >= timedelta(hours=3, minutes=30):
-                    # Evaluate 4h predictions any time 3.5+ hours after creation
-                    can_evaluate = True
-                
-                # Only evaluate if within the time window and we have current price
-                if can_evaluate and current_prices.get(crypto):
-                    key = f"{crypto}_{horizon}"
-                    
-                    if key not in evaluations:
-                        evaluations[key] = []
-                    
-                    actual_price = current_prices[crypto]
-                    predicted_return = ((predicted_price - actual_price) / actual_price) * 100
-                    actual_return = 0  # We're comparing to current price
-                    
-                    # Direction accuracy
-                    predicted_direction = predicted_return > 0
-                    # For simplicity, assume current price movement direction
-                    # In a real implementation, you'd fetch historical price at target_time
-                    
-                    evaluation = {
-                        'predicted_price': predicted_price,
-                        'actual_price': actual_price,
-                        'predicted_return': predicted_return,
-                        'confidence': confidence,
-                        'time_elapsed': time_since_created,
-                        'created_at': created_at
-                    }
-                    
-                    evaluations[key].append(evaluation)
-            
-            return evaluations
-            
-        except Exception as e:
-            logger.error(f"Past prediction evaluation failed: {e}")
-            return None
-    
     def display_prediction_evaluation(self):
         """
-        Display evaluation of prediction accuracy
+        Display evaluation of direction prediction accuracy
         """
         try:
             conn = sqlite3.connect(config.DATABASE_PATH)
-            
-            # Get recent prediction evaluations
             query = '''
-                SELECT 
+                SELECT
                     crypto,
                     prediction_horizon,
                     predicted_price,
-                    actual_price,
-                    absolute_error,
-                    percent_error,
+                    direction_predicted,
+                    direction_actual,
                     direction_correct,
                     confidence,
-                    prediction_timestamp,
-                    target_timestamp,
                     evaluation_timestamp
-                FROM prediction_evaluations 
-                WHERE evaluation_timestamp >= datetime('now', '-7 days')
+                FROM (
+                    SELECT *,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY crypto, prediction_horizon, target_timestamp
+                            ORDER BY evaluation_timestamp DESC
+                        ) as rn
+                    FROM prediction_evaluations
+                    WHERE evaluation_timestamp >= datetime('now', '-7 days')
+                )
+                WHERE rn = 1
                 ORDER BY evaluation_timestamp DESC
             '''
-            
             df = pd.read_sql_query(query, conn)
             conn.close()
-            
+
             if df.empty:
                 print("\n📊 No prediction evaluations available yet")
                 print("    Predictions need time to mature before evaluation")
                 return
-            
+
             print("\n" + "="*80)
-            print("📊 PREDICTION ACCURACY EVALUATION")
+            print("📊 DIRECTION PREDICTION ACCURACY")
             print("="*80)
-            
-            # Group by crypto
+
             for crypto in config.CRYPTOCURRENCIES:
                 crypto_data = df[df['crypto'] == crypto]
-                
                 if crypto_data.empty:
                     continue
-                
-                # Use distinctive emojis for each crypto
-                if crypto == 'bitcoin':
-                    crypto_emoji = "₿"
-                elif crypto == 'ethereum':
-                    crypto_emoji = "♦️ "
-                else:
-                    crypto_emoji = "📈"
-                
-                print(f"\n{crypto_emoji} {crypto.upper()} - PREDICTION vs ACTUAL")
-                print("-" * 100)
-                print(f"{'Time':>4} | {'Predicted':>10} | {'Actual':>10} | {'Error $':>8} | {'% Error':>9} | {'Direction':>9} | {'Result':>6} | Confidence")
-                print("-" * 100)
-                
-                # Get latest evaluation for each horizon
+
+                crypto_emoji = "₿" if crypto == 'bitcoin' else "♦️ "
+                print(f"\n{crypto_emoji} {crypto.upper()}")
+                print("-" * 70)
+                print(f"{'Time':>4} | {'Predicted':>9} | {'P(UP)':>5} | {'Actual':>6} | {'Correct':>7} | {'Conf':>5} | Evals")
+                print("-" * 70)
+
                 for horizon in ['15m', '1h', '4h']:
-                    horizon_data = crypto_data[crypto_data['prediction_horizon'] == horizon]
-                    
-                    if not horizon_data.empty:
-                        total_evals = len(horizon_data)
-                        
-                        # Get the most recent evaluation for this horizon
-                        latest = horizon_data.iloc[0]
-                        latest_eval_time = pd.to_datetime(latest['evaluation_timestamp'])
-                        
-                        predicted_price = latest['predicted_price']
-                        actual_price = latest['actual_price']
-                        dollar_error = latest['absolute_error']
-                        percent_error = latest['percent_error']
-                        direction_correct = latest['direction_correct']
-                        confidence = latest['confidence']
-                        
-                        # Direction indicator
-                        direction_emoji = "🟢" if direction_correct else "🔴"
-                        direction_text = "✓" if direction_correct else "✗"
-                        
-                        # Determine if prediction was good based on percent error
-                        if percent_error <= 2.0:
-                            accuracy_emoji = "🎯"  # Excellent
-                        elif percent_error <= 5.0:
-                            accuracy_emoji = "✅"  # Good
-                        elif percent_error <= 10.0:
-                            accuracy_emoji = "⚠️"   # Fair
-                        else:
-                            accuracy_emoji = "❌"  # Poor
-                        
-                        confidence_stars = "⭐" * int(confidence * 5) if confidence else ""
-                        
-                        # Calculate how long ago this evaluation was done
-                        time_since_eval = datetime.now() - latest_eval_time
-                        if time_since_eval < timedelta(minutes=1):
-                            eval_age = "just now"
-                        elif time_since_eval < timedelta(hours=1):
-                            eval_age = f"{int(time_since_eval.total_seconds()/60)}m ago"
-                        elif time_since_eval < timedelta(days=1):
-                            eval_age = f"{int(time_since_eval.total_seconds()/3600)}h ago"
-                        else:
-                            eval_age = f"{int(time_since_eval.total_seconds()/86400)}d ago"
-                        
-                        print(f"  {horizon.upper():>3} | "
-                              f"${predicted_price:>9.2f} | "
-                              f"${actual_price:>9.2f} | "
-                              f"${dollar_error:>7.2f} | "
-                              f"{percent_error:>7.2f}% | "
-                              f"{direction_emoji} {direction_text:>6} | "
-                              f"{accuracy_emoji:>6} | {confidence_stars} ({total_evals} evals, latest {eval_age})")
-            
-            # Individual crypto summaries
-            if not df.empty:
-                print("\n" + "="*80)
-                print("📊 ACCURACY SUMMARY BY CRYPTOCURRENCY")
-                print("="*80)
-                
-                for crypto in config.CRYPTOCURRENCIES:
-                    crypto_data = df[df['crypto'] == crypto]
-                    
-                    if not crypto_data.empty:
-                        avg_error = crypto_data['percent_error'].mean()
-                        direction_accuracy = crypto_data['direction_correct'].mean() * 100
-                        total_evals = len(crypto_data)
-                        
-                        # Use distinctive emojis for each crypto
-                        if crypto == 'bitcoin':
-                            crypto_emoji = "₿"
-                        elif crypto == 'ethereum':
-                            crypto_emoji = "♦️ "
-                        else:
-                            crypto_emoji = "📈"
-                        
-                        print(f"{crypto_emoji} {crypto.upper()}")
-                        print(f"   • Total Evaluations: {total_evals}")
-                        print(f"   • Average Error: {avg_error:.2f}%")
-                        print(f"   • Direction Accuracy: {direction_accuracy:.1f}%")
-                        print()
-                
-                print("="*80)
-            
+                    hd = crypto_data[crypto_data['prediction_horizon'] == horizon]
+                    if hd.empty:
+                        continue
+
+                    total_evals = len(hd)
+                    dir_accuracy = hd['direction_correct'].mean() * 100
+                    latest = hd.iloc[0]
+
+                    # direction_prob is stored in predicted_price column
+                    direction_prob = latest['predicted_price']
+                    pred_dir = latest['direction_predicted']
+                    act_dir  = latest['direction_actual']
+                    correct  = latest['direction_correct']
+                    conf     = latest['confidence']
+
+                    pred_label = "UP  " if pred_dir == 1 else "DOWN"
+                    act_label  = "UP"   if act_dir  == 1 else "DOWN"
+                    result     = "✓" if correct else "✗"
+                    result_emoji = "🟢" if correct else "🔴"
+
+                    latest_eval_time = pd.to_datetime(latest['evaluation_timestamp'])
+                    time_since_eval = datetime.now() - latest_eval_time
+                    if time_since_eval < timedelta(minutes=1):
+                        eval_age = "just now"
+                    elif time_since_eval < timedelta(hours=1):
+                        eval_age = f"{int(time_since_eval.total_seconds()/60)}m ago"
+                    elif time_since_eval < timedelta(days=1):
+                        eval_age = f"{int(time_since_eval.total_seconds()/3600)}h ago"
+                    else:
+                        eval_age = f"{int(time_since_eval.total_seconds()/86400)}d ago"
+
+                    print(f"  {horizon.upper():>3} | "
+                          f"{pred_label:>9} | "
+                          f"{direction_prob:>5.2f} | "
+                          f"{act_label:>6} | "
+                          f"{result_emoji} {result:>4} | "
+                          f"{conf*100:>4.0f}% | "
+                          f"{total_evals} evals ({dir_accuracy:.0f}% acc), eval'd {eval_age}")
+
+            # Summary
+            print("\n" + "="*80)
+            print("📊 ACCURACY SUMMARY")
+            print("="*80)
+            for crypto in config.CRYPTOCURRENCIES:
+                crypto_data = df[df['crypto'] == crypto]
+                if crypto_data.empty:
+                    continue
+                crypto_emoji = "₿" if crypto == 'bitcoin' else "♦️ "
+                dir_acc = crypto_data['direction_correct'].mean() * 100
+                avg_conf = crypto_data['confidence'].mean() * 100
+                print(f"{crypto_emoji} {crypto.upper()}")
+                print(f"   • Evaluations:        {len(crypto_data)}")
+                print(f"   • Direction Accuracy: {dir_acc:.1f}%")
+                print(f"   • Avg Confidence:     {avg_conf:.1f}%")
+                print()
+            print("="*80)
+
         except Exception as e:
             logger.error(f"Prediction evaluation display failed: {e}")
             print(f"\n❌ Error displaying evaluations: {e}")

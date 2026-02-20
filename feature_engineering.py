@@ -867,34 +867,125 @@ class FeatureEngineer:
         df = df.copy()
 
         try:
-            # Target variables for different horizons (future prices)
-            df['target_15m'] = df[price_col].shift(-1)    # Price 15 minutes in the future
-            df['target_1h'] = df[price_col].shift(-4)     # Price 1 hour in the future
-            df['target_4h'] = df[price_col].shift(-16)    # Price 4 hours in the future
+            # Direction targets only — 1 if price goes UP, 0 if DOWN
+            # shift(-N) looks N bars ahead; > current price means UP
+            # Use .where(future.notna()) to preserve NaN at the tail so the leakage
+            # validator can confirm the shift was applied and training drops those rows.
+            future_15m = df[price_col].shift(-1)
+            future_1h  = df[price_col].shift(-4)
+            future_4h  = df[price_col].shift(-16)
+            df['target_direction_15m'] = (future_15m > df[price_col]).where(future_15m.notna())
+            df['target_direction_1h']  = (future_1h  > df[price_col]).where(future_1h.notna())
+            df['target_direction_4h']  = (future_4h  > df[price_col]).where(future_4h.notna())
 
-            # Target returns (percentage change)
-            df['target_return_15m'] = (df['target_15m'] / df[price_col] - 1) * 100
-            df['target_return_1h'] = (df['target_1h'] / df[price_col] - 1) * 100
-            df['target_return_4h'] = (df['target_4h'] / df[price_col] - 1) * 100
-
-            # Binary classification targets (up/down)
-            df['target_direction_15m'] = (df['target_return_15m'] > 0).astype(int)
-            df['target_direction_1h'] = (df['target_return_1h'] > 0).astype(int)
-            df['target_direction_4h'] = (df['target_return_4h'] > 0).astype(int)
-
-            # CRITICAL: Create future datetime stamps for proper evaluation
+            # Future datetime stamps for evaluation alignment
             df['target_datetime_15m'] = df['datetime'] + pd.Timedelta(minutes=15)
-            df['target_datetime_1h'] = df['datetime'] + pd.Timedelta(hours=1)
-            df['target_datetime_4h'] = df['datetime'] + pd.Timedelta(hours=4)
+            df['target_datetime_1h']  = df['datetime'] + pd.Timedelta(hours=1)
+            df['target_datetime_4h']  = df['datetime'] + pd.Timedelta(hours=4)
 
-            logger.info("Created target variables for 15m, 1h, 4h horizons")
+            logger.info("Created direction target variables for 15m, 1h, 4h horizons")
 
         except Exception as e:
             logger.error(f"Error creating target variables: {e}")
 
         return df
     
-    def prepare_features(self, crypto_df: pd.DataFrame, market_df: pd.DataFrame = None) -> pd.DataFrame:
+    def add_funding_rate_features(self, df: pd.DataFrame, funding_df: pd.DataFrame = None) -> pd.DataFrame:
+        """
+        Add perpetual funding rate features via merge_asof (backward) so each 15m bar
+        receives the most-recent 8h settlement value — the rate actually in effect.
+        """
+        if funding_df is None or funding_df.empty:
+            return df
+
+        try:
+            fdf = funding_df.copy()
+            fdf['datetime'] = pd.to_datetime(fdf['datetime'])
+            fdf = fdf.sort_values('datetime').reset_index(drop=True)
+
+            fdf['funding_rate_rolling_8h']  = fdf['funding_rate'].rolling(3, min_periods=1).mean()
+            fdf['funding_rate_std_24h']     = fdf['funding_rate'].rolling(3, min_periods=1).std()
+            fdf['funding_rate_cumulative']  = fdf['funding_rate'].cumsum()
+            fdf['funding_rate_change']      = fdf['funding_rate'].diff()
+
+            df = df.copy()
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df = df.sort_values('datetime').reset_index(drop=True)
+
+            df = pd.merge_asof(df, fdf, on='datetime', direction='backward')
+            logger.info("Added funding rate features")
+        except Exception as e:
+            logger.error(f"Error adding funding rate features: {e}")
+
+        return df
+
+    def add_open_interest_features(self, df: pd.DataFrame, oi_df: pd.DataFrame = None) -> pd.DataFrame:
+        """
+        Add open interest features via merge_asof (backward).
+        Renames oi_usd → open_interest; drops oi_volume_usd after deriving oi_volume_ratio.
+        """
+        if oi_df is None or oi_df.empty:
+            return df
+
+        try:
+            odf = oi_df.copy()
+            odf['datetime'] = pd.to_datetime(odf['datetime'])
+            odf = odf.sort_values('datetime').reset_index(drop=True)
+
+            odf['oi_delta']        = odf['oi_usd'].diff()
+            odf['oi_trend']        = odf['oi_delta'].diff()   # 2nd derivative / acceleration
+            odf['oi_volume_ratio'] = odf['oi_volume_usd'] / (odf['oi_usd'] + 1e-6)
+
+            df = df.copy()
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df = df.sort_values('datetime').reset_index(drop=True)
+
+            df = pd.merge_asof(df, odf, on='datetime', direction='backward')
+
+            df['oi_price_ratio'] = df['oi_usd'] / (df['price'] + 1e-6)
+            df = df.rename(columns={'oi_usd': 'open_interest'})
+            df = df.drop(columns=['oi_volume_usd'], errors='ignore')
+
+            logger.info("Added open interest features")
+        except Exception as e:
+            logger.error(f"Error adding open interest features: {e}")
+
+        return df
+
+    def add_fear_greed_features(self, df: pd.DataFrame, fng_df: pd.DataFrame = None) -> pd.DataFrame:
+        """
+        Add Fear & Greed Index features via merge_asof (backward).
+        Daily values are broadcast to all 15m bars within the day — no future leakage.
+        """
+        if fng_df is None or fng_df.empty:
+            return df
+
+        try:
+            fdf = fng_df.copy()
+            fdf['datetime'] = pd.to_datetime(fdf['datetime'])
+            fdf = fdf.sort_values('datetime').reset_index(drop=True)
+
+            fdf['fear_greed_regime'] = pd.cut(
+                fdf['fear_greed_value'],
+                bins=[0, 30, 60, 100],
+                labels=[0, 1, 2],
+                include_lowest=True,
+            ).astype(float)
+            fdf['fear_greed_change']           = fdf['fear_greed_value'].diff()
+            fdf['fear_greed_distance_from_50'] = fdf['fear_greed_value'] - 50
+
+            df = df.copy()
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df = df.sort_values('datetime').reset_index(drop=True)
+
+            df = pd.merge_asof(df, fdf, on='datetime', direction='backward')
+            logger.info("Added Fear & Greed features")
+        except Exception as e:
+            logger.error(f"Error adding Fear & Greed features: {e}")
+
+        return df
+
+    def prepare_features(self, crypto_df: pd.DataFrame, market_df: pd.DataFrame = None, external_data: dict = None) -> pd.DataFrame:
         """
         Main feature preparation pipeline
         """
@@ -908,6 +999,13 @@ class FeatureEngineer:
         df = self.add_volume_based_features(df)
         df = self.add_momentum_features(df)  # NEW: Better momentum capture
         df = self.add_volatility_features(df)  # NEW: Volatility patterns
+
+        # External derivative/sentiment data (no future leakage via merge_asof backward)
+        external_data = external_data or {}
+        df = self.add_funding_rate_features(df, external_data.get('funding_rate'))
+        df = self.add_open_interest_features(df, external_data.get('open_interest'))
+        df = self.add_fear_greed_features(df, external_data.get('fear_greed'))
+
         df = self.create_target_variables(df)
         
         # Clean data: replace infinity and extreme values
@@ -916,8 +1014,6 @@ class FeatureEngineer:
 
         # Replace extreme values (beyond 3 standard deviations) with NaN
         _target_cols_set = {
-            'target_15m', 'target_1h', 'target_4h',
-            'target_return_15m', 'target_return_1h', 'target_return_4h',
             'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
         }
         for col in numeric_cols:
@@ -930,14 +1026,12 @@ class FeatureEngineer:
         # Store feature column names (excluding targets and metadata)
         exclude_cols = [
             'datetime', 'crypto',
-            'target_15m', 'target_1h', 'target_4h',
-            'target_return_15m', 'target_return_1h', 'target_return_4h',
             'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
             'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h',
         ]
-        
+
         self.feature_columns = [col for col in df.columns if col not in exclude_cols]
-        
+
         # CRITICAL: Data leakage validation (re-derive feature columns after cross-asset enrichment)
         self.feature_columns = [col for col in df.columns if col not in exclude_cols]
         self.validate_no_data_leakage(df)
@@ -957,9 +1051,9 @@ class FeatureEngineer:
         # shift(-n) produces NaN in the LAST n rows (not the first), so a valid
         # value at index 0 is completely correct.  We verify the tail is NaN.
         target_shift_map = {
-            'target_15m': 1,   # shift(-1)
-            'target_1h':  4,   # shift(-4)
-            'target_4h':  16,  # shift(-16)
+            'target_direction_15m': 1,   # shift(-1)
+            'target_direction_1h':  4,   # shift(-4)
+            'target_direction_4h':  16,  # shift(-16)
         }
         for target, shift_n in target_shift_map.items():
             if target in df.columns:
@@ -1004,8 +1098,9 @@ class FeatureEngineer:
         
         logger.info("🔍 Data leakage validation complete")
     
-    def prepare_features_with_cross_asset_correlation(self, crypto_data_dict: Dict[str, pd.DataFrame], 
-                                                    market_df: pd.DataFrame = None) -> Dict[str, pd.DataFrame]:
+    def prepare_features_with_cross_asset_correlation(self, crypto_data_dict: Dict[str, pd.DataFrame],
+                                                    market_df: pd.DataFrame = None,
+                                                    external_data_by_crypto: dict = None) -> Dict[str, pd.DataFrame]:
         """
         Prepare features for multiple cryptocurrencies with cross-asset correlation features
         
@@ -1023,7 +1118,8 @@ class FeatureEngineer:
         for crypto_name, crypto_df in crypto_data_dict.items():
             if not crypto_df.empty:
                 logger.info(f"Preparing individual features for {crypto_name}...")
-                prepared_data[crypto_name] = self.prepare_features(crypto_df, market_df)
+                ext = (external_data_by_crypto or {}).get(crypto_name, {})
+                prepared_data[crypto_name] = self.prepare_features(crypto_df, market_df, ext)
         
         # Now add cross-asset correlation features for Bitcoin and Ethereum
         if 'bitcoin' in prepared_data and 'ethereum' in prepared_data:
@@ -1063,8 +1159,6 @@ class FeatureEngineer:
                 for col in numeric_cols:
                     if col not in [
                         'datetime',
-                        'target_15m', 'target_1h', 'target_4h',
-                        'target_return_15m', 'target_return_1h', 'target_return_4h',
                         'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
                     ]:
                         # Check for extremely large values (beyond reasonable float64 range)
@@ -1075,13 +1169,21 @@ class FeatureEngineer:
                         if any(substring in col for substring in ['_ratio', '_vs_', 'divergence', 'correlation']):
                             crypto_df.loc[crypto_df[col].abs() > 1000, col] = np.nan
 
-                # Fill remaining NaN values with forward fill, then backward fill, then zero
+                # Fill remaining NaN values with forward fill, then backward fill, then zero.
+                # External columns (funding rate, OI, F&G) are excluded from the main loop
+                # and zero-filled separately — bfilling them would pull future values backward
+                # across the start of history.
+                _EXTERNAL_COLS = {
+                    'funding_rate', 'funding_rate_rolling_8h', 'funding_rate_std_24h',
+                    'funding_rate_cumulative', 'funding_rate_change',
+                    'open_interest', 'oi_delta', 'oi_price_ratio', 'oi_trend', 'oi_volume_ratio',
+                    'fear_greed_value', 'fear_greed_regime', 'fear_greed_change',
+                    'fear_greed_distance_from_50',
+                }
                 _exclude_fill = {
                     'datetime',
-                    'target_15m', 'target_1h', 'target_4h',
-                    'target_return_15m', 'target_return_1h', 'target_return_4h',
                     'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
-                }
+                } | _EXTERNAL_COLS
                 for col in numeric_cols:
                     if col not in _exclude_fill:
                         # Forward fill
@@ -1089,6 +1191,12 @@ class FeatureEngineer:
                         # Backward fill
                         crypto_df[col] = crypto_df[col].bfill()
                         # Finally fill any remaining NaN with 0
+                        crypto_df[col] = crypto_df[col].fillna(0)
+
+                # Zero-fill external columns only — no bfill to avoid pulling
+                # future values backward into the period before data starts.
+                for col in _EXTERNAL_COLS:
+                    if col in crypto_df.columns:
                         crypto_df[col] = crypto_df[col].fillna(0)
                 
                 # Final check for any remaining problematic values
@@ -1104,8 +1212,6 @@ class FeatureEngineer:
             if not crypto_df.empty:
                 exclude_cols = [
                     'datetime', 'crypto',
-                    'target_15m', 'target_1h', 'target_4h',
-                    'target_return_15m', 'target_return_1h', 'target_return_4h',
                     'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
                     'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h',
                 ]

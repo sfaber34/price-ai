@@ -374,9 +374,10 @@ class PredictionAccuracyTracker:
                                 evaluations[key].append(evaluation)
                                 evaluated_count += 1
                                 
-                                logger.debug(f"✅ Evaluated {crypto} {pred_horizon} prediction: "
-                                           f"predicted ${predicted_price:.2f}, actual ${actual_price_at_target:.2f}, "
-                                           f"error {evaluation['percent_error']:.2f}%")
+                                pred_dir = "UP" if predicted_price > 0.5 else "DOWN"
+                                logger.debug(f"✅ Evaluated {crypto} {pred_horizon}: "
+                                           f"predicted {pred_dir} (P(UP)={predicted_price:.2f}), "
+                                           f"direction_correct={evaluation['direction_correct']}")
                         
                         except Exception as e:
                             logger.error(f"Failed to evaluate individual prediction: {e}")
@@ -769,27 +770,30 @@ class PredictionAccuracyTracker:
         try:
             conn = sqlite3.connect(config.DATABASE_PATH)
             
-            # Get directional accuracy data with deduplication
+            # Get directional accuracy data.
+            # Deduplicate by prediction_id so a prediction that was somehow double-stored
+            # is only counted once, but different predictions that happen to share the same
+            # target_timestamp (e.g. due to cached feature data) are each counted.
             query = '''
-                SELECT 
+                SELECT
                     target_timestamp as timestamp,
                     prediction_horizon,
                     direction_correct,
                     evaluation_timestamp,
                     ROW_NUMBER() OVER (
-                        PARTITION BY target_timestamp, prediction_horizon 
+                        PARTITION BY prediction_id
                         ORDER BY evaluation_timestamp DESC
                     ) as rn
                 FROM prediction_evaluations
                 WHERE crypto = ? AND evaluation_timestamp >= ?
                 ORDER BY target_timestamp
             '''
-            
+
             params = [crypto, (datetime.now() - timedelta(days=days_back)).isoformat()]
             df = pd.read_sql_query(query, conn, params=params)
             conn.close()
-            
-            # Keep only the most recent evaluation for each target_timestamp + horizon
+
+            # Keep only one row per prediction_id (guards against accidental double-evaluation)
             df = df[df['rn'] == 1].drop('rn', axis=1)
             
             if df.empty:
@@ -862,14 +866,25 @@ class PredictionAccuracyTracker:
     
     def _format_time_axis(self, ax, days_back=30):
         """Helper function to format x-axis for time series plots"""
+        # Pin the visible range to exactly days_back so DayLocator never tries to
+        # generate one tick per day across the full DB history (which would exceed
+        # matplotlib's MAXTICKS limit and produce a warning).
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=days_back)
+        ax.set_xlim(mdates.date2num(start_dt), mdates.date2num(end_dt))
+
         # Format dates without year and without leading zeros
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%-m/%d'))
-        
-        # Always label each day for major ticks
-        ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
-        
-        # Add minor ticks every 6 hours (4 ticks between each day: 6am, 12pm, 6pm, 12am)
-        ax.xaxis.set_minor_locator(mdates.HourLocator(byhour=[6, 12, 18]))
+
+        # Pick a day interval that keeps major ticks ≤ ~20 labels
+        day_interval = max(1, days_back // 20)
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=day_interval))
+
+        # Minor ticks: hourly subdivisions scaled to the interval
+        if day_interval == 1:
+            ax.xaxis.set_minor_locator(mdates.HourLocator(byhour=[6, 12, 18]))
+        else:
+            ax.xaxis.set_minor_locator(mdates.DayLocator(interval=1))
         
         # Rotate labels at 45 degrees and align right
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
@@ -969,18 +984,30 @@ class PredictionAccuracyTracker:
                 # Plot directional accuracy for each horizon
                 plotted_any_direction = False
                 
+                horizon_colors = {'15m': '#1f77b4', '1h': '#ff7f0e', '4h': '#2ca02c'}
                 for horizon in ['15m', '1h', '4h']:
                     horizon_data = direction_data[direction_data['prediction_horizon'] == horizon]
                     if not horizon_data.empty:
-                        # Calculate rolling accuracy (window of 5 predictions)
                         horizon_data = horizon_data.sort_values('timestamp')
-                        rolling_accuracy = horizon_data['direction_correct'].rolling(window=min(5, len(horizon_data)), 
-                                                                                   min_periods=1).mean()
-                        
-                        plt.plot(horizon_data['timestamp'], rolling_accuracy, 
-                               label=f'{horizon.upper()} Accuracy (rolling)', 
-                               alpha=0.8, linewidth=2)
-                        
+                        color = horizon_colors[horizon]
+
+                        # Individual prediction markers at y=1 (correct) or y=0 (wrong)
+                        correct = horizon_data[horizon_data['direction_correct'] == 1]
+                        wrong   = horizon_data[horizon_data['direction_correct'] == 0]
+                        if not correct.empty:
+                            plt.scatter(correct['timestamp'], [1.0] * len(correct),
+                                        marker='|', s=60, color=color, alpha=0.4, linewidths=1.5)
+                        if not wrong.empty:
+                            plt.scatter(wrong['timestamp'], [0.0] * len(wrong),
+                                        marker='|', s=60, color=color, alpha=0.4, linewidths=1.5)
+
+                        # Rolling accuracy line on top
+                        rolling_accuracy = horizon_data['direction_correct'].rolling(
+                            window=min(5, len(horizon_data)), min_periods=1).mean()
+                        plt.plot(horizon_data['timestamp'], rolling_accuracy,
+                                 label=f'{horizon.upper()} (rolling)', color=color,
+                                 alpha=0.9, linewidth=2)
+
                         plotted_any_direction = True
                 
                 if plotted_any_direction:
@@ -1043,13 +1070,15 @@ class PredictionAccuracyTracker:
                          transform=plt.gca().transAxes)
                 plt.title(f'{crypto.upper()} - Accuracy by Horizon (Not Available Yet)')
 
-            # subplot 4: confidence distribution
+            # subplot 4: confidence vs correctness scatter
             plt.subplot(2, 2, 4)
             try:
                 conn_conf = sqlite3.connect(config.DATABASE_PATH)
                 conf_query = '''
-                    SELECT prediction_horizon, confidence FROM prediction_evaluations
+                    SELECT prediction_horizon, confidence, direction_correct
+                    FROM prediction_evaluations
                     WHERE crypto = ? AND evaluation_timestamp >= ?
+                    AND direction_correct IS NOT NULL
                 '''
                 conf_df = pd.read_sql_query(conf_query, conn_conf, params=[
                     crypto, (datetime.now() - timedelta(days=days_back)).isoformat()
@@ -1057,22 +1086,28 @@ class PredictionAccuracyTracker:
                 conn_conf.close()
                 if not conf_df.empty:
                     for horizon, color in [('15m', '#1f77b4'), ('1h', '#ff7f0e'), ('4h', '#2ca02c')]:
-                        hd = conf_df[conf_df['prediction_horizon'] == horizon]['confidence']
+                        hd = conf_df[conf_df['prediction_horizon'] == horizon]
                         if not hd.empty:
-                            plt.hist(hd, bins=20, alpha=0.5, label=horizon.upper(), color=color)
-                    plt.axvline(0.5, color='gray', linestyle='--', alpha=0.5)
+                            jitter = (np.random.default_rng(seed=42).random(len(hd)) - 0.5) * 0.08
+                            plt.scatter(hd['confidence'], hd['direction_correct'] + jitter,
+                                        alpha=0.4, s=20, color=color, label=horizon.upper())
+                    plt.axvline(0.5, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+                    plt.axhline(0.5, color='gray', linestyle='--', alpha=0.3, linewidth=1)
                     plt.xlabel('Model Confidence')
-                    plt.ylabel('Frequency')
-                    plt.title(f'{crypto.upper()} - Confidence Distribution')
+                    plt.ylabel('Correct (1) / Wrong (0)')
+                    plt.yticks([0, 1], ['Wrong', 'Correct'])
+                    plt.xlim(0.5, 1.0)
+                    plt.ylim(-0.25, 1.25)
+                    plt.title(f'{crypto.upper()} - Confidence vs Correctness')
                     plt.legend()
                 else:
-                    plt.text(0.5, 0.5, 'No confidence data yet', ha='center', va='center',
+                    plt.text(0.5, 0.5, 'No data yet', ha='center', va='center',
                              transform=plt.gca().transAxes)
-                    plt.title(f'{crypto.upper()} - Confidence Distribution (Not Available Yet)')
+                    plt.title(f'{crypto.upper()} - Confidence vs Correctness (Not Available Yet)')
             except Exception:
-                plt.text(0.5, 0.5, 'Confidence data unavailable', ha='center', va='center',
+                plt.text(0.5, 0.5, 'Data unavailable', ha='center', va='center',
                          transform=plt.gca().transAxes)
-                plt.title(f'{crypto.upper()} - Confidence Distribution')
+                plt.title(f'{crypto.upper()} - Confidence vs Correctness')
 
             plt.tight_layout()
             

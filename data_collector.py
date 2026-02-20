@@ -1,10 +1,9 @@
 """
 Data collection module for crypto price prediction bot
-Collects data from free APIs: CoinGecko, Yahoo Finance, Alpha Vantage, FRED
+Fetches OHLCV + taker volume data from Binance.US public REST API.
 """
 import requests
 import pandas as pd
-import yfinance as yf
 import time
 import sqlite3
 from datetime import datetime, timedelta
@@ -17,9 +16,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class DataCollector:
+    # Cache TTLs in seconds — matched to each source's update frequency.
+    # These are fetched once per TTL window; prediction cycles reuse the cache.
+    _CACHE_TTL = {
+        'fear_greed':    86400,  # daily — refreshes at midnight
+        'funding_rate':  28800,  # 8-hour settlements
+        'open_interest':  3600,  # hourly snapshots
+    }
+
     def __init__(self):
         self.session = requests.Session()
         self.last_api_call = {}
+        self._cache: dict = {}   # key → {'data': DataFrame, 'fetched_at': float}
         
     def _rate_limit(self, api_name: str, calls_per_minute: int):
         """Simple rate limiting to respect free API limits"""
@@ -33,10 +41,22 @@ class DataCollector:
                 time.sleep(sleep_time)
         self.last_api_call[api_name] = current_time
 
-    # Binance.US public REST endpoints — no API key required
-    # (api.binance.com returns HTTP 451 for US IPs; binance.us is the US-accessible endpoint)
-    _BINANCE_BASE    = 'https://api.binance.us/api/v3'
-    _BINANCE_SYMBOLS = {'bitcoin': 'BTCUSDT', 'ethereum': 'ETHUSDT'}
+    # Binance spot REST endpoints (OHLCV).
+    # Primary:  api.binance.us  — US exchange, works from US IPs (no VPN)
+    # Fallback: api.binance.com — global exchange, works from non-US IPs (VPN on)
+    _BINANCE_BASE        = 'https://api.binance.us/api/v3'
+    _BINANCE_BASE_GLOBAL = 'https://api.binance.com/api/v3'
+    _BINANCE_SYMBOLS     = {'bitcoin': 'BTCUSDT', 'ethereum': 'ETHUSDT'}
+
+    # Binance global futures REST endpoints — geo-blocked in the US without a VPN.
+    # Used as the primary source for funding rate + open interest (2400 req/min,
+    # no pagination issues).  Falls back to OKX automatically if unavailable.
+    _BINANCE_FUTURES_BASE = 'https://fapi.binance.com'
+
+    # OKX public REST endpoints — fallback when Binance futures is unavailable
+    _OKX_BASE     = 'https://www.okx.com/api/v5'
+    _OKX_INST_IDS = {'bitcoin': 'BTC-USD-SWAP', 'ethereum': 'ETH-USD-SWAP'}
+    _OKX_CCY      = {'bitcoin': 'BTC', 'ethereum': 'ETH'}
 
     def get_crypto_data(self, crypto_id: str, days: int = 365) -> pd.DataFrame:
         """
@@ -65,37 +85,57 @@ class DataCollector:
         all_klines: list = []
         current_start = start_ms
 
+        # Try .us first (no VPN), fall back to .com (VPN on, non-US exit)
+        base_urls = [self._BINANCE_BASE, self._BINANCE_BASE_GLOBAL]
+        active_base = self._BINANCE_BASE  # will be updated on first successful call
+
         logger.info(f"Fetching {days}d of 15m bars for {crypto_id} from Binance…")
 
         while current_start < end_ms:
-            try:
-                resp = self.session.get(
-                    f"{self._BINANCE_BASE}/klines",
-                    params={
-                        'symbol':    symbol,
-                        'interval':  '15m',
-                        'startTime': current_start,
-                        'endTime':   end_ms,
-                        'limit':     1000,
-                    },
-                    timeout=10,
-                )
-                resp.raise_for_status()
-                klines = resp.json()
+            fetched = False
+            for base in base_urls:
+                try:
+                    resp = self.session.get(
+                        f"{base}/klines",
+                        params={
+                            'symbol':    symbol,
+                            'interval':  '15m',
+                            'startTime': current_start,
+                            'endTime':   end_ms,
+                            'limit':     1000,
+                        },
+                        timeout=10,
+                    )
+                    resp.raise_for_status()
+                    klines = resp.json()
 
-                if not klines:
+                    if base != active_base:
+                        logger.info(f"Switched OHLCV source to {base} for {crypto_id}")
+                        active_base = base
+                        # Once we know which base works, only use that for remaining pages
+                        base_urls = [base]
+
+                    if not klines:
+                        fetched = True   # empty = reached end, exit outer loop cleanly
+                        break
+
+                    all_klines.extend(klines)
+                    current_start = klines[-1][6] + 1
+
+                    if len(klines) < 1000:
+                        fetched = True   # last page
+                        break
+
+                    time.sleep(0.05)
+                    fetched = True
                     break
 
-                all_klines.extend(klines)
-                current_start = klines[-1][6] + 1   # advance past last bar's close_time
+                except Exception as e:
+                    if base == base_urls[-1]:
+                        logger.error(f"Binance fetch error for {crypto_id} ({base}): {e}")
+                    continue
 
-                if len(klines) < 1000:
-                    break   # reached present, no more pages
-
-                time.sleep(0.05)    # stay well under 1200 req/min limit
-
-            except Exception as e:
-                logger.error(f"Binance fetch error for {crypto_id}: {e}")
+            if not fetched:
                 break
 
         if not all_klines:
@@ -177,6 +217,314 @@ class DataCollector:
             logger.error(f"Binance price fetch failed for {crypto_id}: {e}")
             return None
 
+    def _cache_get(self, key: str, ttl_key: str) -> pd.DataFrame:
+        """Return cached DataFrame if still fresh, else empty DataFrame."""
+        entry = self._cache.get(key)
+        if entry and (time.time() - entry['fetched_at']) < self._CACHE_TTL[ttl_key]:
+            age_min = (time.time() - entry['fetched_at']) / 60
+            logger.info(f"Cache hit [{key}] — {age_min:.0f}m old, TTL {self._CACHE_TTL[ttl_key]//60}m")
+            return entry['data']
+        return pd.DataFrame()
+
+    def _cache_set(self, key: str, df: pd.DataFrame):
+        self._cache[key] = {'data': df, 'fetched_at': time.time()}
+
+    def _okx_get(self, url: str, params: dict, timeout: int = 10, max_retries: int = 4) -> dict:
+        """
+        GET an OKX endpoint with automatic retry and exponential backoff on HTTP 429.
+        Raises for any other non-2xx status.
+        """
+        for attempt in range(max_retries):
+            resp = self.session.get(url, params=params, timeout=timeout)
+            if resp.status_code == 429:
+                wait = 2.0 * (attempt + 1)   # 2s, 4s, 6s, 8s
+                logger.warning(
+                    f"OKX rate limit (429) — waiting {wait:.0f}s before retry "
+                    f"{attempt + 1}/{max_retries} [{url.split('/')[-1]}]"
+                )
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        # Final attempt after all waits
+        resp = self.session.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_funding_rate(self, crypto_id: str, days: int = 90) -> pd.DataFrame:
+        """
+        Fetch perpetual funding rate history from OKX (8-hour settlements).
+
+        Returns columns: datetime (tz-naive UTC), funding_rate (float).
+        Returns empty DataFrame on any failure.
+        """
+        if crypto_id not in self._BINANCE_SYMBOLS:
+            logger.error(f"Unknown crypto_id '{crypto_id}' for funding rate")
+            return pd.DataFrame()
+
+        cache_key = f'funding_rate_{crypto_id}_{days}'
+        cached = self._cache_get(cache_key, 'funding_rate')
+        if not cached.empty:
+            return cached
+
+        symbol   = self._BINANCE_SYMBOLS[crypto_id]
+        start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+        end_ms   = int(datetime.now().timestamp() * 1000)
+
+        # ── Primary: Binance futures (requires VPN from US) ──────────────────
+        df = self._get_funding_rate_binance(symbol, start_ms, end_ms)
+
+        # ── Fallback: OKX ────────────────────────────────────────────────────
+        if df.empty and crypto_id in self._OKX_INST_IDS:
+            df = self._get_funding_rate_okx(self._OKX_INST_IDS[crypto_id], start_ms)
+
+        if df.empty:
+            logger.warning(f"No funding rate data available for {crypto_id}")
+            return pd.DataFrame()
+
+        logger.info(f"Collected {len(df)} funding rate records for {crypto_id}")
+        self._cache_set(cache_key, df)
+        return df
+
+    def _get_funding_rate_binance(self, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+        """
+        Fetch funding rate history from Binance futures, paginating forward in 1000-record
+        chunks until end_ms is covered (needed for training windows > ~4 months).
+        """
+        all_rows: list = []
+        current_start = start_ms
+        try:
+            while True:
+                resp = self.session.get(
+                    f"{self._BINANCE_FUTURES_BASE}/fapi/v1/fundingRate",
+                    params={'symbol': symbol, 'startTime': current_start,
+                            'endTime': end_ms, 'limit': 1000},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                rows = resp.json()
+                if not rows:
+                    break
+                all_rows.extend(rows)
+                if len(rows) < 1000:
+                    break
+                current_start = int(rows[-1]['fundingTime']) + 1
+                time.sleep(0.05)
+        except Exception as e:
+            logger.warning(f"Binance futures funding rate unavailable for {symbol}: {e}")
+            return pd.DataFrame()
+        if not all_rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(all_rows)
+        df['datetime']     = pd.to_datetime(df['fundingTime'].astype(int), unit='ms')
+        df['funding_rate'] = pd.to_numeric(df['fundingRate'])
+        df = (df[['datetime', 'funding_rate']]
+              .drop_duplicates('datetime')
+              .sort_values('datetime')
+              .reset_index(drop=True))
+        logger.info(f"Binance futures funding rate: {len(df)} records for {symbol}")
+        return df
+
+    def _get_funding_rate_okx(self, inst_id: str, start_ms: int) -> pd.DataFrame:
+        """Fetch funding rate history from OKX (fallback, paginated)."""
+        all_rows: list = []
+        after: Optional[str] = None
+        logger.info(f"OKX fallback: fetching funding rate for {inst_id}…")
+        try:
+            while True:
+                params: dict = {'instId': inst_id, 'limit': 100}
+                if after is not None:
+                    params['after'] = after
+                result = self._okx_get(f"{self._OKX_BASE}/public/funding-rate-history", params=params)
+                if result.get('code') != '0' or not result.get('data'):
+                    break
+                data = result['data']
+                all_rows.extend(data)
+                oldest_ts = int(data[-1]['fundingTime'])
+                if oldest_ts < start_ms or len(data) < 100:
+                    break
+                after = str(oldest_ts)
+                time.sleep(0.12)
+        except Exception as e:
+            logger.error(f"OKX funding rate fallback error: {e}")
+            return pd.DataFrame()
+        if not all_rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(all_rows)
+        df['datetime']     = pd.to_datetime(df['fundingTime'].astype(int), unit='ms')
+        df['funding_rate'] = pd.to_numeric(df['fundingRate'])
+        df = df[df['datetime'] >= pd.to_datetime(start_ms, unit='ms')]
+        return (df[['datetime', 'funding_rate']]
+                .drop_duplicates('datetime')
+                .sort_values('datetime')
+                .reset_index(drop=True))
+
+    def get_open_interest(self, crypto_id: str, days: int = 90) -> pd.DataFrame:
+        """
+        Fetch hourly open interest from Binance futures (primary) or OKX (fallback).
+
+        Returns columns: datetime (tz-naive UTC), oi_usd (float), oi_volume_usd (float).
+        Returns empty DataFrame on any failure.
+        """
+        if crypto_id not in self._BINANCE_SYMBOLS:
+            logger.error(f"Unknown crypto_id '{crypto_id}' for open interest")
+            return pd.DataFrame()
+
+        cache_key = f'open_interest_{crypto_id}_{days}'
+        cached = self._cache_get(cache_key, 'open_interest')
+        if not cached.empty:
+            return cached
+
+        symbol   = self._BINANCE_SYMBOLS[crypto_id]
+        start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+        end_ms   = int(datetime.now().timestamp() * 1000)
+
+        # ── Primary: Binance futures ──────────────────────────────────────────
+        df = self._get_open_interest_binance(symbol, start_ms, end_ms)
+
+        # ── Fallback: OKX ────────────────────────────────────────────────────
+        if df.empty and crypto_id in self._OKX_CCY:
+            df = self._get_open_interest_okx(self._OKX_CCY[crypto_id], start_ms)
+
+        if df.empty:
+            logger.warning(f"No open interest data available for {crypto_id}")
+            return pd.DataFrame()
+
+        logger.info(f"Collected {len(df)} open interest records for {crypto_id}")
+        self._cache_set(cache_key, df)
+        return df
+
+    def _get_open_interest_binance(self, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+        """
+        Fetch hourly OI history from Binance futures/data/openInterestHist.
+        Binance only retains the last 30 days — cap startTime accordingly.
+        Limit=500 per call; pages forward using startTime until end_ms is covered.
+        """
+        _30d_ms = int((datetime.now() - timedelta(days=29)).timestamp() * 1000)
+        current_start = max(start_ms, _30d_ms)   # Binance 400s on anything older
+        all_rows: list = []
+        try:
+            while True:
+                resp = self.session.get(
+                    f"{self._BINANCE_FUTURES_BASE}/futures/data/openInterestHist",
+                    params={
+                        'symbol':    symbol,
+                        'period':    '1h',
+                        'limit':     500,
+                        'startTime': current_start,
+                        'endTime':   end_ms,
+                    },
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                rows = resp.json()
+                if not rows:
+                    break
+                all_rows.extend(rows)
+                if len(rows) < 500:
+                    break
+                current_start = int(rows[-1]['timestamp']) + 1
+                time.sleep(0.05)
+        except Exception as e:
+            logger.warning(f"Binance futures open interest unavailable for {symbol}: {e}")
+            return pd.DataFrame()
+
+        if not all_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_rows)
+        df['datetime']     = pd.to_datetime(df['timestamp'].astype(int), unit='ms')
+        df['oi_usd']       = pd.to_numeric(df['sumOpenInterestValue'])
+        # Binance OI hist doesn't include volume — fill with 0 so downstream code works
+        df['oi_volume_usd'] = 0.0
+
+        df = (df[['datetime', 'oi_usd', 'oi_volume_usd']]
+              .drop_duplicates('datetime')
+              .sort_values('datetime')
+              .reset_index(drop=True))
+        logger.info(f"Binance futures open interest: {len(df)} records for {symbol}")
+        return df
+
+    def _get_open_interest_okx(self, ccy: str, start_ms: int) -> pd.DataFrame:
+        """Fetch open interest from OKX (fallback, paginated)."""
+        all_rows: list = []
+        after: Optional[str] = None
+        logger.info(f"OKX fallback: fetching open interest for {ccy}…")
+        try:
+            while True:
+                params: dict = {'ccy': ccy, 'period': '1H', 'limit': 100}
+                if after is not None:
+                    params['after'] = after
+                result = self._okx_get(
+                    f"{self._OKX_BASE}/rubik/stat/contracts/open-interest-volume",
+                    params=params,
+                )
+                if result.get('code') != '0' or not result.get('data'):
+                    break
+                data = result['data']
+                all_rows.extend(data)
+                oldest_ts = int(data[0][0])
+                if oldest_ts <= start_ms or len(data) < 100:
+                    break
+                after = str(oldest_ts)
+                time.sleep(0.5)
+        except Exception as e:
+            logger.error(f"OKX open interest fallback error: {e}")
+            return pd.DataFrame()
+        if not all_rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(all_rows, columns=['ts_ms', 'oi_usd', 'oi_volume_usd'])
+        df['datetime']      = pd.to_datetime(df['ts_ms'].astype(int), unit='ms')
+        df['oi_usd']        = pd.to_numeric(df['oi_usd'])
+        df['oi_volume_usd'] = pd.to_numeric(df['oi_volume_usd'])
+        df = df[df['datetime'] >= pd.to_datetime(start_ms, unit='ms')]
+        return (df[['datetime', 'oi_usd', 'oi_volume_usd']]
+                .drop_duplicates('datetime')
+                .sort_values('datetime')
+                .reset_index(drop=True))
+
+    def get_fear_greed(self, days: int = 90) -> pd.DataFrame:
+        """
+        Fetch the Fear & Greed Index from alternative.me (daily, single call).
+
+        Returns columns: datetime (tz-naive UTC, midnight), fear_greed_value (int).
+        Returns empty DataFrame on any failure.
+        """
+        cache_key = f'fear_greed_{days}'
+        cached = self._cache_get(cache_key, 'fear_greed')
+        if not cached.empty:
+            return cached
+
+        try:
+            resp = self.session.get(
+                f"https://api.alternative.me/fng/?limit={days}",
+                timeout=10,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+
+            if 'data' not in result or not result['data']:
+                logger.warning("No Fear & Greed data returned from alternative.me")
+                return pd.DataFrame()
+
+            df = pd.DataFrame(result['data'])
+            df['datetime']          = pd.to_datetime(df['timestamp'].astype(int), unit='s')
+            df['fear_greed_value']  = pd.to_numeric(df['value'])
+
+            df = (df[['datetime', 'fear_greed_value']]
+                  .drop_duplicates('datetime')
+                  .sort_values('datetime')
+                  .reset_index(drop=True))
+
+            logger.info(f"Collected {len(df)} Fear & Greed records")
+            self._cache_set(cache_key, df)
+            return df
+
+        except Exception as e:
+            logger.error(f"Fear & Greed fetch error: {e}")
+            return pd.DataFrame()
+
+
 def initialize_database():
     """Initialize SQLite database for storing collected data"""
     conn = sqlite3.connect(config.DATABASE_PATH)
@@ -252,17 +600,33 @@ if __name__ == "__main__":
     # Test data collection
     collector = DataCollector()
     
-    # Test crypto data collection
+    # Test crypto OHLCV data
     btc_data = collector.get_crypto_data('bitcoin', days=7)
     eth_data = collector.get_crypto_data('ethereum', days=7)
 
     # Test traditional market data
     market_data = collector.get_traditional_markets_data(days=7)
-    
+
     # Test economic indicators
     econ_data = collector.get_economic_indicators()
-    
-    print(f"BTC data shape: {btc_data.shape}")
-    print(f"ETH data shape: {eth_data.shape}")
-    print(f"Market data shape: {market_data.shape}")
-    print(f"Economic data shape: {econ_data.shape}") 
+
+    # Test OKX funding rate
+    btc_fr  = collector.get_funding_rate('bitcoin',  days=7)
+    eth_fr  = collector.get_funding_rate('ethereum', days=7)
+
+    # Test OKX open interest
+    btc_oi  = collector.get_open_interest('bitcoin',  days=7)
+    eth_oi  = collector.get_open_interest('ethereum', days=7)
+
+    # Test Fear & Greed
+    fng     = collector.get_fear_greed(days=7)
+
+    print(f"BTC data shape:         {btc_data.shape}")
+    print(f"ETH data shape:         {eth_data.shape}")
+    print(f"Market data shape:      {market_data.shape}")
+    print(f"Economic data shape:    {econ_data.shape}")
+    print(f"BTC funding rate shape: {btc_fr.shape}")
+    print(f"ETH funding rate shape: {eth_fr.shape}")
+    print(f"BTC open interest shape:{btc_oi.shape}")
+    print(f"ETH open interest shape:{eth_oi.shape}")
+    print(f"Fear & Greed shape:     {fng.shape}") 

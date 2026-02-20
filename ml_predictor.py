@@ -5,7 +5,7 @@ Uses XGBoost and ensemble methods for multi-horizon predictions
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split, TimeSeriesSplit, cross_val_score
-from sklearn.metrics import mean_squared_error, mean_absolute_error, accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import SelectKBest, f_classif
 import xgboost as xgb
@@ -39,10 +39,9 @@ class CryptoPredictionModel:
         
         # Separate features and target
         exclude_cols = [
-            'datetime', 'crypto', 'target_15m', 'target_1h', 'target_4h',
-            'target_return_15m', 'target_return_1h', 'target_return_4h',
+            'datetime', 'crypto',
             'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
-            'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h'
+            'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h',
         ]
         
         feature_cols = [col for col in clean_df.columns if col not in exclude_cols]
@@ -130,168 +129,168 @@ class CryptoPredictionModel:
         
         return pd.DataFrame(X_scaled, columns=X.columns, index=X.index)
     
-    def train_xgboost_regressor(self, X: pd.DataFrame, y: pd.Series) -> Dict:
-        """
-        Train XGBoost regression model
-        """
-        # Adjust cross-validation folds based on data size
-        n_samples = len(X)
-        max_folds = min(config.MODEL_SETTINGS['cross_validation_folds'], max(2, n_samples // 10))
-        
-        # Time series split for validation
-        tscv = TimeSeriesSplit(n_splits=max_folds)
-        
-        # XGBoost parameters
-        xgb_params = config.MODEL_SETTINGS['xgboost_params'].copy()
-        xgb_params['objective'] = 'reg:squarederror'
-        
-        model = xgb.XGBRegressor(**xgb_params)
-        
-        # Cross-validation with error handling
-        try:
-            cv_scores = cross_val_score(model, X, y, cv=tscv, scoring='neg_mean_squared_error')
-        except Exception as cv_error:
-            logger.warning(f"Cross-validation failed: {cv_error}. Skipping CV evaluation.")
-            cv_scores = np.array([0])  # Placeholder scores
-        
-        # Train final model on all data
-        model.fit(X, y)
-        
-        # Model evaluation
-        y_pred = model.predict(X)
-        mse = mean_squared_error(y, y_pred)
-        mae = mean_absolute_error(y, y_pred)
-        
-        model_key = f"{self.prediction_horizon}_xgb_regressor"
-        self.models[model_key] = model
-        
-        results = {
-            'model_type': 'xgb_regressor',
-            'cv_mse_mean': -cv_scores.mean(),
-            'cv_mse_std': cv_scores.std(),
-            'train_mse': mse,
-            'train_mae': mae,
-            'feature_importance': dict(zip(X.columns, model.feature_importances_))
-        }
-        
-        logger.info(f"XGBoost Regressor trained - MSE: {mse:.4f}, MAE: {mae:.4f}")
-        return results
-    
     def train_xgboost_classifier(self, X: pd.DataFrame, y: pd.Series) -> Dict:
         """
-        Train XGBoost classification model for direction prediction
+        Train a calibrated XGBoost classifier for direction prediction.
+
+        Three-step process:
+          1. Early stopping on a time-ordered holdout (last 15 % of data) to find
+             the optimal number of trees — prevents overfitting to training noise.
+          2. TimeSeriesSplit cross-validation on the base model for an unbiased
+             accuracy estimate that is reported in logs/metadata.
+          3. CalibratedClassifierCV (isotonic, TimeSeriesSplit) wraps the final
+             base model so that predict_proba() outputs genuine probabilities that
+             correlate with empirical accuracy rather than raw XGBoost scores.
         """
-        # Convert to binary classification (up/down)
+        from sklearn.calibration import CalibratedClassifierCV
+        from sklearn.dummy import DummyClassifier
+
+        # ── Convert target ───────────────────────────────────────────────────
         y_binary = (y > 0).astype(int)
-        
-        # Check for class balance
         unique_classes = y_binary.nunique()
         class_counts = y_binary.value_counts()
-        
+
+        # ── Dummy classifier for degenerate datasets ──────────────────────────
         if unique_classes < 2:
-            logger.warning(f"Insufficient class variation: only {unique_classes} unique classes. Classes: {class_counts.to_dict()}")
-            # Create a dummy classifier that always predicts the majority class
-            from sklearn.dummy import DummyClassifier
-            dummy_model = DummyClassifier(strategy='most_frequent')
-            dummy_model.fit(X, y_binary)
-            
-            model_key = f"{self.prediction_horizon}_xgb_classifier"
-            self.models[model_key] = dummy_model
-            
+            logger.warning(f"Only {unique_classes} class(es) in target — using dummy classifier")
+            dummy = DummyClassifier(strategy='most_frequent')
+            dummy.fit(X, y_binary)
+            self.models[f"{self.prediction_horizon}_xgb_classifier"] = dummy
+            baseline = float(max(class_counts)) / len(y_binary)
             return {
                 'model_type': 'dummy_classifier',
-                'cv_accuracy_mean': max(class_counts) / len(y_binary),
+                'cv_accuracy_mean': baseline,
                 'cv_accuracy_std': 0.0,
-                'train_accuracy': max(class_counts) / len(y_binary),
+                'train_accuracy': baseline,
+                'best_n_estimators': 0,
                 'feature_importance': {col: 0.0 for col in X.columns},
-                'note': 'Used dummy classifier due to insufficient class variation'
             }
-        
-        # Check if classes are severely imbalanced (less than 5% minority class)
-        min_class_pct = min(class_counts) / len(y_binary)
+
+        min_class_pct = float(min(class_counts)) / len(y_binary)
         if min_class_pct < 0.05:
-            logger.warning(f"Severe class imbalance: minority class = {min_class_pct:.2%}. Classes: {class_counts.to_dict()}")
-        
-        # Adjust cross-validation folds based on data size and class balance
+            logger.warning(f"Severe class imbalance: minority = {min_class_pct:.2%}")
+
         n_samples = len(X)
-        min_class_size = min(class_counts)
-        
-        # Ensure we don't have more folds than the smallest class can support
-        max_folds_by_size = min(config.MODEL_SETTINGS['cross_validation_folds'], max(2, n_samples // 10))
-        max_folds_by_class = max(2, min_class_size // 2)  # At least 2 samples per class per fold
-        max_folds = min(max_folds_by_size, max_folds_by_class)
-        
-        # XGBoost parameters with handling for imbalanced classes
+        min_class_size = int(min(class_counts))
+
+        # How many CV folds can the data support?
+        max_folds = min(
+            config.MODEL_SETTINGS['cross_validation_folds'],
+            max(2, n_samples // 10),
+            max(2, min_class_size // 2),
+        )
+
+        # ── Base XGBoost params ───────────────────────────────────────────────
         xgb_params = config.MODEL_SETTINGS['xgboost_params'].copy()
         xgb_params['objective'] = 'binary:logistic'
-        
-        # Add class balancing for imbalanced datasets
-        if min_class_pct < 0.2:  # If minority class is less than 20%
-            scale_pos_weight = max(class_counts) / min(class_counts)
-            xgb_params['scale_pos_weight'] = scale_pos_weight
-            logger.info(f"Added class balancing: scale_pos_weight = {scale_pos_weight:.2f}")
-        
-        model = xgb.XGBClassifier(**xgb_params)
-        
-        # Cross-validation with robust error handling
-        cv_scores = np.array([0.5])  # Default fallback
+        if min_class_pct < 0.2:
+            xgb_params['scale_pos_weight'] = float(max(class_counts)) / float(min(class_counts))
+            logger.info(f"Class balancing: scale_pos_weight={xgb_params['scale_pos_weight']:.2f}")
+
+        # ── Step 1: Early stopping to find optimal n_estimators ───────────────
+        early_stopping_rounds = config.MODEL_SETTINGS.get('early_stopping_rounds', 30)
+        best_n_estimators = xgb_params.get('n_estimators', 100)  # safe fallback
+
+        n_val = max(int(n_samples * 0.15), 50)
+        if n_samples - n_val >= 100:
+            try:
+                X_tr = X.iloc[:n_samples - n_val]
+                X_val = X.iloc[n_samples - n_val:]
+                y_tr = y_binary.iloc[:n_samples - n_val]
+                y_val = y_binary.iloc[n_samples - n_val:]
+
+                es_params = xgb_params.copy()
+                es_params['n_estimators'] = 1000  # high ceiling; early stopping prunes it
+                es_params['early_stopping_rounds'] = early_stopping_rounds  # XGBoost 2.x: constructor
+                es_model = xgb.XGBClassifier(**es_params)
+                es_model.fit(
+                    X_tr, y_tr,
+                    eval_set=[(X_val, y_val)],
+                    verbose=False,
+                )
+                best_n_estimators = max(10, es_model.best_iteration + 1)
+                logger.info(f"Early stopping: optimal n_estimators={best_n_estimators} "
+                            f"({self.crypto_name} {self.prediction_horizon})")
+            except Exception as es_err:
+                logger.warning(f"Early stopping failed ({es_err}), "
+                               f"using fallback n_estimators={best_n_estimators}")
+        else:
+            logger.info(f"Dataset too small for early stopping ({n_samples} rows), "
+                        f"using n_estimators={best_n_estimators}")
+
+        # Final params with early-stopping-selected tree count
+        final_params = xgb_params.copy()
+        final_params['n_estimators'] = best_n_estimators
+
+        # ── Step 2: TimeSeriesSplit CV on base model (accuracy reporting) ─────
+        cv_scores = np.array([0.5])
         try:
             if max_folds >= 2:
-                # Use stratified time series split when possible
                 tscv = TimeSeriesSplit(n_splits=max_folds)
-                cv_scores = cross_val_score(model, X, y_binary, cv=tscv, scoring='accuracy')
-            else:
-                logger.warning(f"Insufficient data for cross-validation: {n_samples} samples, {min_class_size} min class size")
-        except Exception as cv_error:
-            logger.warning(f"Cross-validation failed: {cv_error}. Using simple train-test evaluation.")
-            # Try a simple train-test split as fallback
-            try:
-                from sklearn.model_selection import train_test_split
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y_binary, test_size=0.2, random_state=42, stratify=y_binary
-                )
-                temp_model = xgb.XGBClassifier(**xgb_params)
-                temp_model.fit(X_train, y_train)
-                test_score = temp_model.score(X_test, y_test)
-                cv_scores = np.array([test_score])
-            except Exception as split_error:
-                logger.warning(f"Train-test split also failed: {split_error}. Using baseline accuracy.")
-                cv_scores = np.array([max(class_counts) / len(y_binary)])
-        
-        # Train final model on all data with error handling
+                cv_model = xgb.XGBClassifier(**final_params)
+                cv_scores = cross_val_score(cv_model, X, y_binary, cv=tscv, scoring='accuracy')
+                logger.info(f"CV accuracy: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+        except Exception as cv_err:
+            logger.warning(f"CV failed ({cv_err}), reporting 0.5 fallback")
+
+        # ── Step 3: Calibrated final model ───────────────────────────────────
+        cal_folds = max(2, min(config.MODEL_SETTINGS.get('calibration_folds', 3), max_folds))
+        model_type = 'dummy_classifier'
+        feature_importance: Dict = {}
+        accuracy = float(max(class_counts)) / len(y_binary)
+
         try:
+            base_model = xgb.XGBClassifier(**final_params)
+            tscv_cal = TimeSeriesSplit(n_splits=cal_folds)
+            model = CalibratedClassifierCV(base_model, cv=tscv_cal, method='isotonic')
             model.fit(X, y_binary)
-            
-            # Model evaluation
+
+            # Average feature importances across the calibrated sub-estimators
+            importances = [
+                cc.estimator.feature_importances_
+                for cc in model.calibrated_classifiers_
+                if hasattr(cc.estimator, 'feature_importances_')
+            ]
+            if importances:
+                feature_importance = dict(zip(X.columns, np.mean(importances, axis=0)))
+
             y_pred = model.predict(X)
-            y_pred_proba = model.predict_proba(X)[:, 1]
-            accuracy = accuracy_score(y_binary, y_pred)
-            feature_importance = dict(zip(X.columns, model.feature_importances_))
-            
-        except Exception as fit_error:
-            logger.error(f"Model fitting failed: {fit_error}. Using dummy classifier.")
-            from sklearn.dummy import DummyClassifier
-            model = DummyClassifier(strategy='most_frequent')
-            model.fit(X, y_binary)
-            
-            y_pred = model.predict(X)
-            accuracy = accuracy_score(y_binary, y_pred)
-            feature_importance = {col: 0.0 for col in X.columns}
-        
-        model_key = f"{self.prediction_horizon}_xgb_classifier"
-        self.models[model_key] = model
-        
+            accuracy = float(accuracy_score(y_binary, y_pred))
+            model_type = 'calibrated_xgb'
+
+        except Exception as cal_err:
+            logger.error(f"Calibrated model failed ({cal_err}), falling back to plain XGBoost")
+            try:
+                model = xgb.XGBClassifier(**final_params)
+                model.fit(X, y_binary)
+                y_pred = model.predict(X)
+                accuracy = float(accuracy_score(y_binary, y_pred))
+                feature_importance = dict(zip(X.columns, model.feature_importances_))
+                model_type = 'xgb_classifier'
+            except Exception as plain_err:
+                logger.error(f"Plain XGBoost also failed ({plain_err}), using dummy classifier")
+                model = DummyClassifier(strategy='most_frequent')
+                model.fit(X, y_binary)
+                y_pred = model.predict(X)
+                accuracy = float(accuracy_score(y_binary, y_pred))
+                feature_importance = {col: 0.0 for col in X.columns}
+
+        self.models[f"{self.prediction_horizon}_xgb_classifier"] = model
+
         results = {
-            'model_type': 'xgb_classifier' if hasattr(model, 'feature_importances_') else 'dummy_classifier',
-            'cv_accuracy_mean': cv_scores.mean(),
-            'cv_accuracy_std': cv_scores.std(),
+            'model_type': model_type,
+            'cv_accuracy_mean': float(cv_scores.mean()),
+            'cv_accuracy_std': float(cv_scores.std()),
             'train_accuracy': accuracy,
+            'best_n_estimators': best_n_estimators,
             'feature_importance': feature_importance,
             'class_distribution': class_counts.to_dict(),
-            'min_class_percentage': min_class_pct * 100
+            'min_class_percentage': min_class_pct * 100,
         }
-        
-        logger.info(f"XGBoost Classifier trained - Accuracy: {accuracy:.4f}, Model type: {results['model_type']}")
+
+        logger.info(f"{model_type} trained ({self.crypto_name} {self.prediction_horizon}) — "
+                    f"CV: {cv_scores.mean():.3f}, best_n_est: {best_n_estimators}, "
+                    f"train_acc: {accuracy:.3f}")
         return results
     
     def train(self, df: pd.DataFrame) -> Dict:
@@ -359,8 +358,7 @@ class CryptoPredictionModel:
             latest_data = df.iloc[[-1]].copy()
 
             exclude_cols = [
-                'datetime', 'crypto', 'target_15m', 'target_1h', 'target_4h',
-                'target_return_15m', 'target_return_1h', 'target_return_4h',
+                'datetime', 'crypto',
                 'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
                 'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h',
             ]
@@ -521,34 +519,27 @@ class EnsemblePredictionEngine:
                 self.models[model_key] = model
 
 if __name__ == "__main__":
-    # Test the prediction engine
     from data_collector import DataCollector
     from feature_engineering import FeatureEngineer
-    
-    # Collect and prepare data
+
     collector = DataCollector()
     fe = FeatureEngineer()
-    
+
     btc_data = collector.get_crypto_data('bitcoin', days=30)
-    market_data = collector.get_traditional_markets_data(days=30)
-    
-    # Feature engineering
-    btc_features = fe.prepare_features(btc_data, market_data)
-    
-    # Create and train model
+    btc_features = fe.prepare_features(btc_data)
+
     model = CryptoPredictionModel('bitcoin', '15m')
     training_results = model.train(btc_features)
-    
+
     print("Training Results:")
-    print(f"Regression MSE: {training_results['regression_results']['train_mse']:.6f}")
-    print(f"Classification Accuracy: {training_results['classification_results']['train_accuracy']:.4f}")
-    
-    # Make prediction
+    print(f"CV Accuracy: {training_results['classification_results']['cv_accuracy_mean']:.4f}")
+    print(f"Train Accuracy: {training_results['classification_results']['train_accuracy']:.4f}")
+
     prediction = model.predict(btc_features)
     if prediction:
+        direction = "UP" if prediction['predicted_direction'] == 1 else "DOWN"
         print(f"\nPrediction for {prediction['crypto']} ({prediction['horizon']}):")
-        print(f"Current Price: ${prediction['current_price']:.2f}")
-        print(f"Predicted Price: ${prediction['predicted_price']:.2f}")
-        print(f"Predicted Return: {prediction['predicted_return']:.2f}%")
-        print(f"Direction: {'UP' if prediction['predicted_direction'] else 'DOWN'}")
-        print(f"Confidence: {prediction['model_confidence']:.2f}") 
+        print(f"Current Price:  ${prediction['current_price']:.2f}")
+        print(f"Direction:      {direction}")
+        print(f"P(UP):          {prediction['direction_prob']:.3f}")
+        print(f"Confidence:     {prediction['model_confidence']:.3f}")
