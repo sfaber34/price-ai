@@ -15,7 +15,7 @@ DATABASE_PATH = "crypto_predictions.db"
 # Prediction Settings
 CRYPTOCURRENCIES = ['bitcoin', 'ethereum']
 PREDICTION_INTERVALS = ['15m', '1h', '4h']
-UPDATE_FREQUENCY_MINUTES = 5
+UPDATE_FREQUENCY_MINUTES = 15  # Match the bar size — running faster just duplicates predictions
 
 # Technical Indicators Settings
 # Windows are tuned for 15-minute bars (1 period = 15 minutes):
@@ -65,8 +65,8 @@ MODEL_SETTINGS = {
     'calibration_folds': 3,
     # Fixed production training window (days).  We deliberately do NOT select
     # this from backtest accuracy to avoid test-set selection bias.
-    'production_training_days': 365,
-    'retrain_frequency_hours': 24
+    'production_training_days': 180,
+    'retrain_frequency_hours': 6
 }
 
 # Rate Limiting (to respect free API limits)

@@ -1008,20 +1008,14 @@ class FeatureEngineer:
 
         df = self.create_target_variables(df)
         
-        # Clean data: replace infinity and extreme values
+        # Replace only true infinities — do NOT clip by standard deviation.
+        # 3-sigma clipping zeros out extreme RSI/momentum values that are exactly
+        # the informative signal we want the model to learn from.  It also creates
+        # a train/inference mismatch because the clipping stats (mean, std) are
+        # computed on different data windows at training time vs live prediction time.
+        # XGBoost handles outliers correctly via its split-based tree structure.
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], np.nan)
-
-        # Replace extreme values (beyond 3 standard deviations) with NaN
-        _target_cols_set = {
-            'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
-        }
-        for col in numeric_cols:
-            if col not in _target_cols_set:
-                mean_val = df[col].mean()
-                std_val = df[col].std()
-                if not pd.isna(std_val) and std_val > 0:
-                    df.loc[np.abs(df[col] - mean_val) > 3 * std_val, col] = np.nan
 
         # Store feature column names (excluding targets and metadata)
         exclude_cols = [
