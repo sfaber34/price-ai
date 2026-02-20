@@ -44,8 +44,8 @@ class CryptoPredictionModel:
             'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h',
         ]
         
-        feature_cols = [col for col in clean_df.columns if col not in exclude_cols]
-        
+        feature_cols = sorted(col for col in clean_df.columns if col not in exclude_cols)
+
         X = clean_df[feature_cols].fillna(0)  # Fill remaining NaN with 0
         y = clean_df[target_col]
         
@@ -363,7 +363,8 @@ class CryptoPredictionModel:
                 'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h',
             ]
 
-            X = latest_data[[c for c in latest_data.columns if c not in exclude_cols]].fillna(0)
+            feature_cols = sorted(c for c in latest_data.columns if c not in exclude_cols)
+            X = latest_data[feature_cols].fillna(0)
 
             selector = self.feature_selectors[f"{self.prediction_horizon}_selector"]
             X_selected = pd.DataFrame(

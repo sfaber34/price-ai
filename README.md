@@ -319,6 +319,9 @@ python train_optimal_models.py --runs 30
 
 # Extended data collection (default 180 days)
 python train_optimal_models.py --days 365
+
+# Use this:
+python3 train_optimal_models.py --skip-backtest
 ```
 
 #### Manual Bot Training

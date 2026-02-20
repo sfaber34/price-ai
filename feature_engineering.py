@@ -985,6 +985,134 @@ class FeatureEngineer:
 
         return df
 
+    def add_intrabar_features(self, df: pd.DataFrame, df_1m: pd.DataFrame = None) -> pd.DataFrame:
+        """
+        Add within-bar features derived from 1-minute bars.
+
+        Each 15m bar contains exactly 15 1m bars.  We aggregate those bars to
+        capture *how* price and order flow evolved inside the bar — information
+        that is completely invisible in a single OHLCV row.
+
+        Key signals:
+          - CVD acceleration: did buying pressure build toward the close or fade?
+          - Price momentum: did price drift up or down through the bar?
+          - High/low timing: did price peak early (exhaustion) or late (momentum)?
+          - Close position: where in the high-low range did the bar close?
+
+        Alignment is safe: each 1m bar is mapped to its parent 15m bar via
+        floor('15min') on open_time, then merged backward — no future leakage.
+        """
+        if df_1m is None or df_1m.empty:
+            return df
+
+        try:
+            df_1m = df_1m.copy()
+            df_1m['datetime'] = pd.to_datetime(df_1m['datetime'])
+            df_1m = df_1m.sort_values('datetime').reset_index(drop=True)
+
+            # --- Map each 1m bar to its parent 15m bar (open_time floor) ----------
+            # CRITICAL alignment: floor to 15min means the 1m bar at 10:14 belongs
+            # to the 15m bar that opened at 10:00 — never the one opening at 10:15.
+            df_1m['bar_15m'] = df_1m['datetime'].dt.floor('15min')
+            df_1m['rank_in_bar'] = df_1m.groupby('bar_15m').cumcount()        # 0=first
+            df_1m['rank_rev']    = df_1m.groupby('bar_15m').cumcount(ascending=False)  # 0=last
+
+            # Add CVD before subsetting so all views carry it
+            has_cvd = ('taker_buy_base_vol' in df_1m.columns and
+                       'taker_sell_base_vol' in df_1m.columns)
+            if has_cvd:
+                df_1m['bar_cvd'] = df_1m['taker_buy_base_vol'] - df_1m['taker_sell_base_vol']
+
+            n_per_bar = df_1m.groupby('bar_15m').size()
+            early = df_1m[df_1m['rank_in_bar'] < 5]   # first 5 1m bars
+            late  = df_1m[df_1m['rank_rev']    < 5]   # last  5 1m bars
+            last3 = df_1m[df_1m['rank_rev']    < 3]   # last  3 1m bars
+
+            feats = pd.DataFrame(index=n_per_bar.index)
+
+            # -- Price momentum (late avg price vs early avg price) ----------------
+            early_price = early.groupby('bar_15m')['price'].mean()
+            late_price  = late.groupby('bar_15m')['price'].mean()
+            feats['intrabar_price_momentum'] = (
+                (late_price - early_price) / (early_price.abs() + 1e-10)
+            )
+
+            # -- High / low timing ------------------------------------------------
+            if 'high' in df_1m.columns and 'low' in df_1m.columns:
+                hi_idx = df_1m.groupby('bar_15m')['high'].idxmax()
+                lo_idx = df_1m.groupby('bar_15m')['low'].idxmin()
+
+                high_ranks = df_1m.loc[hi_idx.values, 'rank_in_bar'].copy()
+                high_ranks.index = hi_idx.index
+                low_ranks  = df_1m.loc[lo_idx.values, 'rank_in_bar'].copy()
+                low_ranks.index  = lo_idx.index
+
+                # 0 = peaked/troughed at start, 1 = peaked/troughed at end
+                feats['intrabar_high_timing'] = high_ranks / n_per_bar.clip(lower=1)
+                feats['intrabar_low_timing']  = low_ranks  / n_per_bar.clip(lower=1)
+
+                bar_high  = df_1m.groupby('bar_15m')['high'].max()
+                bar_low   = df_1m.groupby('bar_15m')['low'].min()
+                bar_close = df_1m.groupby('bar_15m')['price'].last()
+                # 1.0 = closed at high, 0.0 = closed at low
+                feats['intrabar_close_position'] = (
+                    (bar_close - bar_low) / (bar_high - bar_low + 1e-10)
+                )
+
+            # -- Volume distribution (was volume front- or back-loaded?) -----------
+            if 'volume' in df_1m.columns:
+                total_vol = df_1m.groupby('bar_15m')['volume'].sum()
+                early_vol = early.groupby('bar_15m')['volume'].sum()
+                late_vol  = late.groupby('bar_15m')['volume'].sum()
+                # positive = volume grew toward close (interest building)
+                feats['intrabar_volume_trend'] = (late_vol - early_vol) / (total_vol + 1e-10)
+
+            # -- CVD features (strongest intrabar signal) -------------------------
+            if has_cvd:
+                total_cvd = df_1m.groupby('bar_15m')['bar_cvd'].sum()
+                early_cvd = early.groupby('bar_15m')['bar_cvd'].sum()
+                late_cvd  = late.groupby('bar_15m')['bar_cvd'].sum()
+
+                feats['intrabar_cvd_total']        = total_cvd
+                # positive = buying pressure built toward close (bullish momentum)
+                feats['intrabar_cvd_acceleration'] = late_cvd - early_cvd
+
+                if 'volume' in df_1m.columns:
+                    total_vol = df_1m.groupby('bar_15m')['volume'].sum()
+                    feats['intrabar_cvd_norm'] = total_cvd / (total_vol + 1e-10)
+
+                # Buy pressure in the very last 3 bars — most predictive of continuation
+                if 'volume' in df_1m.columns:
+                    last3_buy = last3.groupby('bar_15m')['taker_buy_base_vol'].sum()
+                    last3_vol = last3.groupby('bar_15m')['volume'].sum()
+                    feats['intrabar_buy_pressure_close'] = last3_buy / (last3_vol + 1e-10)
+
+            feats = feats.reset_index()  # bar_15m becomes a column
+
+            # -- Merge onto 15m df ------------------------------------------------
+            df = df.copy()
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df = df.sort_values('datetime').reset_index(drop=True)
+            feats = feats.sort_values('bar_15m')
+
+            # direction='backward': 15m bar at T matches intrabar features for T
+            # (its own completed 1m bars).  Never pulls in future bar's features.
+            df = pd.merge_asof(
+                df, feats,
+                left_on='datetime',
+                right_on='bar_15m',
+                direction='backward',
+            )
+            df = df.drop(columns=['bar_15m'], errors='ignore')
+
+            n_added = len([c for c in feats.columns if c != 'bar_15m'])
+            logger.info(f"Added {n_added} intrabar features from 1m data")
+
+        except Exception as e:
+            logger.error(f"Error adding intrabar features: {e}")
+
+        return df
+
     def prepare_features(self, crypto_df: pd.DataFrame, market_df: pd.DataFrame = None, external_data: dict = None) -> pd.DataFrame:
         """
         Main feature preparation pipeline
@@ -1005,6 +1133,7 @@ class FeatureEngineer:
         df = self.add_funding_rate_features(df, external_data.get('funding_rate'))
         df = self.add_open_interest_features(df, external_data.get('open_interest'))
         df = self.add_fear_greed_features(df, external_data.get('fear_greed'))
+        df = self.add_intrabar_features(df, external_data.get('intrabar_1m'))
 
         df = self.create_target_variables(df)
         
@@ -1173,6 +1302,11 @@ class FeatureEngineer:
                     'open_interest', 'oi_delta', 'oi_price_ratio', 'oi_trend', 'oi_volume_ratio',
                     'fear_greed_value', 'fear_greed_regime', 'fear_greed_change',
                     'fear_greed_distance_from_50',
+                    # Intrabar (1m) features — zero-fill only, no bfill
+                    'intrabar_price_momentum', 'intrabar_high_timing', 'intrabar_low_timing',
+                    'intrabar_close_position', 'intrabar_volume_trend',
+                    'intrabar_cvd_total', 'intrabar_cvd_acceleration', 'intrabar_cvd_norm',
+                    'intrabar_buy_pressure_close',
                 }
                 _exclude_fill = {
                     'datetime',

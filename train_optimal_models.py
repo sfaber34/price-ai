@@ -597,7 +597,8 @@ class CryptoBacktester:
         print("\n" + "="*80)
 
 def train_production_models(backtester: CryptoBacktester, analysis: Dict,
-                            prepared_data: Dict[str, pd.DataFrame]) -> Dict:
+                            prepared_data: Dict[str, pd.DataFrame],
+                            intrabar_1m_data: Dict[str, pd.DataFrame] = None) -> Dict:
     """
     Train final production models on a fixed training window and save them.
 
@@ -636,6 +637,13 @@ def train_production_models(backtester: CryptoBacktester, analysis: Dict,
         # Use the most recent `production_window_days` of data
         n_bars = int(production_window_days * 24 * 4)
         recent_data = data.tail(n_bars).copy()
+
+        # Add intrabar (1m) features to the production training slice
+        if intrabar_1m_data and crypto in intrabar_1m_data:
+            recent_data = backtester.feature_engineer.add_intrabar_features(
+                recent_data, intrabar_1m_data[crypto]
+            )
+
         print(f"\n  {crypto.upper()}: {len(recent_data)} training samples "
               f"({production_window_days} days × 96 bars/day)")
 
@@ -686,7 +694,7 @@ def main():
     """
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Crypto Price Prediction Backtester')
-    parser.add_argument('--runs', type=int, default=30, 
+    parser.add_argument('--runs', type=int, default=30,
                        help='Number of runs per training window (default: 30)')
     parser.add_argument('--days', type=int, default=730,
                        help='Days of history for the backtest experiment (default: 730). '
@@ -694,9 +702,49 @@ def main():
                             'production_training_days (config, default 365) of this data.')
     parser.add_argument('--quick', action='store_true',
                        help='Quick test mode (3 runs per window)')
-    
+    parser.add_argument('--skip-backtest', action='store_true',
+                       help='Skip the window-size experiment and go straight to production '
+                            'model training. Much faster (~2 min vs ~30 min).')
+
     args = parser.parse_args()
-    
+
+    production_window_days = config.MODEL_SETTINGS.get('production_training_days', 180)
+    backtester = CryptoBacktester()
+
+    # ------------------------------------------------------------------ #
+    # Fast path: skip the backtest experiment entirely                     #
+    # ------------------------------------------------------------------ #
+    if args.skip_backtest:
+        print("🚀 Crypto Model Trainer  (backtest skipped)")
+        print("="*50)
+        print(f"Fetching {production_window_days}d of data for production training…")
+
+        raw_data = backtester.collect_backtest_data(days=production_window_days + 5)
+        prepared_data = backtester.prepare_features_for_backtest(raw_data)
+        analysis = {}  # no backtest analysis — only used for display/save
+
+        print(f"\n📡 Fetching 1m intrabar data ({production_window_days}d)…")
+        intrabar_1m_data = {}
+        for crypto in config.CRYPTOCURRENCIES:
+            try:
+                df_1m = backtester.data_collector.get_crypto_data_1m(
+                    crypto, days=production_window_days + 2
+                )
+                if not df_1m.empty:
+                    intrabar_1m_data[crypto] = df_1m
+                    print(f"  {crypto}: {len(df_1m)} 1m bars")
+            except Exception as e:
+                print(f"  {crypto}: 1m fetch failed ({e}) — intrabar features skipped")
+
+        print("\n🔥 TRAINING PRODUCTION MODELS...")
+        train_production_models(backtester, analysis, prepared_data, intrabar_1m_data)
+        print("\n✅ Production model training complete!")
+        print("🤖 Production models saved to models/ directory")
+        return
+
+    # ------------------------------------------------------------------ #
+    # Full path: window-size experiment + production training              #
+    # ------------------------------------------------------------------ #
     # Set runs based on mode
     if args.quick:
         runs_per_window = 1
@@ -704,18 +752,16 @@ def main():
     else:
         runs_per_window = args.runs
         print("🚀 Crypto Price Prediction Backtester")
-    
+
     print("="*50)
     print("Training Window Size Experiment")
     print("="*50)
-    
-    backtester = CryptoBacktester()
-    
+
     # Run training optimization
     print("🧪 Running training window optimization...")
     print(f"Testing 6 different training window sizes with {runs_per_window} runs each")
     print("⚠️  Includes error handling for insufficient data and training failures\n")
-    
+
     experiment_results = backtester.run_training_optimization(
         days=args.days,
         runs_per_window=runs_per_window
@@ -746,10 +792,27 @@ def main():
 
         json.dump(json_analysis, f, indent=2)
 
+    # Fetch 1m intrabar data for production training window only
+    # (not needed for the backtest experiment — avoids fetching 730d of 1m bars)
+    print(f"\n📡 Fetching 1m intrabar data for production training ({production_window_days}d)…")
+    intrabar_1m_data = {}
+    for crypto in config.CRYPTOCURRENCIES:
+        try:
+            df_1m = backtester.data_collector.get_crypto_data_1m(
+                crypto, days=production_window_days + 2
+            )
+            if not df_1m.empty:
+                intrabar_1m_data[crypto] = df_1m
+                print(f"  {crypto}: {len(df_1m)} 1m bars")
+        except Exception as e:
+            print(f"  {crypto}: 1m fetch failed ({e}) — intrabar features skipped")
+
     # Train production models on fixed window using already-prepared data
     print("\n🔥 TRAINING PRODUCTION MODELS...")
-    optimal_models = train_production_models(backtester, analysis, prepared_data)
-    
+    optimal_models = train_production_models(
+        backtester, analysis, prepared_data, intrabar_1m_data
+    )
+
     logger.info("Optimal training results saved to optimal_training_results.json")
     print("\n✅ Optimal model training complete!")
     print("📊 Results saved to optimal_training_results.json")

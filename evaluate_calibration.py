@@ -91,8 +91,15 @@ def main():
             print("  No data available.")
             continue
 
+        print("  Fetching 1m intrabar data…", end='', flush=True)
+        df_1m = collector.get_crypto_data_1m(crypto, days=total_days)
+        if df_1m.empty:
+            print(" not available (intrabar features skipped)")
+        else:
+            print(f" {len(df_1m)} bars")
+
         print("  Preparing features…", end='', flush=True)
-        df = fe.prepare_features(raw)
+        df = fe.prepare_features(raw, external_data={'intrabar_1m': df_1m if not df_1m.empty else None})
         df = df.sort_values('datetime').reset_index(drop=True)
         print(f" {len(df)} bars")
 

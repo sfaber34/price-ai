@@ -15,7 +15,7 @@ DATABASE_PATH = "crypto_predictions.db"
 # Prediction Settings
 CRYPTOCURRENCIES = ['bitcoin', 'ethereum']
 PREDICTION_INTERVALS = ['15m', '1h', '4h']
-UPDATE_FREQUENCY_MINUTES = 15  # Match the bar size — running faster just duplicates predictions
+UPDATE_FREQUENCY_MINUTES = 15  # Match the 15m bar size — running faster just duplicates predictions
 
 # Technical Indicators Settings
 # Windows are tuned for 15-minute bars (1 period = 15 minutes):

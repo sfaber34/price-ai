@@ -52,7 +52,7 @@ class CryptoPredictionBot:
         
         data = {}
         
-        # Collect crypto data
+        # Collect crypto data (15m bars for features + 1m bars for intrabar features)
         for crypto in config.CRYPTOCURRENCIES:
             try:
                 crypto_data = self.data_collector.get_crypto_data(crypto, days=days)
@@ -63,6 +63,16 @@ class CryptoPredictionBot:
                     logger.warning(f"No data collected for {crypto}")
             except Exception as e:
                 logger.error(f"Failed to collect data for {crypto}: {e}")
+
+            try:
+                # Only need ~2 hours of 1m bars for intrabar features (current bar context).
+                # Intrabar features are per-bar aggregations, not rolled across bars.
+                data_1m = self.data_collector.get_crypto_data_1m(crypto, days=1)
+                if not data_1m.empty:
+                    data[f'{crypto}_1m'] = data_1m
+                    logger.info(f"Collected {len(data_1m)} 1m bars for {crypto}")
+            except Exception as e:
+                logger.warning(f"1m data fetch failed for {crypto}: {e}")
         
         # Collect traditional market data
         try:
@@ -134,6 +144,7 @@ class CryptoPredictionBot:
                 'funding_rate':  raw_data.get(f'{crypto}_funding_rate', pd.DataFrame()),
                 'open_interest': raw_data.get(f'{crypto}_open_interest', pd.DataFrame()),
                 'fear_greed':    fng_df,
+                'intrabar_1m':   raw_data.get(f'{crypto}_1m', pd.DataFrame()),
             }
             for crypto in config.CRYPTOCURRENCIES
         }
@@ -758,28 +769,28 @@ class CryptoPredictionBot:
         self.train_models()
         
         # Don't wait for boundaries - start checking immediately
-        logger.info(f"Starting immediately at {datetime.now().strftime('%H:%M:%S')} - will catch next 5-minute boundary")
-        
+        freq = config.UPDATE_FREQUENCY_MINUTES
+        logger.info(f"Starting immediately at {datetime.now().strftime('%H:%M:%S')} - will catch next {freq}-minute boundary")
+
         # Set up variables for tracking other scheduled tasks
         last_price_update = datetime.now()
         last_model_training = datetime.now()
-        last_prediction_run = datetime.now() - timedelta(minutes=10)  # Initialize to 10 min ago
-        
-        logger.info(f"Bot started - Predictions every 5 minutes at clock boundaries (XX:00, XX:05, XX:10, etc.)")
-        logger.info("Checking system clock every second for 5-minute boundaries...")
-        
+        last_prediction_run = datetime.now() - timedelta(minutes=freq * 2)  # Initialize to 2 intervals ago
+
+        logger.info(f"Bot started - Predictions every {freq} minutes at clock boundaries")
+        logger.info("Checking system clock every second for boundaries...")
+
         try:
             while True:
                 now = datetime.now()
                 current_minute = now.minute
-                current_second = now.second
-                
-                # Check if we're at a 5-minute boundary (XX:00, XX:05, XX:10, etc.)
-                is_five_minute_boundary = (current_minute % 5 == 0)
-                
-                # Only run if we're at boundary AND haven't run in the last 2.5 minutes (prevent double-runs)
+
+                # Check if we're at the configured boundary (e.g. XX:00, XX:15, XX:30, XX:45 for 15m)
+                is_boundary = (current_minute % freq == 0)
+
+                # Only run if we're at boundary AND haven't run in the last half-interval (prevent double-runs)
                 time_since_last_prediction = (now - last_prediction_run).total_seconds()
-                should_run_prediction = is_five_minute_boundary and time_since_last_prediction > 150
+                should_run_prediction = is_boundary and time_since_last_prediction > (freq * 60 / 2)
                 
                 if should_run_prediction:
                     logger.info(f"🎯 BOUNDARY HIT! Running scheduled prediction at {now.strftime('%H:%M:%S')}")
