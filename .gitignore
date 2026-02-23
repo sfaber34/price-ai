@@ -9,11 +9,6 @@ crypto_predictions.db
 *.log
 crypto_bot.log
 
-# Trained models (can be regenerated)
-models/
-*.joblib
-*.pkl
-
 # Training results (can be regenerated)
 optimal_training_results.json
 backtest_results.json
