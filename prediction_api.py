@@ -66,16 +66,19 @@ def _format_prediction(row: dict) -> dict:
     prob_up    = float(row["predicted_price"])  # P(UP), stored as predicted_price
     confidence = float(row["confidence"])
 
+    predicted_at = datetime.fromisoformat(row["predicted_at"])  # naive local time from DB
+    prediction_age_ms = int((datetime.now() - predicted_at).total_seconds() * 1000)
+
     return {
-        "crypto":        row["crypto"],
-        "horizon":       row["prediction_horizon"],
-        "direction":     "UP" if prob_up >= 0.5 else "DOWN",
-        "direction_prob": round(prob_up, 4),
-        "confidence":    round(confidence, 4),   # distance from 0.5, e.g. 0.23 = 73% or 27% confident
-        "current_price": round(float(row["current_price"]), 2),
-        "predicted_at":  row["predicted_at"],
-        "target_time":   row["target_time"],
-        "as_of":         datetime.now(timezone.utc).isoformat(),
+        "crypto":           row["crypto"],
+        "horizon":          row["prediction_horizon"],
+        "direction":        "UP" if prob_up >= 0.5 else "DOWN",
+        "confidence":       round(confidence, 4),
+        "current_price":    round(float(row["current_price"]), 2),
+        "predicted_at":     row["predicted_at"],
+        "target_time":      row["target_time"],
+        "prediction_age_ms": prediction_age_ms,
+        "as_of":            datetime.now(timezone.utc).isoformat(),
     }
 
 

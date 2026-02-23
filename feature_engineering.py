@@ -1132,7 +1132,6 @@ class FeatureEngineer:
         external_data = external_data or {}
         df = self.add_funding_rate_features(df, external_data.get('funding_rate'))
         df = self.add_open_interest_features(df, external_data.get('open_interest'))
-        df = self.add_fear_greed_features(df, external_data.get('fear_greed'))
         df = self.add_intrabar_features(df, external_data.get('intrabar_1m'))
 
         df = self.create_target_variables(df)
@@ -1300,8 +1299,6 @@ class FeatureEngineer:
                     'funding_rate', 'funding_rate_rolling_8h', 'funding_rate_std_24h',
                     'funding_rate_cumulative', 'funding_rate_change',
                     'open_interest', 'oi_delta', 'oi_price_ratio', 'oi_trend', 'oi_volume_ratio',
-                    'fear_greed_value', 'fear_greed_regime', 'fear_greed_change',
-                    'fear_greed_distance_from_50',
                     # Intrabar (1m) features — zero-fill only, no bfill
                     'intrabar_price_momentum', 'intrabar_high_timing', 'intrabar_low_timing',
                     'intrabar_close_position', 'intrabar_volume_trend',

@@ -19,7 +19,6 @@ class DataCollector:
     # Cache TTLs in seconds — matched to each source's update frequency.
     # These are fetched once per TTL window; prediction cycles reuse the cache.
     _CACHE_TTL = {
-        'fear_greed':    86400,  # daily — refreshes at midnight
         'funding_rate':  28800,  # 8-hour settlements
         'open_interest':  3600,  # hourly snapshots
     }

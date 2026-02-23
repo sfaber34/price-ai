@@ -52,7 +52,7 @@ class CryptoBacktester:
 
         # External data — parallel fetch with hard timeout (same pattern as bot)
         _EXT_TIMEOUT = 60  # longer timeout for backtest (not time-critical)
-        ext_tasks = {'fear_greed': (self.data_collector.get_fear_greed, (days,))}
+        ext_tasks = {}
         for crypto in config.CRYPTOCURRENCIES:
             ext_tasks[f'{crypto}_funding_rate']  = (self.data_collector.get_funding_rate,  (crypto, days))
             ext_tasks[f'{crypto}_open_interest'] = (self.data_collector.get_open_interest, (crypto, days))
@@ -91,13 +91,11 @@ class CryptoBacktester:
             logger.warning("No crypto data available for backtest feature preparation")
             return {}
         
-        # Build per-crypto external data dict (funding rate, OI, Fear & Greed)
-        fng_df = raw_data.get('fear_greed', pd.DataFrame())
+        # Build per-crypto external data dict (funding rate, OI)
         external_data_by_crypto = {
             crypto: {
                 'funding_rate':  raw_data.get(f'{crypto}_funding_rate', pd.DataFrame()),
                 'open_interest': raw_data.get(f'{crypto}_open_interest', pd.DataFrame()),
-                'fear_greed':    fng_df,
             }
             for crypto in config.CRYPTOCURRENCIES
         }

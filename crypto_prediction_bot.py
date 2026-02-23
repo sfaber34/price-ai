@@ -94,11 +94,11 @@ class CryptoPredictionBot:
             logger.error(f"Failed to collect economic indicators: {e}")
             data['economic_indicators'] = pd.DataFrame()
 
-        # External data (Fear & Greed, funding rate, open interest) — fetched in parallel
+        # External data (funding rate, open interest) — fetched in parallel
         # with a hard wall-clock timeout so a slow/hung OKX request can never block
         # prediction cycles.  Cached results return immediately on subsequent calls.
         _EXT_TIMEOUT = 45  # seconds per source before giving up
-        ext_tasks = {'fear_greed': (self.data_collector.get_fear_greed, (days,))}
+        ext_tasks = {}
         for crypto in config.CRYPTOCURRENCIES:
             ext_tasks[f'{crypto}_funding_rate']  = (self.data_collector.get_funding_rate,  (crypto, days))
             ext_tasks[f'{crypto}_open_interest'] = (self.data_collector.get_open_interest, (crypto, days))
@@ -137,13 +137,11 @@ class CryptoPredictionBot:
             logger.warning("No crypto data available for feature preparation")
             return {}
         
-        # Build per-crypto external data dict (funding rate, OI, Fear & Greed)
-        fng_df = raw_data.get('fear_greed', pd.DataFrame())
+        # Build per-crypto external data dict (funding rate, OI)
         external_data_by_crypto = {
             crypto: {
                 'funding_rate':  raw_data.get(f'{crypto}_funding_rate', pd.DataFrame()),
                 'open_interest': raw_data.get(f'{crypto}_open_interest', pd.DataFrame()),
-                'fear_greed':    fng_df,
                 'intrabar_1m':   raw_data.get(f'{crypto}_1m', pd.DataFrame()),
             }
             for crypto in config.CRYPTOCURRENCIES
