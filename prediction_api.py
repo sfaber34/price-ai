@@ -61,24 +61,13 @@ def _get_latest_prediction(crypto: str, horizon: str) -> dict | None:
         return None
 
 
-def _format_prediction(row: dict) -> dict:
-    """Convert a raw DB row into clean API output."""
-    prob_up    = float(row["predicted_price"])  # P(UP), stored as predicted_price
-    confidence = float(row["confidence"])
-
-    predicted_at = datetime.fromisoformat(row["predicted_at"])  # naive local time from DB
-    prediction_age_ms = int((datetime.now() - predicted_at).total_seconds() * 1000)
-
+def _format_market(row: dict) -> dict:
+    """Extract per-market fields from a prediction row."""
+    prob_up = float(row["predicted_price"])
     return {
-        "crypto":           row["crypto"],
-        "horizon":          row["prediction_horizon"],
-        "direction":        "UP" if prob_up >= 0.5 else "DOWN",
-        "confidence":       round(confidence, 4),
-        "current_price":    round(float(row["current_price"]), 2),
-        "predicted_at":     row["predicted_at"],
-        "target_time":      row["target_time"],
-        "prediction_age_ms": prediction_age_ms,
-        "as_of":            datetime.now(timezone.utc).isoformat(),
+        "direction":     "UP" if prob_up >= 0.5 else "DOWN",
+        "confidence":    round(float(row["confidence"]), 4),
+        "current_price": round(float(row["current_price"]), 2),
     }
 
 
@@ -92,12 +81,32 @@ def predictions():
     if provided != API_KEY:
         return jsonify({"error": "unauthorized"}), 401
 
-    # --- fetch ---
-    row = _get_latest_prediction("bitcoin", "15m")
-    if row is None:
+    # --- fetch both markets ---
+    btc_row = _get_latest_prediction("bitcoin", "15m")
+    eth_row = _get_latest_prediction("ethereum", "15m")
+
+    if btc_row is None and eth_row is None:
         return jsonify({"error": "no predictions available yet — is the bot running?"}), 404
 
-    return jsonify(_format_prediction(row))
+    # Use whichever row exists for the shared timestamp fields
+    ref = btc_row or eth_row
+    predicted_at = datetime.fromisoformat(ref["predicted_at"])
+    prediction_age_ms = int((datetime.now() - predicted_at).total_seconds() * 1000)
+
+    result = {
+        "predicted_at":      ref["predicted_at"],
+        "target_time":       ref["target_time"],
+        "prediction_age_ms": prediction_age_ms,
+        "as_of":             datetime.now(timezone.utc).isoformat(),
+        "markets": {},
+    }
+
+    if btc_row:
+        result["markets"]["bitcoin_15m"] = _format_market(btc_row)
+    if eth_row:
+        result["markets"]["ethereum_15m"] = _format_market(eth_row)
+
+    return jsonify(result)
 
 
 @app.route("/health")
