@@ -14,6 +14,7 @@ External access:
 Set PREDICTION_API_KEY in .env before exposing externally.
 Port-forward the port below on your TP-Link router to this machine.
 """
+import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -107,6 +108,69 @@ def predictions():
         result["markets"]["ethereum_15m"] = _format_market(eth_row)
 
     return jsonify(result)
+
+
+_CONFIDENCE_BUCKETS = [
+    (50, 55), (55, 60), (60, 65), (65, 70),
+    (70, 75), (75, 80), (80, 85), (85, 90), (90, 95), (95, 100),
+]
+
+
+def _get_confidence_buckets(crypto: str, horizon: str) -> list[dict]:
+    """Query prediction_evaluations and bucket by confidence percentage."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT confidence, direction_correct
+            FROM prediction_evaluations
+            WHERE crypto = ? AND prediction_horizon = ?
+              AND direction_correct IS NOT NULL
+            """,
+            (crypto, horizon),
+        ).fetchall()
+        con.close()
+    except Exception as e:
+        app.logger.error(f"DB error in performance: {e}")
+        rows = []
+
+    # Bin each evaluation into a confidence bucket (confidence is 0-1 in DB)
+    buckets = {(lo, hi): {"hits": 0, "total": 0} for lo, hi in _CONFIDENCE_BUCKETS}
+    for r in rows:
+        pct = float(r["confidence"]) * 100  # convert 0-1 → 0-100
+        for lo, hi in _CONFIDENCE_BUCKETS:
+            if lo <= pct < hi or (hi == 100 and pct == 100):
+                buckets[(lo, hi)]["total"] += 1
+                buckets[(lo, hi)]["hits"] += int(r["direction_correct"])
+                break
+
+    result = {}
+    for lo, hi in _CONFIDENCE_BUCKETS:
+        b = buckets[(lo, hi)]
+        n = b["total"]
+        hit_rate = round(b["hits"] / n, 4) if n > 0 else None
+        result[f"{lo}-{hi}"] = {"n": n, "hit_rate": hit_rate}
+    return result
+
+
+@app.route("/performance")
+def performance():
+    # --- auth ---
+    if not API_KEY:
+        return jsonify({"error": "API key not configured on server"}), 500
+
+    provided = request.args.get("key", "")
+    if provided != API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+
+    return jsonify({
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "markets": {
+            "bitcoin_15m":  _get_confidence_buckets("bitcoin", "15m"),
+            "ethereum_15m": _get_confidence_buckets("ethereum", "15m"),
+        },
+    })
 
 
 @app.route("/health")
