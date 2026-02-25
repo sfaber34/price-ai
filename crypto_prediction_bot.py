@@ -73,6 +73,14 @@ class CryptoPredictionBot:
                     logger.info(f"Collected {len(data_1m)} 1m bars for {crypto}")
             except Exception as e:
                 logger.warning(f"1m data fetch failed for {crypto}: {e}")
+
+            try:
+                data_5m = self.data_collector.get_crypto_data_5m(crypto, days=1)
+                if not data_5m.empty:
+                    data[f'{crypto}_5m'] = data_5m
+                    logger.info(f"Collected {len(data_5m)} 5m bars for {crypto}")
+            except Exception as e:
+                logger.warning(f"5m data fetch failed for {crypto}: {e}")
         
         # Collect traditional market data
         try:
@@ -143,6 +151,7 @@ class CryptoPredictionBot:
                 'funding_rate':  raw_data.get(f'{crypto}_funding_rate', pd.DataFrame()),
                 'open_interest': raw_data.get(f'{crypto}_open_interest', pd.DataFrame()),
                 'intrabar_1m':   raw_data.get(f'{crypto}_1m', pd.DataFrame()),
+                'intrabar_5m':   raw_data.get(f'{crypto}_5m', pd.DataFrame()),
             }
             for crypto in config.CRYPTOCURRENCIES
         }
@@ -407,12 +416,11 @@ class CryptoPredictionBot:
         """
         try:
             conn = sqlite3.connect(config.DATABASE_PATH)
-            
+
             for model_key, prediction in predictions.items():
                 # Convert timestamps to strings - now using target timestamp (when prediction is FOR)
                 target_timestamp_str = str(prediction['timestamp'])
-                feature_timestamp_str = str(prediction.get('feature_timestamp', prediction['timestamp']))
-                
+
                 # Insert prediction into database with corrected timestamp logic
                 # predicted_price column repurposed: stores raw P(UP) in [0, 1].
                 # Direction = 1 (UP) when value > 0.5, DOWN otherwise.
@@ -463,7 +471,7 @@ class CryptoPredictionBot:
             except Exception:
                 live_price = preds[0]['current_price']
 
-            preds.sort(key=lambda x: {'15m': 1, '1h': 2, '4h': 3}.get(x['horizon'], 99))
+            preds.sort(key=lambda x: {'15m': 1}.get(x['horizon'], 99))
 
             for pred in preds:
                 is_up   = bool(pred['predicted_direction'])
@@ -551,7 +559,7 @@ class CryptoPredictionBot:
                 print(f"{'Time':>4} | {'Predicted':>9} | {'P(UP)':>5} | {'Actual':>6} | {'Correct':>7} | {'Conf':>5} | Evals")
                 print("-" * 70)
 
-                for horizon in ['15m', '1h', '4h']:
+                for horizon in config.PREDICTION_INTERVALS:
                     hd = crypto_data[crypto_data['prediction_horizon'] == horizon]
                     if hd.empty:
                         continue
@@ -682,14 +690,6 @@ class CryptoPredictionBot:
                     # Compare 15m predictions made 5+ minutes ago
                     min_age = timedelta(minutes=5)
                     max_age = timedelta(hours=1)  # Up to 1 hour old
-                elif horizon == '1h':
-                    # Compare 1h predictions made 50+ minutes ago
-                    min_age = timedelta(minutes=50)
-                    max_age = timedelta(hours=4)  # Up to 4 hours old
-                elif horizon == '4h':
-                    # Compare 4h predictions made 3.5+ hours ago
-                    min_age = timedelta(hours=3, minutes=30)
-                    max_age = timedelta(hours=24)  # Up to 24 hours old
                 else:
                     continue
                 
@@ -840,7 +840,7 @@ def main():
     print("🚀 Crypto Price Prediction Bot")
     print("="*50)
     print("Free ML-powered Bitcoin & Ethereum price predictions")
-    print("Horizons: 15 minutes, 1 hour, 4 hours")
+    print("Horizon: 15 minutes")
     print("="*50)
     
     bot = CryptoPredictionBot()

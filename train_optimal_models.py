@@ -50,6 +50,16 @@ class CryptoBacktester:
             except Exception as e:
                 logger.error(f"Failed to collect data for {crypto}: {e}")
 
+        # Fetch 5m bars for intrabar features (1 day is enough for live, use more for training)
+        for crypto in config.CRYPTOCURRENCIES:
+            try:
+                data_5m = self.data_collector.get_crypto_data_5m(crypto, days=days)
+                if not data_5m.empty:
+                    data[f'{crypto}_5m'] = data_5m
+                    logger.info(f"Collected {len(data_5m)} 5m bars for {crypto}")
+            except Exception as e:
+                logger.warning(f"5m data fetch failed for {crypto}: {e}")
+
         # External data — parallel fetch with hard timeout (same pattern as bot)
         _EXT_TIMEOUT = 60  # longer timeout for backtest (not time-critical)
         ext_tasks = {}
@@ -91,11 +101,12 @@ class CryptoBacktester:
             logger.warning("No crypto data available for backtest feature preparation")
             return {}
         
-        # Build per-crypto external data dict (funding rate, OI)
+        # Build per-crypto external data dict (funding rate, OI, 5m bars)
         external_data_by_crypto = {
             crypto: {
                 'funding_rate':  raw_data.get(f'{crypto}_funding_rate', pd.DataFrame()),
                 'open_interest': raw_data.get(f'{crypto}_open_interest', pd.DataFrame()),
+                'intrabar_5m':   raw_data.get(f'{crypto}_5m', pd.DataFrame()),
             }
             for crypto in config.CRYPTOCURRENCIES
         }
@@ -210,15 +221,9 @@ class CryptoBacktester:
             
             # Find future prices for evaluation (15-minute intervals: 4 per hour)
             future_prices = {}
+            _horizon_offsets = {'15m': 1, '1h': 4, '4h': 16}
             for horizon in config.PREDICTION_INTERVALS:
-                if horizon == '15m':
-                    future_idx = test_start + 1         # 1 × 15m interval
-                elif horizon == '1h':
-                    future_idx = test_start + 4         # 4 × 15m intervals
-                elif horizon == '4h':
-                    future_idx = test_start + 16        # 16 × 15m intervals
-                else:
-                    continue
+                future_idx = test_start + _horizon_offsets.get(horizon, 1)
                 
                 if future_idx < len(data):
                     future_prices[horizon] = data.iloc[future_idx]['price']
@@ -642,6 +647,9 @@ def train_production_models(backtester: CryptoBacktester, analysis: Dict,
                 recent_data, intrabar_1m_data[crypto]
             )
 
+        # Note: 5m intrabar features are already in prepared_data from the pipeline
+        # (prepare_features → add_intrabar_5m_features), unlike 1m which is added here.
+
         print(f"\n  {crypto.upper()}: {len(recent_data)} training samples "
               f"({production_window_days} days × 96 bars/day)")
 
@@ -734,6 +742,9 @@ def main():
             except Exception as e:
                 print(f"  {crypto}: 1m fetch failed ({e}) — intrabar features skipped")
 
+        # Note: 5m bars are already fetched in collect_backtest_data and flow
+        # through prepare_features_for_backtest → prepare_features pipeline.
+
         print("\n🔥 TRAINING PRODUCTION MODELS...")
         train_production_models(backtester, analysis, prepared_data, intrabar_1m_data)
         print("\n✅ Production model training complete!")
@@ -790,7 +801,7 @@ def main():
 
         json.dump(json_analysis, f, indent=2)
 
-    # Fetch 1m intrabar data for production training window only
+    # Fetch 1m and 5m intrabar data for production training window only
     # (not needed for the backtest experiment — avoids fetching 730d of 1m bars)
     print(f"\n📡 Fetching 1m intrabar data for production training ({production_window_days}d)…")
     intrabar_1m_data = {}
@@ -804,6 +815,9 @@ def main():
                 print(f"  {crypto}: {len(df_1m)} 1m bars")
         except Exception as e:
             print(f"  {crypto}: 1m fetch failed ({e}) — intrabar features skipped")
+
+    # Note: 5m bars are already fetched in collect_backtest_data and flow
+    # through prepare_features_for_backtest → prepare_features pipeline.
 
     # Train production models on fixed window using already-prepared data
     print("\n🔥 TRAINING PRODUCTION MODELS...")

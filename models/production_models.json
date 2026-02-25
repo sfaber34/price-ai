@@ -6,26 +6,8 @@
       "training_days": 180,
       "training_samples": 17280,
       "model_type": "calibrated_xgb",
-      "cv_accuracy": 0.6415422021535255,
+      "cv_accuracy": 0.6350816255644322,
       "best_n_estimators": 10
-    },
-    "1h": {
-      "model_path": "models/bitcoin_1h_production.pkl",
-      "training_window": "180_days_fixed",
-      "training_days": 180,
-      "training_samples": 17280,
-      "model_type": "calibrated_xgb",
-      "cv_accuracy": 0.5711010767627649,
-      "best_n_estimators": 10
-    },
-    "4h": {
-      "model_path": "models/bitcoin_4h_production.pkl",
-      "training_window": "180_days_fixed",
-      "training_days": 180,
-      "training_samples": 17280,
-      "model_type": "calibrated_xgb",
-      "cv_accuracy": 0.5302050747306222,
-      "best_n_estimators": 24
     }
   },
   "ethereum": {
@@ -35,26 +17,8 @@
       "training_days": 180,
       "training_samples": 17280,
       "model_type": "calibrated_xgb",
-      "cv_accuracy": 0.5776311219173325,
-      "best_n_estimators": 23
-    },
-    "1h": {
-      "model_path": "models/ethereum_1h_production.pkl",
-      "training_window": "180_days_fixed",
-      "training_days": 180,
-      "training_samples": 17280,
-      "model_type": "calibrated_xgb",
-      "cv_accuracy": 0.5448419590135464,
-      "best_n_estimators": 10
-    },
-    "4h": {
-      "model_path": "models/ethereum_4h_production.pkl",
-      "training_window": "180_days_fixed",
-      "training_days": 180,
-      "training_samples": 17280,
-      "model_type": "calibrated_xgb",
-      "cv_accuracy": 0.5296489398679181,
-      "best_n_estimators": 10
+      "cv_accuracy": 0.5687391455366446,
+      "best_n_estimators": 16
     }
   }
 }

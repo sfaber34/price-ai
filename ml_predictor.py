@@ -40,8 +40,8 @@ class CryptoPredictionModel:
         # Separate features and target
         exclude_cols = [
             'datetime', 'crypto',
-            'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
-            'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h',
+            'target_direction_15m',
+            'target_datetime_15m',
         ]
         
         feature_cols = sorted(col for col in clean_df.columns if col not in exclude_cols)
@@ -304,8 +304,6 @@ class CryptoPredictionModel:
 
         clf_target_map = {
             '15m': 'target_direction_15m',
-            '1h':  'target_direction_1h',
-            '4h':  'target_direction_4h',
         }
 
         if self.prediction_horizon not in clf_target_map:
@@ -359,8 +357,8 @@ class CryptoPredictionModel:
 
             exclude_cols = [
                 'datetime', 'crypto',
-                'target_direction_15m', 'target_direction_1h', 'target_direction_4h',
-                'target_datetime_15m', 'target_datetime_1h', 'target_datetime_4h',
+                'target_direction_15m',
+                'target_datetime_15m',
             ]
 
             feature_cols = sorted(c for c in latest_data.columns if c not in exclude_cols)
@@ -390,7 +388,9 @@ class CryptoPredictionModel:
             if isinstance(feature_datetime, str):
                 feature_datetime = pd.to_datetime(feature_datetime)
 
-            offsets = {'15m': pd.Timedelta(minutes=15), '1h': pd.Timedelta(hours=1), '4h': pd.Timedelta(hours=4)}
+            # datetime = bar open_time; the 15m prediction targets the NEXT bar's
+            # close, which is 2 bar-widths from open_time (open + 15m + 15m).
+            offsets = {'15m': pd.Timedelta(minutes=30)}
             target_datetime = feature_datetime + offsets.get(self.prediction_horizon, pd.Timedelta(0))
 
             return {

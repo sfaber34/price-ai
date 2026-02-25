@@ -14,7 +14,7 @@ DATABASE_PATH = "crypto_predictions.db"
 
 # Prediction Settings
 CRYPTOCURRENCIES = ['bitcoin', 'ethereum']
-PREDICTION_INTERVALS = ['15m', '1h', '4h']
+PREDICTION_INTERVALS = ['15m']
 UPDATE_FREQUENCY_MINUTES = 15  # Match the 15m bar size — running faster just duplicates predictions
 
 # Technical Indicators Settings
@@ -42,13 +42,13 @@ FRED_SERIES = {}
 MODEL_SETTINGS = {
     'train_test_split': 0.8,
     'cross_validation_folds': 5,
-    'feature_selection_k': 50,
+    'feature_selection_k': 30,
     'xgboost_params': {
         # These are the fallback values used if early stopping fails.
         # Early stopping will search up to 1000 trees and prune back;
         # the value here only matters in edge cases (tiny datasets, API errors).
         'n_estimators': 100,
-        'max_depth': 4,          # shallower than before — reduces overfitting on financial noise
+        'max_depth': 3,          # shallow trees generalise better on noisy financial data
         'learning_rate': 0.05,   # slower learning compensated by more trees via early stopping
         'subsample': 0.8,        # row subsampling per tree
         'colsample_bytree': 0.7, # feature subsampling per tree
@@ -61,8 +61,8 @@ MODEL_SETTINGS = {
     # used as the time-ordered validation split (no shuffling).
     'early_stopping_rounds': 30,
     # Isotonic calibration folds (TimeSeriesSplit).  Must be ≥ 2.
-    # Higher = better calibration but slower training.
-    'calibration_folds': 3,
+    # 5 folds (up from 3) reduces isotonic overfitting while preserving output diversity.
+    'calibration_folds': 5,
     # Fixed production training window (days).  We deliberately do NOT select
     # this from backtest accuracy to avoid test-set selection bias.
     'production_training_days': 180,

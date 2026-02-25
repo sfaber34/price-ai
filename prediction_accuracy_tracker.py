@@ -290,16 +290,6 @@ class PredictionAccuracyTracker:
                     'window_size': timedelta(minutes=2),  # ±2 minutes for accurate 15m evaluation
                     'description': '15 minutes ago'
                 },
-                '1h': {
-                    'lookback_time': now - timedelta(hours=1),
-                    'window_size': timedelta(minutes=3),  # ±3 minutes for accurate 1-hour evaluation
-                    'description': '1 hour ago'
-                },
-                '4h': {
-                    'lookback_time': now - timedelta(hours=4),
-                    'window_size': timedelta(minutes=15),  # ±15 minutes for accurate 4-hour evaluation
-                    'description': '4 hours ago'
-                }
             }
             
             for horizon, window_config in evaluation_windows.items():
@@ -516,11 +506,10 @@ class PredictionAccuracyTracker:
                 # First time storing data for this crypto
                 time_running = timedelta(0)
             
-            # Only store prediction values for horizons where enough time has passed
-            # This prevents showing meaningless prediction traces
-            pred_15m = predictions.get('15m') if predictions else None  # Always allow 15m predictions
-            pred_1h = predictions.get('1h') if predictions else None    # Always allow 1h predictions
-            pred_4h = predictions.get('4h') if predictions and time_running >= timedelta(hours=4) else None
+            # Only store 15m predictions (1h/4h removed)
+            pred_15m = predictions.get('15m') if predictions else None
+            pred_1h = None
+            pred_4h = None
             
             # Direction accuracy is tracked via prediction_evaluations (batch_evaluate_mature_predictions).
             # predicted_price_Xm columns store direction_prob (0–1), not prices, so price-error
@@ -697,7 +686,7 @@ class PredictionAccuracyTracker:
             
             # Rename columns to match expected format
             rename_map = {}
-            for horizon in ['15m', '1h', '4h']:
+            for horizon in config.PREDICTION_INTERVALS:
                 if f'predicted_price_{horizon}' in df_pivoted.columns:
                     rename_map[f'predicted_price_{horizon}'] = f'predicted_price_{horizon}'
                 if f'absolute_error_{horizon}' in df_pivoted.columns:
@@ -958,7 +947,7 @@ class PredictionAccuracyTracker:
             plt.subplot(2, 2, 1)
             horizon_colors = {'15m': '#1f77b4', '1h': '#ff7f0e', '4h': '#2ca02c'}
             plotted_prob = False
-            for horizon_key, col in [('15m', 'predicted_price_15m'), ('1h', 'predicted_price_1h'), ('4h', 'predicted_price_4h')]:
+            for horizon_key, col in [(h, f'predicted_price_{h}') for h in config.PREDICTION_INTERVALS]:
                 if col in df.columns:
                     prob_data = df[col].dropna()
                     if not prob_data.empty:
@@ -985,7 +974,7 @@ class PredictionAccuracyTracker:
                 plotted_any_direction = False
                 
                 horizon_colors = {'15m': '#1f77b4', '1h': '#ff7f0e', '4h': '#2ca02c'}
-                for horizon in ['15m', '1h', '4h']:
+                for horizon in config.PREDICTION_INTERVALS:
                     horizon_data = direction_data[direction_data['prediction_horizon'] == horizon]
                     if not horizon_data.empty:
                         horizon_data = horizon_data.sort_values('timestamp')
@@ -1044,7 +1033,7 @@ class PredictionAccuracyTracker:
             plt.subplot(2, 2, 3)
             if not direction_data.empty:
                 bar_horizons, bar_accs, bar_counts = [], [], []
-                for horizon in ['15m', '1h', '4h']:
+                for horizon in config.PREDICTION_INTERVALS:
                     hd = direction_data[direction_data['prediction_horizon'] == horizon]
                     if not hd.empty:
                         bar_horizons.append(horizon.upper())
@@ -1085,7 +1074,8 @@ class PredictionAccuracyTracker:
                 ])
                 conn_conf.close()
                 if not conf_df.empty:
-                    for horizon, color in [('15m', '#1f77b4'), ('1h', '#ff7f0e'), ('4h', '#2ca02c')]:
+                    _horizon_colors = {'15m': '#1f77b4', '1h': '#ff7f0e', '4h': '#2ca02c'}
+                    for horizon, color in [(h, _horizon_colors.get(h, '#1f77b4')) for h in config.PREDICTION_INTERVALS]:
                         hd = conf_df[conf_df['prediction_horizon'] == horizon]
                         if not hd.empty:
                             jitter = (np.random.default_rng(seed=42).random(len(hd)) - 0.5) * 0.08
@@ -1143,7 +1133,7 @@ class PredictionAccuracyTracker:
                 logger.warning("No evaluation data available for calibration chart")
                 return
 
-            horizons = [h for h in ['15m', '1h', '4h'] if h in df['prediction_horizon'].unique()]
+            horizons = [h for h in config.PREDICTION_INTERVALS if h in df['prediction_horizon'].unique()]
             n_horizons = len(horizons)
             if n_horizons == 0:
                 return

@@ -286,6 +286,111 @@ class DataCollector:
         )
         return df
 
+    def get_crypto_data_5m(self, crypto_id: str, days: int = 1) -> pd.DataFrame:
+        """
+        Fetch 5-minute OHLCV bars from Binance for intrabar feature engineering.
+
+        Each 15m bar contains exactly 3 five-minute sub-bars.  Used to compute
+        within-bar direction, momentum, and CVD acceleration features that give
+        the 15m model more short-term signal.
+
+        For live inference (1 day): ~1 API call, near-instant.
+        """
+        if crypto_id not in self._BINANCE_SYMBOLS:
+            return pd.DataFrame()
+
+        symbol   = self._BINANCE_SYMBOLS[crypto_id]
+        end_ms   = int(datetime.now().timestamp() * 1000)
+        start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+
+        all_klines: list = []
+        current_start = start_ms
+        base_urls = [self._BINANCE_BASE, self._BINANCE_BASE_GLOBAL]
+        active_base = self._BINANCE_BASE
+
+        logger.info(f"Fetching {days}d of 5m bars for {crypto_id} from Binance…")
+
+        while current_start < end_ms:
+            fetched = False
+            for base in base_urls:
+                try:
+                    resp = self.session.get(
+                        f"{base}/klines",
+                        params={
+                            'symbol':    symbol,
+                            'interval':  '5m',
+                            'startTime': current_start,
+                            'endTime':   end_ms,
+                            'limit':     1000,
+                        },
+                        timeout=10,
+                    )
+                    resp.raise_for_status()
+                    klines = resp.json()
+
+                    if base != active_base:
+                        active_base = base
+                        base_urls = [base]
+
+                    if not klines:
+                        fetched = True
+                        break
+
+                    all_klines.extend(klines)
+                    current_start = klines[-1][6] + 1
+
+                    if len(klines) < 1000:
+                        fetched = True
+                        break
+
+                    time.sleep(0.05)
+                    fetched = True
+                    break
+
+                except Exception as e:
+                    if base == base_urls[-1]:
+                        logger.error(f"Binance 5m fetch error for {crypto_id}: {e}")
+                    continue
+
+            if not fetched:
+                break
+
+        if not all_klines:
+            logger.warning(f"No 5m data returned for {crypto_id}")
+            return pd.DataFrame()
+
+        kline_cols = [
+            'open_time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_volume', 'num_trades',
+            'taker_buy_base_vol', 'taker_buy_quote_vol', '_ignore',
+        ]
+        df = pd.DataFrame(all_klines, columns=kline_cols)
+        df['datetime'] = pd.to_datetime(df['open_time'], unit='ms')
+        for col in ['open', 'high', 'low', 'close', 'volume',
+                    'quote_volume', 'taker_buy_base_vol']:
+            df[col] = pd.to_numeric(df[col])
+        df['num_trades'] = pd.to_numeric(df['num_trades'])
+        df['taker_sell_base_vol'] = df['volume'] - df['taker_buy_base_vol']
+        df = df.rename(columns={'close': 'price'})
+        df['crypto'] = crypto_id
+
+        keep = [
+            'datetime', 'crypto',
+            'open', 'high', 'low', 'price',
+            'volume', 'num_trades',
+            'taker_buy_base_vol', 'taker_sell_base_vol',
+        ]
+        df = (df[keep]
+              .drop_duplicates('datetime')
+              .sort_values('datetime')
+              .reset_index(drop=True))
+
+        logger.info(
+            f"Collected {len(df)} 5m bars for {crypto_id} "
+            f"({df['datetime'].min().date()} → {df['datetime'].max().date()})"
+        )
+        return df
+
     def get_traditional_markets_data(self, days: int = 30) -> pd.DataFrame:
         """
         Disabled: traditional market data (stocks, bonds, forex) comes at 1h resolution
