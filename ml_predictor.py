@@ -12,7 +12,7 @@ import xgboost as xgb
 import joblib
 import logging
 from typing import Dict, List, Tuple, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import config
 
 logger = logging.getLogger(__name__)
@@ -328,7 +328,7 @@ class CryptoPredictionModel:
         classification_results = self.train_xgboost_classifier(X_scaled, y_clf)
 
         training_info = {
-            'timestamp': datetime.now(),
+            'timestamp': datetime.now(timezone.utc).replace(tzinfo=None),
             'crypto': self.crypto_name,
             'horizon': self.prediction_horizon,
             'training_samples': len(X),

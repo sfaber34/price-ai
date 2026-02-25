@@ -11,7 +11,7 @@ Use this after retraining models with bug fixes to start fresh with accurate eva
 import sqlite3
 import config
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -120,7 +120,7 @@ def confirm_clear():
 
 if __name__ == "__main__":
     print(f"Database path: {config.DATABASE_PATH}")
-    print(f"Timestamp: {datetime.now()}")
+    print(f"Timestamp: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
     print()
     
     if confirm_clear():

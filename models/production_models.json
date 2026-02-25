@@ -6,7 +6,7 @@
       "training_days": 180,
       "training_samples": 17280,
       "model_type": "calibrated_xgb",
-      "cv_accuracy": 0.6350816255644322,
+      "cv_accuracy": 0.6353594998263287,
       "best_n_estimators": 10
     }
   },
@@ -17,8 +17,8 @@
       "training_days": 180,
       "training_samples": 17280,
       "model_type": "calibrated_xgb",
-      "cv_accuracy": 0.5687391455366446,
-      "best_n_estimators": 16
+      "cv_accuracy": 0.5664466828759986,
+      "best_n_estimators": 15
     }
   }
 }

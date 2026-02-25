@@ -7,7 +7,7 @@ import argparse
 import os
 import sys
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 def create_plots_directory(base_dir="plots"):
     """Create plots directory with timestamp subdirectory"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     plot_dir = os.path.join(base_dir, timestamp)
     os.makedirs(plot_dir, exist_ok=True)
     return plot_dir
@@ -105,7 +105,7 @@ def generate_all_plots(crypto=None, days_back=30, save_dir=None):
         summary_path = os.path.join(save_dir, "README.txt")
         with open(summary_path, 'w') as f:
             f.write(f"Prediction Accuracy Plots\n")
-            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
             f.write(f"Period: Last {days_back} days\n")
             f.write(f"Cryptos: {', '.join(cryptos)}\n\n")
             f.write(f"Files:\n")

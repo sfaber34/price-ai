@@ -8,10 +8,15 @@ import schedule
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List
 import json
 import os
+
+
+def _utcnow() -> datetime:
+    """Return current UTC time as timezone-naive datetime (matches Binance timestamps)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 from data_collector import DataCollector, initialize_database
 from feature_engineering import FeatureEngineer
@@ -236,7 +241,7 @@ class CryptoPredictionBot:
             
             if models_loaded > 0:
                 self.is_trained = True
-                self.last_training_time = datetime.now()
+                self.last_training_time = _utcnow()
                 logger.info(f"Successfully loaded {models_loaded} production models")
                 return True
             else:
@@ -257,8 +262,8 @@ class CryptoPredictionBot:
             return
         
         # Check if retraining is needed
-        if (not force_retrain and self.is_trained and self.last_training_time and 
-            datetime.now() - self.last_training_time < timedelta(hours=config.MODEL_SETTINGS['retrain_frequency_hours'])):
+        if (not force_retrain and self.is_trained and self.last_training_time and
+            _utcnow() - self.last_training_time < timedelta(hours=config.MODEL_SETTINGS['retrain_frequency_hours'])):
             logger.info("Models recently trained, skipping training")
             return
         
@@ -290,7 +295,7 @@ class CryptoPredictionBot:
             self.prediction_engine.save_ensemble('models')
             
             self.is_trained = True
-            self.last_training_time = datetime.now()
+            self.last_training_time = _utcnow()
             logger.info("Model training completed and saved")
             
         except Exception as e:
@@ -339,15 +344,15 @@ class CryptoPredictionBot:
                             # Update timeseries tracking
                             self.accuracy_tracker.update_prediction_timeseries(
                                 crypto=crypto,
-                                timestamp=datetime.now(),
+                                timestamp=_utcnow(),
                                 actual_price=current_price,
                                 predictions=current_predictions
                             )
-                            
+
                             # Store actual price at target for future evaluations
                             self.accuracy_tracker.store_actual_price_at_target(
                                 crypto=crypto,
-                                target_timestamp=datetime.now(),
+                                target_timestamp=_utcnow(),
                                 actual_price=current_price
                             )
                     except Exception as e:
@@ -389,7 +394,7 @@ class CryptoPredictionBot:
                                 logger.info("📋 Unevaluated predictions waiting:")
                                 for _, row in df.iterrows():
                                     oldest_time = pd.to_datetime(row['oldest'])
-                                    time_waiting = datetime.now() - oldest_time
+                                    time_waiting = _utcnow() - oldest_time
                                     logger.info(f"   - {row['crypto']} {row['prediction_horizon']}: {row['count']} predictions "
                                               f"(oldest waiting {time_waiting.total_seconds()/3600:.1f}h)")
                             else:
@@ -436,7 +441,7 @@ class CryptoPredictionBot:
                     float(prediction.get('direction_prob', 0.5)),   # P(UP)
                     float(prediction.get('current_price', 0)),
                     float(prediction['model_confidence']),
-                    datetime.now().isoformat()
+                    _utcnow().isoformat()
                 ))
             
             conn.commit()
@@ -451,7 +456,7 @@ class CryptoPredictionBot:
         Display direction predictions with confidence scores.
         """
         print("\n" + "="*70)
-        print(f"DIRECTION PREDICTIONS  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"DIRECTION PREDICTIONS  —  {_utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
         print("="*70)
 
         crypto_predictions: Dict[str, list] = {}
@@ -581,7 +586,7 @@ class CryptoPredictionBot:
                     result_emoji = "🟢" if correct else "🔴"
 
                     latest_eval_time = pd.to_datetime(latest['evaluation_timestamp'])
-                    time_since_eval = datetime.now() - latest_eval_time
+                    time_since_eval = _utcnow() - latest_eval_time
                     if time_since_eval < timedelta(minutes=1):
                         eval_age = "just now"
                     elif time_since_eval < timedelta(hours=1):
@@ -644,19 +649,19 @@ class CryptoPredictionBot:
                     if current_price:
                         # Get the most recent predictions for this crypto
                         current_predictions = self.get_current_predictions_for_crypto(crypto)
-                        
+
                         # Store current actual price and predictions for timeseries tracking
                         self.accuracy_tracker.update_prediction_timeseries(
                             crypto=crypto,
-                            timestamp=datetime.now(),
+                            timestamp=_utcnow(),
                             actual_price=current_price,
                             predictions=current_predictions
                         )
-                        
+
                         # Store actual price at target for future evaluations
                         self.accuracy_tracker.store_actual_price_at_target(
                             crypto=crypto,
-                            target_timestamp=datetime.now(),
+                            target_timestamp=_utcnow(),
                             actual_price=current_price
                         )
                 except Exception as e:
@@ -680,9 +685,9 @@ class CryptoPredictionBot:
         """
         try:
             conn = sqlite3.connect(config.DATABASE_PATH)
-            
+
             predictions = {}
-            now = datetime.now()
+            now = _utcnow()
             
             for horizon in config.PREDICTION_INTERVALS:
                 # Define time windows for when predictions can be compared to current prices
@@ -768,19 +773,19 @@ class CryptoPredictionBot:
         
         # Don't wait for boundaries - start checking immediately
         freq = config.UPDATE_FREQUENCY_MINUTES
-        logger.info(f"Starting immediately at {datetime.now().strftime('%H:%M:%S')} - will catch next {freq}-minute boundary")
+        logger.info(f"Starting immediately at {_utcnow().strftime('%H:%M:%S')} UTC - will catch next {freq}-minute boundary")
 
         # Set up variables for tracking other scheduled tasks
-        last_price_update = datetime.now()
-        last_model_training = datetime.now()
-        last_prediction_run = datetime.now() - timedelta(minutes=freq * 2)  # Initialize to 2 intervals ago
+        last_price_update = _utcnow()
+        last_model_training = _utcnow()
+        last_prediction_run = _utcnow() - timedelta(minutes=freq * 2)  # Initialize to 2 intervals ago
 
         logger.info(f"Bot started - Predictions every {freq} minutes at clock boundaries")
         logger.info("Checking system clock every second for boundaries...")
 
         try:
             while True:
-                now = datetime.now()
+                now = _utcnow()
                 current_minute = now.minute
 
                 # Check if we're at the configured boundary (e.g. XX:00, XX:15, XX:30, XX:45 for 15m)
@@ -793,22 +798,22 @@ class CryptoPredictionBot:
                 if should_run_prediction:
                     logger.info(f"🎯 BOUNDARY HIT! Running scheduled prediction at {now.strftime('%H:%M:%S')}")
                     self.generate_predictions()
-                    last_prediction_run = now
-                    
+                    last_prediction_run = _utcnow()
+
                     # Also run other tasks based on their frequency
                     # Update prices every 30 minutes (at XX:00 and XX:30)
                     if current_minute % 30 == 0:
                         self.update_current_prices()
-                        last_price_update = now
-                    
+                        last_price_update = _utcnow()
+
                     # NOTE: Accuracy evaluation now happens automatically in generate_predictions()
-                    
+
                     # Check if model retraining is needed (every N hours)
-                    hours_since_training = (now - last_model_training).total_seconds() / 3600
+                    hours_since_training = (_utcnow() - last_model_training).total_seconds() / 3600
                     if hours_since_training >= config.MODEL_SETTINGS['retrain_frequency_hours']:
                         logger.info("Retraining models...")
                         self.train_models()
-                        last_model_training = now
+                        last_model_training = _utcnow()
                 
                 # Simple: sleep 1 second and check again
                 time.sleep(1)

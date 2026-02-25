@@ -6,10 +6,28 @@ import requests
 import pandas as pd
 import time
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 from typing import Dict, List, Optional
 import config
+
+
+def _utcnow() -> datetime:
+    """Return current UTC time as timezone-naive datetime (matches Binance timestamps)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _utc_ms() -> int:
+    """Return current UTC time as milliseconds since epoch.
+
+    IMPORTANT: Do NOT use ``_utcnow().timestamp()`` for this purpose.
+    Python's ``datetime.timestamp()`` on a *naive* datetime assumes the
+    system's **local** timezone, so on a non-UTC machine the result is
+    silently shifted by the local UTC offset.  ``time.time()`` always
+    returns the true UTC epoch and is immune to the system timezone.
+    """
+    return int(time.time() * 1000)
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -78,8 +96,8 @@ class DataCollector:
             return pd.DataFrame()
 
         symbol   = self._BINANCE_SYMBOLS[crypto_id]
-        end_ms   = int(datetime.now().timestamp() * 1000)
-        start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+        end_ms   = _utc_ms()
+        start_ms = end_ms - days * 86_400_000
 
         all_klines: list = []
         current_start = start_ms
@@ -152,6 +170,16 @@ class DataCollector:
         ]
         df = pd.DataFrame(all_klines, columns=kline_cols)
 
+        # Drop incomplete (in-progress) candles: their close_time is in the
+        # future.  Using them for prediction would mean features computed on
+        # partial data and a target_datetime shifted forward by one bar.
+        now_ms = _utc_ms()
+        df['close_time'] = pd.to_numeric(df['close_time'])
+        n_before = len(df)
+        df = df[df['close_time'] < now_ms]
+        if len(df) < n_before:
+            logger.info(f"Dropped {n_before - len(df)} incomplete candle(s) for {crypto_id}")
+
         df['datetime'] = pd.to_datetime(df['open_time'], unit='ms')
         for col in ['open', 'high', 'low', 'close', 'volume',
                     'quote_volume', 'taker_buy_base_vol']:
@@ -195,8 +223,8 @@ class DataCollector:
             return pd.DataFrame()
 
         symbol   = self._BINANCE_SYMBOLS[crypto_id]
-        end_ms   = int(datetime.now().timestamp() * 1000)
-        start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+        end_ms   = _utc_ms()
+        start_ms = end_ms - days * 86_400_000
 
         all_klines: list = []
         current_start = start_ms
@@ -260,6 +288,11 @@ class DataCollector:
             'taker_buy_base_vol', 'taker_buy_quote_vol', '_ignore',
         ]
         df = pd.DataFrame(all_klines, columns=kline_cols)
+
+        now_ms = _utc_ms()
+        df['close_time'] = pd.to_numeric(df['close_time'])
+        df = df[df['close_time'] < now_ms]
+
         df['datetime'] = pd.to_datetime(df['open_time'], unit='ms')
         for col in ['open', 'high', 'low', 'close', 'volume',
                     'quote_volume', 'taker_buy_base_vol']:
@@ -300,8 +333,8 @@ class DataCollector:
             return pd.DataFrame()
 
         symbol   = self._BINANCE_SYMBOLS[crypto_id]
-        end_ms   = int(datetime.now().timestamp() * 1000)
-        start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+        end_ms   = _utc_ms()
+        start_ms = end_ms - days * 86_400_000
 
         all_klines: list = []
         current_start = start_ms
@@ -365,6 +398,11 @@ class DataCollector:
             'taker_buy_base_vol', 'taker_buy_quote_vol', '_ignore',
         ]
         df = pd.DataFrame(all_klines, columns=kline_cols)
+
+        now_ms = _utc_ms()
+        df['close_time'] = pd.to_numeric(df['close_time'])
+        df = df[df['close_time'] < now_ms]
+
         df['datetime'] = pd.to_datetime(df['open_time'], unit='ms')
         for col in ['open', 'high', 'low', 'close', 'volume',
                     'quote_volume', 'taker_buy_base_vol']:
@@ -478,8 +516,8 @@ class DataCollector:
             return cached
 
         symbol   = self._BINANCE_SYMBOLS[crypto_id]
-        start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
-        end_ms   = int(datetime.now().timestamp() * 1000)
+        end_ms   = _utc_ms()
+        start_ms = end_ms - days * 86_400_000
 
         # ── Primary: Binance futures (requires VPN from US) ──────────────────
         df = self._get_funding_rate_binance(symbol, start_ms, end_ms)
@@ -586,8 +624,8 @@ class DataCollector:
             return cached
 
         symbol   = self._BINANCE_SYMBOLS[crypto_id]
-        start_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
-        end_ms   = int(datetime.now().timestamp() * 1000)
+        end_ms   = _utc_ms()
+        start_ms = end_ms - days * 86_400_000
 
         # ── Primary: Binance futures ──────────────────────────────────────────
         df = self._get_open_interest_binance(symbol, start_ms, end_ms)
@@ -610,7 +648,7 @@ class DataCollector:
         Binance only retains the last 30 days — cap startTime accordingly.
         Limit=500 per call; pages forward using startTime until end_ms is covered.
         """
-        _30d_ms = int((datetime.now() - timedelta(days=29)).timestamp() * 1000)
+        _30d_ms = _utc_ms() - 29 * 86_400_000
         current_start = max(start_ms, _30d_ms)   # Binance 400s on anything older
         all_rows: list = []
         try:

@@ -92,7 +92,7 @@ def predictions():
     # Use whichever row exists for the shared timestamp fields
     ref = btc_row or eth_row
     predicted_at = datetime.fromisoformat(ref["predicted_at"])
-    prediction_age_ms = int((datetime.now() - predicted_at).total_seconds() * 1000)
+    prediction_age_ms = int((datetime.now(timezone.utc).replace(tzinfo=None) - predicted_at).total_seconds() * 1000)
 
     result = {
         "predicted_at":      ref["predicted_at"],

@@ -9,11 +9,16 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.ticker as mticker
 import seaborn as sns
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 from typing import Dict, List, Optional, Tuple
 import json
 import config
+
+
+def _utcnow() -> datetime:
+    """Return current UTC time as timezone-naive datetime (matches Binance timestamps)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +253,7 @@ class PredictionAccuracyTracker:
                 prediction_id, crypto, prediction_horizon, predicted_price, actual_price,
                 absolute_error, percent_error, squared_error, direction_predicted,
                 direction_actual, direction_correct, prediction_timestamp.isoformat(),
-                datetime.now().isoformat(), confidence, target_timestamp.isoformat()
+                _utcnow().isoformat(), confidence, target_timestamp.isoformat()
             ))
             
             conn.commit()
@@ -281,13 +286,13 @@ class PredictionAccuracyTracker:
             
             evaluations = {}
             evaluated_count = 0
-            now = datetime.now()
+            now = _utcnow()
             
             # Define time windows for when predictions should be evaluated
             evaluation_windows = {
                 '15m': {
                     'lookback_time': now - timedelta(minutes=15),
-                    'window_size': timedelta(minutes=2),  # ±2 minutes for accurate 15m evaluation
+                    'window_size': timedelta(minutes=4),  # ±4 minutes to handle processing delays
                     'description': '15 minutes ago'
                 },
             }
@@ -436,7 +441,7 @@ class PredictionAccuracyTracker:
             conn.close()
             
             # If no stored data, try to fetch from external API with backoff
-            now = datetime.now()
+            now = _utcnow()
             time_diff_hours = abs((now - target_time).total_seconds()) / 3600
             
             # Only fetch if target time is within reasonable range
@@ -561,7 +566,7 @@ class PredictionAccuracyTracker:
                 params.append(horizon)
             
             where_conditions.append("evaluation_timestamp >= ?")
-            params.append((datetime.now() - timedelta(days=days_back)).isoformat())
+            params.append((_utcnow() - timedelta(days=days_back)).isoformat())
             
             where_clause = " AND ".join(where_conditions)
             
@@ -637,7 +642,7 @@ class PredictionAccuracyTracker:
                 WHERE crypto = ? AND evaluation_timestamp >= ?
             '''
             
-            params = [crypto, (datetime.now() - timedelta(days=days_back)).isoformat()]
+            params = [crypto, (_utcnow() - timedelta(days=days_back)).isoformat()]
             df = pd.read_sql_query(query, conn, params=params)
             conn.close()
             
@@ -723,7 +728,7 @@ class PredictionAccuracyTracker:
                 params.append(horizon)
             
             where_conditions.append("evaluation_timestamp >= ?")
-            params.append((datetime.now() - timedelta(days=days_back)).isoformat())
+            params.append((_utcnow() - timedelta(days=days_back)).isoformat())
             
             where_clause = " AND ".join(where_conditions)
             
@@ -778,7 +783,7 @@ class PredictionAccuracyTracker:
                 ORDER BY target_timestamp
             '''
 
-            params = [crypto, (datetime.now() - timedelta(days=days_back)).isoformat()]
+            params = [crypto, (_utcnow() - timedelta(days=days_back)).isoformat()]
             df = pd.read_sql_query(query, conn, params=params)
             conn.close()
 
@@ -807,7 +812,7 @@ class PredictionAccuracyTracker:
         """
         report = []
         report.append(f"\n{'='*80}")
-        report.append(f"PREDICTION ACCURACY REPORT - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        report.append(f"PREDICTION ACCURACY REPORT - {_utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
         report.append(f"{'='*80}")
         
         # Overall metrics
@@ -858,7 +863,7 @@ class PredictionAccuracyTracker:
         # Pin the visible range to exactly days_back so DayLocator never tries to
         # generate one tick per day across the full DB history (which would exceed
         # matplotlib's MAXTICKS limit and produce a warning).
-        end_dt = datetime.now()
+        end_dt = _utcnow()
         start_dt = end_dt - timedelta(days=days_back)
         ax.set_xlim(mdates.date2num(start_dt), mdates.date2num(end_dt))
 
@@ -1070,7 +1075,7 @@ class PredictionAccuracyTracker:
                     AND direction_correct IS NOT NULL
                 '''
                 conf_df = pd.read_sql_query(conf_query, conn_conf, params=[
-                    crypto, (datetime.now() - timedelta(days=days_back)).isoformat()
+                    crypto, (_utcnow() - timedelta(days=days_back)).isoformat()
                 ])
                 conn_conf.close()
                 if not conf_df.empty:
@@ -1118,7 +1123,7 @@ class PredictionAccuracyTracker:
         try:
             conn = sqlite3.connect(config.DATABASE_PATH)
             where = "WHERE evaluation_timestamp >= ?"
-            params = [(datetime.now() - timedelta(days=days_back)).isoformat()]
+            params = [(_utcnow() - timedelta(days=days_back)).isoformat()]
             if crypto:
                 where += " AND crypto = ?"
                 params.append(crypto)
