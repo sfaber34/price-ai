@@ -129,6 +129,23 @@ class PredictionAccuracyTracker:
         except Exception:
             pass  # Table may not exist yet on first run
 
+        # One-time migration: delete old evaluations that used close-to-close direction
+        # instead of Polymarket candle-color (close >= open of target bar).
+        # Uses a simple flag column to avoid re-running.
+        try:
+            cursor.execute("PRAGMA table_info(prediction_evaluations)")
+            cols = [row[1] for row in cursor.fetchall()]
+            if 'polymarket_eval' not in cols:
+                # Column missing = old schema, needs migration
+                cursor.execute('DELETE FROM prediction_evaluations')
+                deleted = cursor.rowcount
+                cursor.execute('ALTER TABLE prediction_evaluations ADD COLUMN polymarket_eval INTEGER DEFAULT 1')
+                if deleted > 0:
+                    logger.info(f"Migration: cleared {deleted} evaluations (switching to Polymarket "
+                                f"candle-color evaluation: close >= open). Will re-evaluate from kline data.")
+        except Exception:
+            pass  # Table may not exist yet
+
         conn.commit()
         conn.close()
         logger.info("Prediction accuracy tracking tables initialized")
@@ -151,93 +168,30 @@ class PredictionAccuracyTracker:
         except Exception as e:
             logger.error(f"Failed to store actual price for {crypto}: {e}")
     
-    def evaluate_prediction(self, prediction_id: int, crypto: str, prediction_horizon: str, 
-                          predicted_price: float, actual_price: float, 
+    def evaluate_prediction(self, prediction_id: int, crypto: str, prediction_horizon: str,
+                          predicted_price: float,
+                          target_bar_open: float, target_bar_close: float,
                           prediction_timestamp: datetime, target_timestamp: datetime,
                           confidence: float = 0.0) -> Dict:
         """
-        Evaluate a single prediction and store the results
+        Evaluate a single prediction using Polymarket candle-color rules:
+          UP   if target bar close >= target bar open  (green candle)
+          DOWN if target bar close <  target bar open  (red candle)
+
+        predicted_price is direction_prob P(UP) in [0, 1].
         """
         try:
-            # predicted_price now stores direction_prob (P(UP), range 0–1), not a price.
-            # Price error metrics are meaningless; direction accuracy is the signal.
             absolute_error = 0.0
             percent_error = 0.0
             squared_error = 0.0
-            
-            # Direction accuracy - compare predicted vs actual price DIRECTION from the price
-            # at the time the prediction was made (start_price).
-            direction_predicted = None
-            direction_actual = None
-            direction_correct = 0
-            
-            # Get the starting price (at prediction time) to calculate direction.
-            # Priority: (1) current_price stored with the prediction row,
-            #           (2) actual_prices_at_targets near prediction_timestamp,
-            #           (3) crypto_data near prediction_timestamp.
-            start_price = None
-            try:
-                conn = sqlite3.connect(config.DATABASE_PATH)
-                cursor = conn.cursor()
-                
-                # 1. Use current_price stored directly in the predictions row (most reliable)
-                if prediction_id is not None:
-                    cursor.execute(
-                        'SELECT current_price FROM predictions WHERE id = ?',
-                        (prediction_id,)
-                    )
-                    row = cursor.fetchone()
-                    if row and row[0] and row[0] > 0:
-                        start_price = row[0]
-                
-                # 2. Fall back to actual_prices_at_targets near prediction_timestamp
-                if start_price is None:
-                    cursor.execute('''
-                        SELECT actual_price FROM actual_prices_at_targets
-                        WHERE crypto = ? AND 
-                              ABS(julianday(target_timestamp) - julianday(?)) < (30.0/1440.0)
-                        ORDER BY ABS(julianday(target_timestamp) - julianday(?))
-                        LIMIT 1
-                    ''', (crypto, prediction_timestamp.isoformat(), prediction_timestamp.isoformat()))
-                    row = cursor.fetchone()
-                    if row and row[0]:
-                        start_price = row[0]
-                
-                # 3. Fall back to crypto_data table (populated by historical data loads)
-                if start_price is None:
-                    cursor.execute('''
-                        SELECT price FROM crypto_data
-                        WHERE crypto = ? AND 
-                              ABS(julianday(datetime) - julianday(?)) < (30.0/1440.0)
-                        ORDER BY ABS(julianday(datetime) - julianday(?))
-                        LIMIT 1
-                    ''', (crypto, prediction_timestamp.isoformat(), prediction_timestamp.isoformat()))
-                    row = cursor.fetchone()
-                    if row and row[0]:
-                        start_price = row[0]
 
-                conn.close()
-                
-                if start_price is not None:
-                    # predicted_price is direction_prob (P(UP)) — threshold at 0.5
-                    # >= matches Polymarket rules: "Up" if end price >= start price
-                    predicted_direction = 1 if predicted_price >= 0.5 else 0  # 1=up, 0=down
-                    actual_direction = 1 if actual_price >= start_price else 0
-                    direction_predicted = predicted_direction
-                    direction_actual = actual_direction
-                    direction_correct = 1 if predicted_direction == actual_direction else 0
-                else:
-                    # Cannot determine direction without a reliable start price — leave as unknown
-                    logger.debug(f"No start price found for {crypto} at {prediction_timestamp}; direction marked unknown")
-                    direction_predicted = None
-                    direction_actual = None
-                    direction_correct = 0
-                    
-            except Exception as e:
-                logger.warning(f"Could not calculate direction accuracy: {e}")
-                direction_predicted = None
-                direction_actual = None
-                direction_correct = 0
+            # Polymarket-style: compare close vs open of the TARGET bar
+            predicted_direction = 1 if predicted_price >= 0.5 else 0
+            actual_direction = 1 if target_bar_close >= target_bar_open else 0
+            direction_predicted = predicted_direction
+            direction_actual = actual_direction
+            direction_correct = 1 if predicted_direction == actual_direction else 0
+            actual_price = target_bar_close  # for DB storage compatibility
             
             # Store evaluation
             conn = sqlite3.connect(config.DATABASE_PATH)
@@ -298,87 +252,99 @@ class PredictionAccuracyTracker:
                 },
             }
             
+            # Pre-fetch recent kline data once per crypto (covers all predictions)
+            kline_cache = {}
+            for crypto in config.CRYPTOCURRENCIES:
+                try:
+                    kline_cache[crypto] = data_collector.get_crypto_data(crypto, days=1)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch kline data for {crypto}: {e}")
+                    kline_cache[crypto] = pd.DataFrame()
+
             for horizon, window_config in evaluation_windows.items():
                 lookback_time = window_config['lookback_time']
                 window_size = window_config['window_size']
-                
+
                 # Find predictions created around the lookback time that haven't been evaluated
                 earliest_time = lookback_time - window_size
                 latest_time = lookback_time + window_size
-                
+
                 # Evaluate each crypto separately to get the closest prediction for each crypto-horizon combination
                 horizon_evaluations = 0
                 for crypto in config.CRYPTOCURRENCIES:
                     query = '''
-                        SELECT p.id, p.crypto, p.prediction_horizon, p.predicted_price, 
+                        SELECT p.id, p.crypto, p.prediction_horizon, p.predicted_price,
                                p.confidence, p.datetime as target_time, p.created_at,
                                ABS(julianday(p.created_at) - julianday(?)) as time_diff_from_target
                         FROM predictions p
                         LEFT JOIN prediction_evaluations pe ON p.id = pe.prediction_id
-                        WHERE pe.id IS NULL 
+                        WHERE pe.id IS NULL
                         AND p.prediction_horizon = ?
                         AND p.crypto = ?
-                        AND p.created_at >= ? 
+                        AND p.created_at >= ?
                         AND p.created_at <= ?
                         ORDER BY time_diff_from_target ASC, p.created_at DESC
                         LIMIT 1
                     '''
-                    
+
                     cursor = conn.cursor()
                     cursor.execute(query, (
                         lookback_time.isoformat(),  # Target time for comparison
                         horizon,
                         crypto,
-                        earliest_time.isoformat(), 
+                        earliest_time.isoformat(),
                         latest_time.isoformat()
                     ))
                     prediction = cursor.fetchone()
-                    
+
                     if prediction:
                         horizon_evaluations += 1
                         try:
                             pred_id, crypto_name, pred_horizon, predicted_price, confidence, target_time_str, created_at_str, time_diff = prediction
-                            
+
                             created_at = pd.to_datetime(created_at_str)
                             target_time = pd.to_datetime(target_time_str)
-                            
-                            # FIXED: Get actual price at the TARGET TIME, not current price
-                            actual_price_at_target = self.get_actual_price_at_time(
-                                crypto, target_time, data_collector, pred_horizon
+
+                            # Get target bar's open and close for Polymarket-style eval
+                            bar_ohlc = self.get_target_bar_ohlc(
+                                crypto, target_time, kline_data=kline_cache.get(crypto)
                             )
-                            
-                            if actual_price_at_target is None:
-                                logger.debug(f"Could not get historical price for {crypto} at {target_time}")
+
+                            if bar_ohlc is None:
+                                logger.debug(f"Could not get target bar OHLC for {crypto} at {target_time}")
                                 continue
-                            
-                            # Evaluate the prediction using actual price at target time
+
+                            target_bar_open, target_bar_close = bar_ohlc
+
+                            # Evaluate: UP if close >= open (green candle)
                             evaluation = self.evaluate_prediction(
                                 prediction_id=pred_id,
                                 crypto=crypto,
                                 prediction_horizon=pred_horizon,
                                 predicted_price=predicted_price,
-                                actual_price=actual_price_at_target,  # FIXED: Use target time price
-                                prediction_timestamp=created_at,  # When prediction was made
-                                target_timestamp=target_time,  # FIXED: Use actual target time
+                                target_bar_open=target_bar_open,
+                                target_bar_close=target_bar_close,
+                                prediction_timestamp=created_at,
+                                target_timestamp=target_time,
                                 confidence=confidence
                             )
-                            
+
                             if evaluation:
                                 key = f"{crypto}_{pred_horizon}"
                                 if key not in evaluations:
                                     evaluations[key] = []
                                 evaluations[key].append(evaluation)
                                 evaluated_count += 1
-                                
+
                                 pred_dir = "UP" if predicted_price >= 0.5 else "DOWN"
                                 logger.debug(f"✅ Evaluated {crypto} {pred_horizon}: "
                                            f"predicted {pred_dir} (P(UP)={predicted_price:.2f}), "
                                            f"direction_correct={evaluation['direction_correct']}")
-                        
+
                         except Exception as e:
                             logger.error(f"Failed to evaluate individual prediction: {e}")
                             continue
-                
+
                 logger.info(f"Found {horizon_evaluations} {horizon} predictions created {window_config['description']} to evaluate")
                 logger.debug(f"  Search window: {earliest_time.strftime('%H:%M')} to {latest_time.strftime('%H:%M')} (±{window_size})")
             
@@ -399,92 +365,42 @@ class PredictionAccuracyTracker:
             logger.error(f"Batch evaluation failed: {e}")
             return {}
     
-    def get_actual_price_at_time(self, crypto: str, target_time: datetime, data_collector, horizon: str) -> Optional[float]:
+    def get_target_bar_ohlc(self, crypto: str, target_time: datetime,
+                            kline_data: pd.DataFrame = None) -> Optional[Tuple[float, float]]:
         """
-        Get actual price at a specific time using stored historical data
+        Get the target bar's (open, close) for Polymarket-style evaluation.
+
+        `target_time` from the DB = bar open_time + 30min (end of next bar).
+        Binance kline datetime = bar open_time = target_time - 15min.
+
+        `kline_data` should be pre-fetched OHLCV data (avoids re-fetching per prediction).
+
+        Returns (open_price, close_price) of the target 15m bar, or None.
         """
         try:
-            # First check if we have it stored in actual_prices_at_targets
-            conn = sqlite3.connect(config.DATABASE_PATH)
-            cursor = conn.cursor()
-            
-            # Look for actual price within a reasonable window (±6 minutes)
-            cursor.execute('''
-                SELECT actual_price FROM actual_prices_at_targets
-                WHERE crypto = ? AND 
-                      ABS(julianday(target_timestamp) - julianday(?)) < (6.0/1440.0)
-                ORDER BY ABS(julianday(target_timestamp) - julianday(?))
-                LIMIT 1
-            ''', (crypto, target_time.isoformat(), target_time.isoformat()))
-            
-            result = cursor.fetchone()
-            if result:
-                conn.close()
-                return result[0]
-            
-            # Check historical crypto data stored during collection
-            cursor.execute('''
-                SELECT price FROM crypto_data
-                WHERE crypto = ? AND 
-                      ABS(julianday(datetime) - julianday(?)) < (30.0/1440.0)
-                ORDER BY ABS(julianday(datetime) - julianday(?))
-                LIMIT 1
-            ''', (crypto, target_time.isoformat(), target_time.isoformat()))
-            
-            result = cursor.fetchone()
-            if result:
-                historical_price = result[0]
-                # Store this for future reference
-                self.store_actual_price_at_target(crypto, target_time, historical_price)
-                conn.close()
-                return historical_price
-            
-            conn.close()
-            
-            # If no stored data, try to fetch from external API with backoff
-            now = _utcnow()
-            time_diff_hours = abs((now - target_time).total_seconds()) / 3600
-            
-            # Only fetch if target time is within reasonable range
-            if 1 <= time_diff_hours <= 168:  # Between 1 hour and 1 week ago
-                try:
-                    # Calculate how many days back to fetch
-                    days_back = max(1, int(time_diff_hours / 24) + 1)
-                    
-                    # Fetch recent historical data
-                    historical_data = data_collector.get_crypto_data(crypto, days=days_back)
-                    
-                    if not historical_data.empty:
-                        # Find closest price to target time
-                        historical_data['time_diff'] = abs(
-                            pd.to_datetime(historical_data['datetime']) - target_time
-                        ).dt.total_seconds()
-                        
-                        closest_idx = historical_data['time_diff'].idxmin()
-                        closest_price = historical_data.loc[closest_idx, 'price']
-                        closest_time_diff = historical_data.loc[closest_idx, 'time_diff']
-                        
-                        # Only use if within 2 hours
-                        if closest_time_diff <= 7200:  # 2 hours in seconds
-                            # Store for future reference
-                            self.store_actual_price_at_target(crypto, target_time, closest_price)
-                            logger.info(f"Found historical price for {crypto} at {target_time}: ${closest_price:.2f}")
-                            return closest_price
-                        
-                except Exception as e:
-                    logger.warning(f"Failed to fetch historical price for {crypto}: {e}")
-            
-            # If target time is very recent (< 1 hour), can use current price
-            if time_diff_hours < 1:
-                current_price = data_collector.get_crypto_current_price(crypto)
-                if current_price:
-                    self.store_actual_price_at_target(crypto, target_time, current_price)
-                    return current_price
-            
+            if kline_data is None or kline_data.empty or 'open' not in kline_data.columns:
+                return None
+
+            # Convert target_time (bar close time) to bar open_time for matching
+            bar_open_time = target_time - timedelta(minutes=15)
+
+            kline_data = kline_data.copy()
+            kline_data['datetime'] = pd.to_datetime(kline_data['datetime'])
+            time_diffs = (kline_data['datetime'] - bar_open_time).dt.total_seconds().abs()
+
+            closest_idx = time_diffs.idxmin()
+            closest_time_diff = time_diffs.loc[closest_idx]
+
+            # Only use if within 2 minutes of expected bar open
+            if closest_time_diff <= 120:
+                bar_open = float(kline_data.loc[closest_idx, 'open'])
+                bar_close = float(kline_data.loc[closest_idx, 'price'])
+                return (bar_open, bar_close)
+
             return None
-            
+
         except Exception as e:
-            logger.error(f"Failed to get actual price for {crypto} at {target_time}: {e}")
+            logger.error(f"Failed to get target bar OHLC for {crypto} at {target_time}: {e}")
             return None
     
     def update_prediction_timeseries(self, crypto: str, timestamp: datetime, actual_price: float,
