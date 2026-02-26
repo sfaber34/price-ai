@@ -4,7 +4,6 @@ Trains on historical data, makes predictions, and evaluates against known future
 """
 import pandas as pd
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta
 import logging
 from typing import Dict, List, Tuple
@@ -50,113 +49,45 @@ class CryptoBacktester:
             except Exception as e:
                 logger.error(f"Failed to collect data for {crypto}: {e}")
 
-        # Fetch 5m bars for intrabar features (1 day is enough for live, use more for training)
+        # Fetch 1m bars for intrabar features
         for crypto in config.CRYPTOCURRENCIES:
             try:
-                data_5m = self.data_collector.get_crypto_data_5m(crypto, days=days)
-                if not data_5m.empty:
-                    data[f'{crypto}_5m'] = data_5m
-                    logger.info(f"Collected {len(data_5m)} 5m bars for {crypto}")
+                data_1m = self.data_collector.get_crypto_data_1m(crypto, days=days)
+                if not data_1m.empty:
+                    data[f'{crypto}_1m'] = data_1m
+                    logger.info(f"Collected {len(data_1m)} 1m bars for {crypto}")
             except Exception as e:
-                logger.warning(f"5m data fetch failed for {crypto}: {e}")
-
-        # External data — parallel fetch with hard timeout (same pattern as bot)
-        _EXT_TIMEOUT = 60  # longer timeout for backtest (not time-critical)
-        ext_tasks = {}
-        for crypto in config.CRYPTOCURRENCIES:
-            ext_tasks[f'{crypto}_funding_rate']  = (self.data_collector.get_funding_rate,  (crypto, days))
-            ext_tasks[f'{crypto}_open_interest'] = (self.data_collector.get_open_interest, (crypto, days))
-
-        with ThreadPoolExecutor(max_workers=len(ext_tasks)) as pool:
-            futures = {key: pool.submit(fn, *args) for key, (fn, args) in ext_tasks.items()}
-            for key, fut in futures.items():
-                try:
-                    result = fut.result(timeout=_EXT_TIMEOUT)
-                    data[key] = result
-                    logger.info(f"Collected {len(result)} {key} records")
-                except FuturesTimeout:
-                    logger.warning(f"External data '{key}' timed out — skipping")
-                    data[key] = pd.DataFrame()
-                except Exception as e:
-                    logger.warning(f"External data '{key}' failed: {e} — skipping")
-                    data[key] = pd.DataFrame()
+                logger.warning(f"1m data fetch failed for {crypto}: {e}")
 
         return data
     
     def prepare_features_for_backtest(self, raw_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """
-        Prepare features for all cryptocurrencies using the feature engineer with cross-asset correlations
+        Prepare features for all cryptocurrencies independently (per-crypto, no cross-asset).
+        Matches the evaluate_calibration.py pipeline: 15m bars + 1m intrabar only.
         """
-        logger.info("Preparing features for backtesting with cross-asset correlations...")
-        
-        market_data = raw_data.get('traditional_markets', pd.DataFrame())
-        
-        # Extract crypto data for cross-asset feature engineering
-        crypto_data = {}
+        logger.info("Preparing features for backtesting...")
+
+        prepared_data = {}
         for crypto in config.CRYPTOCURRENCIES:
-            if crypto in raw_data and not raw_data[crypto].empty:
-                crypto_data[crypto] = raw_data[crypto]
-        
-        if not crypto_data:
-            logger.warning("No crypto data available for backtest feature preparation")
-            return {}
-        
-        # Build per-crypto external data dict (funding rate, OI, 5m bars)
-        external_data_by_crypto = {
-            crypto: {
-                'funding_rate':  raw_data.get(f'{crypto}_funding_rate', pd.DataFrame()),
-                'open_interest': raw_data.get(f'{crypto}_open_interest', pd.DataFrame()),
-                'intrabar_5m':   raw_data.get(f'{crypto}_5m', pd.DataFrame()),
-            }
-            for crypto in config.CRYPTOCURRENCIES
-        }
+            if crypto not in raw_data or raw_data[crypto].empty:
+                continue
+            try:
+                df_1m = raw_data.get(f'{crypto}_1m', pd.DataFrame())
+                external_data = {'intrabar_1m': df_1m if not df_1m.empty else None}
+                features_df = self.feature_engineer.prepare_features(
+                    raw_data[crypto],
+                    external_data=external_data,
+                )
+                if not features_df.empty:
+                    prepared_data[crypto] = features_df
+                    logger.info(f"Backtest {crypto}: {features_df.shape[1]} features, {len(features_df)} bars")
+                else:
+                    logger.warning(f"No features prepared for {crypto}")
+            except Exception as e:
+                logger.error(f"Feature preparation failed for {crypto}: {e}")
 
-        try:
-            # Use the new cross-asset correlation feature preparation
-            prepared_data = self.feature_engineer.prepare_features_with_cross_asset_correlation(
-                crypto_data,
-                market_data,
-                external_data_by_crypto=external_data_by_crypto,
-            )
-
-            # Log feature counts for each crypto
-            for crypto, features_df in prepared_data.items():
-                # Count cross-asset features specifically
-                cross_asset_features = [col for col in features_df.columns
-                                      if any(other_crypto in col for other_crypto in config.CRYPTOCURRENCIES
-                                           if other_crypto != crypto)]
-
-                logger.info(f"🔬 Backtest {crypto}: {features_df.shape[1]} total features "
-                           f"({len(cross_asset_features)} cross-asset)")
-
-            return prepared_data
-
-        except Exception as e:
-            logger.error(f"Cross-asset backtest feature preparation failed: {e}")
-
-            # Fallback to individual feature preparation
-            logger.info("Falling back to individual feature preparation for backtest...")
-            prepared_data = {}
-            for crypto in config.CRYPTOCURRENCIES:
-                if crypto in raw_data and not raw_data[crypto].empty:
-                    try:
-                        ext = external_data_by_crypto.get(crypto, {})
-                        crypto_features = self.feature_engineer.prepare_features(
-                            raw_data[crypto],
-                            market_data,
-                            ext,
-                        )
-
-                        if not crypto_features.empty:
-                            prepared_data[crypto] = crypto_features
-                            logger.info(f"Features prepared for {crypto}: {crypto_features.shape}")
-                        else:
-                            logger.warning(f"No features prepared for {crypto}")
-
-                    except Exception as crypto_error:
-                        logger.error(f"Feature preparation failed for {crypto}: {crypto_error}")
-
-            return prepared_data
+        return prepared_data
     
     def create_time_splits(self, data: pd.DataFrame, train_days: int = 30, 
                           step_days: int = 7, min_future_days: int = 2) -> List[Tuple[int, int]]:
@@ -605,8 +536,7 @@ class CryptoBacktester:
         print("\n" + "="*80)
 
 def train_production_models(backtester: CryptoBacktester, analysis: Dict,
-                            prepared_data: Dict[str, pd.DataFrame],
-                            intrabar_1m_data: Dict[str, pd.DataFrame] = None) -> Dict:
+                            prepared_data: Dict[str, pd.DataFrame]) -> Dict:
     """
     Train final production models on a fixed training window and save them.
 
@@ -645,15 +575,6 @@ def train_production_models(backtester: CryptoBacktester, analysis: Dict,
         # Use the most recent `production_window_days` of data
         n_bars = int(production_window_days * 24 * 4)
         recent_data = data.tail(n_bars).copy()
-
-        # Add intrabar (1m) features to the production training slice
-        if intrabar_1m_data and crypto in intrabar_1m_data:
-            recent_data = backtester.feature_engineer.add_intrabar_features(
-                recent_data, intrabar_1m_data[crypto]
-            )
-
-        # Note: 5m intrabar features are already in prepared_data from the pipeline
-        # (prepare_features → add_intrabar_5m_features), unlike 1m which is added here.
 
         print(f"\n  {crypto.upper()}: {len(recent_data)} training samples "
               f"({production_window_days} days × 96 bars/day)")
@@ -734,24 +655,8 @@ def main():
         prepared_data = backtester.prepare_features_for_backtest(raw_data)
         analysis = {}  # no backtest analysis — only used for display/save
 
-        print(f"\n📡 Fetching 1m intrabar data ({production_window_days}d)…")
-        intrabar_1m_data = {}
-        for crypto in config.CRYPTOCURRENCIES:
-            try:
-                df_1m = backtester.data_collector.get_crypto_data_1m(
-                    crypto, days=production_window_days + 2
-                )
-                if not df_1m.empty:
-                    intrabar_1m_data[crypto] = df_1m
-                    print(f"  {crypto}: {len(df_1m)} 1m bars")
-            except Exception as e:
-                print(f"  {crypto}: 1m fetch failed ({e}) — intrabar features skipped")
-
-        # Note: 5m bars are already fetched in collect_backtest_data and flow
-        # through prepare_features_for_backtest → prepare_features pipeline.
-
         print("\n🔥 TRAINING PRODUCTION MODELS...")
-        train_production_models(backtester, analysis, prepared_data, intrabar_1m_data)
+        train_production_models(backtester, analysis, prepared_data)
         print("\n✅ Production model training complete!")
         print("🤖 Production models saved to models/ directory")
         return
@@ -806,28 +711,11 @@ def main():
 
         json.dump(json_analysis, f, indent=2)
 
-    # Fetch 1m and 5m intrabar data for production training window only
-    # (not needed for the backtest experiment — avoids fetching 730d of 1m bars)
-    print(f"\n📡 Fetching 1m intrabar data for production training ({production_window_days}d)…")
-    intrabar_1m_data = {}
-    for crypto in config.CRYPTOCURRENCIES:
-        try:
-            df_1m = backtester.data_collector.get_crypto_data_1m(
-                crypto, days=production_window_days + 2
-            )
-            if not df_1m.empty:
-                intrabar_1m_data[crypto] = df_1m
-                print(f"  {crypto}: {len(df_1m)} 1m bars")
-        except Exception as e:
-            print(f"  {crypto}: 1m fetch failed ({e}) — intrabar features skipped")
-
-    # Note: 5m bars are already fetched in collect_backtest_data and flow
-    # through prepare_features_for_backtest → prepare_features pipeline.
-
     # Train production models on fixed window using already-prepared data
+    # (1m intrabar features already flow through prepare_features_for_backtest)
     print("\n🔥 TRAINING PRODUCTION MODELS...")
     optimal_models = train_production_models(
-        backtester, analysis, prepared_data, intrabar_1m_data
+        backtester, analysis, prepared_data
     )
 
     logger.info("Optimal training results saved to optimal_training_results.json")

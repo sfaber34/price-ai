@@ -7,7 +7,6 @@ import pandas as pd
 import schedule
 import time
 import logging
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List
 import json
@@ -70,8 +69,8 @@ class CryptoPredictionBot:
                 logger.error(f"Failed to collect data for {crypto}: {e}")
 
             try:
-                # Only need ~2 hours of 1m bars for intrabar features (current bar context).
-                # Intrabar features are per-bar aggregations, not rolled across bars.
+                # Only need ~1 day of 1m bars — intrabar features are per-bar
+                # aggregations, and we only predict from the most recent bar.
                 data_1m = self.data_collector.get_crypto_data_1m(crypto, days=1)
                 if not data_1m.empty:
                     data[f'{crypto}_1m'] = data_1m
@@ -79,130 +78,32 @@ class CryptoPredictionBot:
             except Exception as e:
                 logger.warning(f"1m data fetch failed for {crypto}: {e}")
 
-            try:
-                data_5m = self.data_collector.get_crypto_data_5m(crypto, days=1)
-                if not data_5m.empty:
-                    data[f'{crypto}_5m'] = data_5m
-                    logger.info(f"Collected {len(data_5m)} 5m bars for {crypto}")
-            except Exception as e:
-                logger.warning(f"5m data fetch failed for {crypto}: {e}")
-        
-        # Collect traditional market data
-        try:
-            market_data = self.data_collector.get_traditional_markets_data(days=days)
-            if not market_data.empty:
-                data['traditional_markets'] = market_data
-                logger.info(f"Collected traditional market data: {len(market_data)} records")
-        except Exception as e:
-            logger.error(f"Failed to collect traditional market data: {e}")
-            data['traditional_markets'] = pd.DataFrame()
-
-        # Collect economic indicators
-        try:
-            econ_data = self.data_collector.get_economic_indicators()
-            if not econ_data.empty:
-                data['economic_indicators'] = econ_data
-                logger.info(f"Collected economic indicators: {len(econ_data)} records")
-        except Exception as e:
-            logger.error(f"Failed to collect economic indicators: {e}")
-            data['economic_indicators'] = pd.DataFrame()
-
-        # External data (funding rate, open interest) — fetched in parallel
-        # with a hard wall-clock timeout so a slow/hung OKX request can never block
-        # prediction cycles.  Cached results return immediately on subsequent calls.
-        _EXT_TIMEOUT = 45  # seconds per source before giving up
-        ext_tasks = {}
-        for crypto in config.CRYPTOCURRENCIES:
-            ext_tasks[f'{crypto}_funding_rate']  = (self.data_collector.get_funding_rate,  (crypto, days))
-            ext_tasks[f'{crypto}_open_interest'] = (self.data_collector.get_open_interest, (crypto, days))
-
-        with ThreadPoolExecutor(max_workers=len(ext_tasks)) as pool:
-            futures = {key: pool.submit(fn, *args) for key, (fn, args) in ext_tasks.items()}
-            for key, fut in futures.items():
-                try:
-                    result = fut.result(timeout=_EXT_TIMEOUT)
-                    data[key] = result
-                    logger.info(f"Collected {len(result)} {key} records")
-                except FuturesTimeout:
-                    logger.warning(f"External data '{key}' timed out after {_EXT_TIMEOUT}s — skipping")
-                    data[key] = pd.DataFrame()
-                except Exception as e:
-                    logger.warning(f"External data '{key}' failed: {e} — skipping")
-                    data[key] = pd.DataFrame()
-
         return data
     
     def prepare_features_for_all_cryptos(self, raw_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """
-        Prepare features for all cryptocurrencies with cross-asset correlation features
+        Prepare features for all cryptocurrencies independently (per-crypto, no cross-asset).
+        Matches the evaluate_calibration.py pipeline: 15m bars + 1m intrabar only.
         """
-        logger.info("Preparing features for all cryptocurrencies with cross-asset correlations...")
-        
-        market_data = raw_data.get('traditional_markets', pd.DataFrame())
-        
-        # Extract crypto data for cross-asset feature engineering
-        crypto_data = {}
+        logger.info("Preparing features for all cryptocurrencies...")
+
+        prepared_data = {}
         for crypto in config.CRYPTOCURRENCIES:
-            if crypto in raw_data and not raw_data[crypto].empty:
-                crypto_data[crypto] = raw_data[crypto]
-        
-        if not crypto_data:
-            logger.warning("No crypto data available for feature preparation")
-            return {}
-        
-        # Build per-crypto external data dict (funding rate, OI)
-        external_data_by_crypto = {
-            crypto: {
-                'funding_rate':  raw_data.get(f'{crypto}_funding_rate', pd.DataFrame()),
-                'open_interest': raw_data.get(f'{crypto}_open_interest', pd.DataFrame()),
-                'intrabar_1m':   raw_data.get(f'{crypto}_1m', pd.DataFrame()),
-                'intrabar_5m':   raw_data.get(f'{crypto}_5m', pd.DataFrame()),
-            }
-            for crypto in config.CRYPTOCURRENCIES
-        }
+            if crypto not in raw_data or raw_data[crypto].empty:
+                continue
+            try:
+                df_1m = raw_data.get(f'{crypto}_1m', pd.DataFrame())
+                external_data = {'intrabar_1m': df_1m if not df_1m.empty else None}
+                features_df = self.feature_engineer.prepare_features(
+                    raw_data[crypto],
+                    external_data=external_data,
+                )
+                prepared_data[crypto] = features_df
+                logger.info(f"{crypto}: {features_df.shape[1]} features, {len(features_df)} bars")
+            except Exception as e:
+                logger.error(f"Feature preparation failed for {crypto}: {e}")
 
-        try:
-            # Use the new cross-asset correlation feature preparation
-            prepared_data = self.feature_engineer.prepare_features_with_cross_asset_correlation(
-                crypto_data,
-                market_data,
-                external_data_by_crypto=external_data_by_crypto,
-            )
-
-            # Log feature counts for each crypto
-            for crypto, features_df in prepared_data.items():
-                # Count cross-asset features specifically
-                cross_asset_features = [col for col in features_df.columns
-                                      if any(other_crypto in col for other_crypto in config.CRYPTOCURRENCIES
-                                           if other_crypto != crypto)]
-
-                logger.info(f"✅ {crypto}: {features_df.shape[1]} total features "
-                           f"({len(cross_asset_features)} cross-asset)")
-
-            return prepared_data
-
-        except Exception as e:
-            logger.error(f"Cross-asset feature preparation failed: {e}")
-
-            # Fallback to individual feature preparation
-            logger.info("Falling back to individual feature preparation...")
-            prepared_data = {}
-            for crypto in config.CRYPTOCURRENCIES:
-                if crypto in raw_data:
-                    try:
-                        ext = external_data_by_crypto.get(crypto, {})
-                        features_df = self.feature_engineer.prepare_features(
-                            raw_data[crypto],
-                            market_data,
-                            ext,
-                        )
-                        prepared_data[crypto] = features_df
-                        logger.info(f"Features prepared for {crypto}: {features_df.shape}")
-
-                    except Exception as crypto_error:
-                        logger.error(f"Feature preparation failed for {crypto}: {crypto_error}")
-
-            return prepared_data
+        return prepared_data
     
     def load_production_models(self) -> bool:
         """
