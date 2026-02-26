@@ -219,16 +219,20 @@ class CryptoBacktester:
             # Get the prediction timestamp (start of test period)
             prediction_time = data.iloc[test_start]['datetime']
             
-            # Find future prices for evaluation (15-minute intervals: 4 per hour)
+            # Find future bar data for evaluation (15-minute intervals: 4 per hour)
+            # Polymarket-style: compare bar close vs bar open of the target bar
             future_prices = {}
+            future_opens = {}
             _horizon_offsets = {'15m': 1, '1h': 4, '4h': 16}
             for horizon in config.PREDICTION_INTERVALS:
                 future_idx = test_start + _horizon_offsets.get(horizon, 1)
-                
+
                 if future_idx < len(data):
-                    future_prices[horizon] = data.iloc[future_idx]['price']
+                    future_prices[horizon] = data.iloc[future_idx]['price']   # close of target bar
+                    future_opens[horizon] = data.iloc[future_idx]['open']     # open of target bar
                 else:
                     future_prices[horizon] = None
+                    future_opens[horizon] = None
             
             # Train models on truncated data
             results = {}
@@ -262,10 +266,11 @@ class CryptoBacktester:
                     if prediction:
                         current_price = train_data.iloc[-1]['price']
                         actual_future_price = future_prices[horizon]
+                        actual_future_open = future_opens[horizon]
 
-                        # Direction evaluation
+                        # Direction evaluation — Polymarket-style: close >= open of target bar
                         predicted_direction = prediction['predicted_direction']  # 1=UP, 0=DOWN
-                        actual_direction = 1 if actual_future_price > current_price else 0
+                        actual_direction = 1 if actual_future_price >= actual_future_open else 0
                         direction_correct = int(predicted_direction == actual_direction)
 
                         results[horizon] = {

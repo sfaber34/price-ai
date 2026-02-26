@@ -48,6 +48,11 @@ class CryptoPredictionModel:
 
         X = clean_df[feature_cols].fillna(0)  # Fill remaining NaN with 0
         y = clean_df[target_col]
+        # Ensure integer class labels (0/1) — boolean/object targets break
+        # mutual_info_classif and some classifiers.  The target column can be
+        # numpy bool, object-dtype with Python True/False, or already int.
+        if y.dtype == bool or y.dtype == object:
+            y = y.astype(int)
         
         # CRITICAL: Additional data validation to prevent training failures
         logger.info("Performing final data validation before model training...")
@@ -94,8 +99,10 @@ class CryptoPredictionModel:
     
     def feature_selection(self, X: pd.DataFrame, y: pd.Series, k: int = 50) -> pd.DataFrame:
         """
-        Select top k features using f_classif — selects features most informative
-        for the direction target (UP/DOWN), not for return magnitude.
+        Select top k features using f_classif (ANOVA F-test).
+        Stable closed-form scoring that outperforms mutual_info_classif on this
+        dataset size (~17k samples). XGBoost handles nonlinear relationships
+        downstream, so linear feature selection is sufficient.
         """
         selector_key = f"{self.prediction_horizon}_selector"
 
@@ -297,8 +304,8 @@ class CryptoPredictionModel:
         """
         Train a direction classifier for the given horizon.
         Feature selection uses f_classif against the binary direction target so
-        the 50 chosen features are the ones that actually predict UP/DOWN, not
-        return magnitude.
+        the 50 chosen features are the ones that actually predict UP/DOWN.
+        XGBoost captures nonlinear effects downstream.
         """
         logger.info(f"Training direction classifier for {self.crypto_name} - {self.prediction_horizon}")
 
@@ -380,7 +387,7 @@ class CryptoPredictionModel:
 
             classifier = self.models[f"{self.prediction_horizon}_xgb_classifier"]
             direction_prob = classifier.predict_proba(X_scaled)[0, 1]  # P(UP)
-            predicted_direction = int(direction_prob > 0.5)
+            predicted_direction = int(direction_prob >= 0.5)  # >= matches Polymarket rules
 
             current_price = latest_data['price'].iloc[0]
 
@@ -388,8 +395,8 @@ class CryptoPredictionModel:
             if isinstance(feature_datetime, str):
                 feature_datetime = pd.to_datetime(feature_datetime)
 
-            # datetime = bar open_time; the 15m prediction targets the NEXT bar's
-            # close, which is 2 bar-widths from open_time (open + 15m + 15m).
+            # datetime = bar open_time; prediction targets the NEXT bar's close vs open
+            # (Polymarket-style). Target time = open_time + 15m (this bar) + 15m (next bar).
             offsets = {'15m': pd.Timedelta(minutes=30)}
             target_datetime = feature_datetime + offsets.get(self.prediction_horizon, pd.Timedelta(0))
 

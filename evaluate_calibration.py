@@ -29,7 +29,7 @@ TEST_DAYS  = 90    # held-out period — model never sees this during training
 
 def calibration_report(probs: np.ndarray, actuals: np.ndarray, horizon: str):
     confidences = np.maximum(probs, 1 - probs)
-    predicted   = (probs > 0.5).astype(int)
+    predicted   = (probs >= 0.5).astype(int)
     correct     = (predicted == actuals).astype(int)
     n_total     = len(correct)
     overall_acc = correct.mean()

@@ -42,7 +42,7 @@ FRED_SERIES = {}
 MODEL_SETTINGS = {
     'train_test_split': 0.8,
     'cross_validation_folds': 5,
-    'feature_selection_k': 30,
+    'feature_selection_k': 50,
     'xgboost_params': {
         # These are the fallback values used if early stopping fails.
         # Early stopping will search up to 1000 trees and prune back;

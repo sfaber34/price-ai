@@ -673,6 +673,10 @@ class FeatureEngineer:
                     lambda x: (x > 0).sum() / len(x) if len(x) > 0 else 0.5
                 )
 
+            # MACD histogram change (momentum of momentum)
+            if 'macd_histogram' in df.columns:
+                df['macd_hist_change'] = df['macd_histogram'].diff()
+
             logger.info("Added momentum features")
             
         except Exception as e:
@@ -855,28 +859,99 @@ class FeatureEngineer:
         
         return df
     
+    def add_mean_reversion_features(self, df: pd.DataFrame, price_col: str = 'price') -> pd.DataFrame:
+        """
+        Add mean-reversion features that capture overextension and streak patterns.
+        These are the strongest 15m-bar predictors of candle colour (close >= open).
+        """
+        df = df.copy()
+        try:
+            logger.info("Adding mean reversion features...")
+
+            # Per-bar return (close-to-close)
+            bar_return = df[price_col].pct_change()
+
+            # Z-score of current return vs rolling window — how "unusual" this bar is
+            for window in [20, 50]:
+                roll_mean = bar_return.rolling(window).mean()
+                roll_std = bar_return.rolling(window).std()
+                df[f'return_zscore_{window}'] = (bar_return - roll_mean) / (roll_std + 1e-10)
+
+            # Consecutive candle colour streaks
+            if 'open' in df.columns:
+                is_green = (df[price_col] >= df['open']).astype(int)  # 1=green, 0=red
+
+                # consecutive_green: count of unbroken green bars ending at current bar
+                green_break = is_green.ne(1)
+                green_groups = green_break.cumsum()
+                df['consecutive_green'] = is_green.groupby(green_groups).cumsum()
+
+                # consecutive_red: count of unbroken red bars ending at current bar
+                is_red = 1 - is_green
+                red_break = is_red.ne(1)
+                red_groups = red_break.cumsum()
+                df['consecutive_red'] = is_red.groupby(red_groups).cumsum()
+
+                # streak_length: signed streak (+N green, -N red)
+                df['streak_length'] = df['consecutive_green'] - df['consecutive_red']
+
+            logger.info("Added mean reversion features")
+        except Exception as e:
+            logger.error(f"Error adding mean reversion features: {e}")
+
+        return df
+
+    def add_price_level_features(self, df: pd.DataFrame, price_col: str = 'price') -> pd.DataFrame:
+        """
+        Add features measuring distance from recent price levels and moving averages.
+        """
+        df = df.copy()
+        try:
+            logger.info("Adding price level features...")
+
+            # Distance from 1h (4-bar) rolling high/low, normalised by range
+            if 'high' in df.columns and 'low' in df.columns:
+                roll_high = df['high'].rolling(4).max()
+                roll_low = df['low'].rolling(4).min()
+                roll_range = roll_high - roll_low + 1e-10
+                df['dist_1h_high_pct'] = (roll_high - df[price_col]) / roll_range
+                df['dist_1h_low_pct'] = (df[price_col] - roll_low) / roll_range
+
+            # Distance from short EMAs (captures short-term mean reversion)
+            ema_8 = df[price_col].ewm(span=8).mean()
+            ema_21 = df[price_col].ewm(span=21).mean()
+            df['dist_ema_8_pct'] = (df[price_col] - ema_8) / (df[price_col].abs() + 1e-10)
+            df['dist_ema_21_pct'] = (df[price_col] - ema_21) / (df[price_col].abs() + 1e-10)
+
+            logger.info("Added price level features")
+        except Exception as e:
+            logger.error(f"Error adding price level features: {e}")
+
+        return df
+
     def create_target_variables(self, df: pd.DataFrame, price_col: str = 'price') -> pd.DataFrame:
         """
         Create target variables for 15m prediction horizon.
-        With 15-minute data: 15m → shift(-1) = 1 period ahead
-        CRITICAL: This creates targets that look FORWARD in time to avoid data leakage
+        Matches Polymarket BTC up/down 15m market rules:
+          "Up" if bar close >= bar open, "Down" otherwise.
+        Target is the NEXT bar (shift -1) so features from bar N predict bar N+1.
         """
         df = df.copy()
 
         try:
-            # Direction target — 1 if price goes UP, 0 if DOWN
-            # shift(-1) looks 1 bar ahead; > current price means UP
-            # Use .where(future.notna()) to preserve NaN at the tail so the leakage
-            # validator can confirm the shift was applied and training drops those rows.
-            future_15m = df[price_col].shift(-1)
-            df['target_direction_15m'] = (future_15m > df[price_col]).where(future_15m.notna())
+            # Direction target — matches Polymarket: UP if next bar's close >= next bar's open.
+            # shift(-1) looks 1 bar ahead to avoid data leakage (bar N features predict bar N+1).
+            # Use .where() to preserve NaN at the tail so training drops those rows.
+            next_close = df[price_col].shift(-1)
+            next_open = df['open'].shift(-1)
+            df['target_direction_15m'] = (next_close >= next_open).where(next_close.notna())
 
             # Future datetime stamp for evaluation alignment.
             # datetime = bar open_time; shift(-1) targets the NEXT bar's close,
             # which is 2 bar-widths from open_time: open + 15m (this bar) + 15m (next bar).
             df['target_datetime_15m'] = df['datetime'] + pd.Timedelta(minutes=30)
 
-            logger.info("Created direction target variable for 15m horizon")
+            logger.info("Created direction target variable for 15m horizon (Polymarket: close >= open)")
 
         except Exception as e:
             logger.error(f"Error creating target variables: {e}")
@@ -1080,6 +1155,42 @@ class FeatureEngineer:
                     last3_vol = last3.groupby('bar_15m')['volume'].sum()
                     feats['intrabar_buy_pressure_close'] = last3_buy / (last3_vol + 1e-10)
 
+            # -- RSI on 1m closes, sampled at 15m bar close (strongest signal) ----
+            rsi_1m = ta.momentum.RSIIndicator(df_1m['price'], window=14).rsi()
+            df_1m['rsi_1m'] = rsi_1m
+            feats['rsi_1m_at_close'] = df_1m.groupby('bar_15m')['rsi_1m'].last()
+
+            # -- VWAP position within bar -----------------------------------------
+            if 'volume' in df_1m.columns and 'high' in df_1m.columns and 'low' in df_1m.columns:
+                pv_1m = df_1m['price'] * df_1m['volume']
+                df_1m['cum_pv'] = pv_1m.groupby(df_1m['bar_15m']).cumsum()
+                df_1m['cum_vol'] = df_1m['volume'].groupby(df_1m['bar_15m']).cumsum()
+                df_1m['bar_vwap'] = df_1m['cum_pv'] / (df_1m['cum_vol'] + 1e-10)
+                bar_vwap = df_1m.groupby('bar_15m')['bar_vwap'].last()
+                bar_high = df_1m.groupby('bar_15m')['high'].max()
+                bar_low = df_1m.groupby('bar_15m')['low'].min()
+                feats['intrabar_vwap_position'] = (
+                    (bar_vwap - bar_low) / (bar_high - bar_low + 1e-10)
+                )
+
+            # -- Price change in last 5 1m bars (rate of change at close) ----------
+            last5 = df_1m[df_1m['rank_rev'] < 5]
+            last5_first = last5.groupby('bar_15m')['price'].first()
+            last5_last = last5.groupby('bar_15m')['price'].last()
+            feats['intrabar_roc_5min'] = (
+                (last5_last - last5_first) / (last5_first.abs() + 1e-10)
+            )
+
+            # -- Linear regression slope of last 5 1m prices, normalised ----------
+            def _norm_slope(prices):
+                if len(prices) < 2:
+                    return 0.0
+                x = np.arange(len(prices))
+                slope = np.polyfit(x, prices.values, 1)[0]
+                return slope / (prices.mean() + 1e-10)
+
+            feats['intrabar_slope_5min'] = last5.groupby('bar_15m')['price'].apply(_norm_slope)
+
             feats = feats.reset_index()  # bar_15m becomes a column
 
             # -- Merge onto 15m df ------------------------------------------------
@@ -1215,6 +1326,8 @@ class FeatureEngineer:
         df = self.add_volume_based_features(df)
         df = self.add_momentum_features(df)  # NEW: Better momentum capture
         df = self.add_volatility_features(df)  # NEW: Volatility patterns
+        df = self.add_mean_reversion_features(df)   # Candle-colour mean reversion signals
+        df = self.add_price_level_features(df)       # Distance from price levels/EMAs
 
         # External derivative/sentiment data (no future leakage via merge_asof backward)
         external_data = external_data or {}
@@ -1391,6 +1504,8 @@ class FeatureEngineer:
                     'intrabar_close_position', 'intrabar_volume_trend',
                     'intrabar_cvd_total', 'intrabar_cvd_acceleration', 'intrabar_cvd_norm',
                     'intrabar_buy_pressure_close',
+                    'rsi_1m_at_close', 'intrabar_vwap_position',
+                    'intrabar_roc_5min', 'intrabar_slope_5min',
                     # Intrabar (5m) features — zero-fill only, no bfill
                     'intra5m_first_last_direction', 'intra5m_middle_momentum',
                     'intra5m_cvd_acceleration', 'intra5m_cvd_norm',

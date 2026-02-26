@@ -428,7 +428,7 @@ class CryptoPredictionBot:
 
                 # Insert prediction into database with corrected timestamp logic
                 # predicted_price column repurposed: stores raw P(UP) in [0, 1].
-                # Direction = 1 (UP) when value > 0.5, DOWN otherwise.
+                # Direction = 1 (UP) when value >= 0.5, DOWN otherwise.
                 # confidence column stores model_confidence (distance from 0.5).
                 conn.execute('''
                     INSERT INTO predictions

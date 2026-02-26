@@ -220,8 +220,9 @@ class PredictionAccuracyTracker:
                 
                 if start_price is not None:
                     # predicted_price is direction_prob (P(UP)) — threshold at 0.5
-                    predicted_direction = 1 if predicted_price > 0.5 else 0  # 1=up, 0=down
-                    actual_direction = 1 if actual_price > start_price else 0
+                    # >= matches Polymarket rules: "Up" if end price >= start price
+                    predicted_direction = 1 if predicted_price >= 0.5 else 0  # 1=up, 0=down
+                    actual_direction = 1 if actual_price >= start_price else 0
                     direction_predicted = predicted_direction
                     direction_actual = actual_direction
                     direction_correct = 1 if predicted_direction == actual_direction else 0
@@ -369,7 +370,7 @@ class PredictionAccuracyTracker:
                                 evaluations[key].append(evaluation)
                                 evaluated_count += 1
                                 
-                                pred_dir = "UP" if predicted_price > 0.5 else "DOWN"
+                                pred_dir = "UP" if predicted_price >= 0.5 else "DOWN"
                                 logger.debug(f"✅ Evaluated {crypto} {pred_horizon}: "
                                            f"predicted {pred_dir} (P(UP)={predicted_price:.2f}), "
                                            f"direction_correct={evaluation['direction_correct']}")
