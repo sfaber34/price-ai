@@ -25,6 +25,10 @@ from data_collector import DataCollector, initialize_database
 from feature_engineering import FeatureEngineer
 from ml_predictor import EnsemblePredictionEngine
 from prediction_accuracy_tracker import PredictionAccuracyTracker
+from training_pipeline import (
+    fetch_data_for_crypto,
+    prepare_features_for_crypto,
+)
 import config
 
 # Set up logging
@@ -53,84 +57,83 @@ class CryptoPredictionBot:
         
         logger.info("Crypto Prediction Bot initialized with accuracy tracking")
     
-    def collect_all_data(self, days: int = 30) -> Dict[str, pd.DataFrame]:
+    def collect_all_data(self, days: int = 30) -> Dict[str, Dict[str, pd.DataFrame]]:
         """
         Collect all required data for training/prediction.
+        Uses training_pipeline.fetch_data_for_crypto() — same as evaluate_calibration.
 
         15m bars are cached in memory: the first call does a full fetch, subsequent
-        calls only fetch the last hour and append — cutting ~10s down to <1s.
+        calls only fetch the last day and append — cutting ~10s down to <1s.
+
+        Returns {crypto: {'15m': df, '1m': df}} matching fetch_all_cryptos() format.
         """
         logger.info(f"Collecting data for past {days} days...")
 
-        data = {}
+        all_data: Dict[str, Dict[str, pd.DataFrame]] = {}
         cutoff = _utcnow() - timedelta(days=days)
 
         for crypto in config.CRYPTOCURRENCIES:
+            crypto_data: Dict[str, pd.DataFrame] = {'15m': pd.DataFrame(), '1m': pd.DataFrame()}
+
+            # 15m bars with caching
             try:
                 cached = self._bar_cache.get(crypto)
                 if cached is not None and not cached.empty:
-                    # Incremental update: fetch last day, append & deduplicate.
-                    # Drop the last cached bar first — it was likely in-progress
-                    # when cached and its OHLCV may be incomplete.
                     stable_cache = cached.iloc[:-1]
                     fresh = self.data_collector.get_crypto_data(crypto, days=1)
                     if not fresh.empty:
                         combined = pd.concat([stable_cache, fresh], ignore_index=True)
                         combined = combined.drop_duplicates(subset='datetime', keep='last')
                         combined = combined.sort_values('datetime').reset_index(drop=True)
-                        # Trim to requested window
                         combined = combined[combined['datetime'] >= cutoff].reset_index(drop=True)
                         self._bar_cache[crypto] = combined
-                        data[crypto] = combined
+                        crypto_data['15m'] = combined
                         logger.info(f"Updated {crypto}: {len(combined)} bars (incremental)")
                     else:
-                        # Fresh fetch failed — use stable cache (without incomplete bar)
                         logger.warning(f"Incremental fetch failed for {crypto}, using cached data")
-                        data[crypto] = stable_cache[stable_cache['datetime'] >= cutoff].reset_index(drop=True)
+                        crypto_data['15m'] = stable_cache[stable_cache['datetime'] >= cutoff].reset_index(drop=True)
                 else:
-                    # Cold start: full fetch
-                    crypto_data = self.data_collector.get_crypto_data(crypto, days=days)
-                    if not crypto_data.empty:
-                        self._bar_cache[crypto] = crypto_data
-                        data[crypto] = crypto_data
-                        logger.info(f"Collected {len(crypto_data)} records for {crypto}")
+                    df = self.data_collector.get_crypto_data(crypto, days=days)
+                    if not df.empty:
+                        self._bar_cache[crypto] = df
+                        crypto_data['15m'] = df
+                        logger.info(f"Collected {len(df)} records for {crypto}")
                     else:
                         logger.warning(f"No data collected for {crypto}")
             except Exception as e:
                 logger.error(f"Failed to collect data for {crypto}: {e}")
-                # Fall back to cache (drop last potentially incomplete bar)
                 if crypto in self._bar_cache and not self._bar_cache[crypto].empty:
-                    data[crypto] = self._bar_cache[crypto].iloc[:-1]
+                    crypto_data['15m'] = self._bar_cache[crypto].iloc[:-1]
 
+            # 1m bars (only 1 day needed for live prediction — intrabar features
+            # are per-bar aggregations, only the most recent bar matters)
             try:
-                # Only need ~1 day of 1m bars — intrabar features are per-bar
-                # aggregations, and we only predict from the most recent bar.
-                data_1m = self.data_collector.get_crypto_data_1m(crypto, days=1)
-                if not data_1m.empty:
-                    data[f'{crypto}_1m'] = data_1m
-                    logger.info(f"Collected {len(data_1m)} 1m bars for {crypto}")
+                df_1m = self.data_collector.get_crypto_data_1m(crypto, days=1)
+                if not df_1m.empty:
+                    crypto_data['1m'] = df_1m
+                    logger.info(f"Collected {len(df_1m)} 1m bars for {crypto}")
             except Exception as e:
                 logger.warning(f"1m data fetch failed for {crypto}: {e}")
 
-        return data
-    
-    def prepare_features_for_all_cryptos(self, raw_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+            all_data[crypto] = crypto_data
+
+        return all_data
+
+    def prepare_features_for_all_cryptos(self, raw_data: Dict[str, Dict[str, pd.DataFrame]]) -> Dict[str, pd.DataFrame]:
         """
-        Prepare features for all cryptocurrencies independently (per-crypto, no cross-asset).
-        Matches the evaluate_calibration.py pipeline: 15m bars + 1m intrabar only.
+        Prepare features using training_pipeline.prepare_features_for_crypto()
+        — same function evaluate_calibration.py and train_optimal_models.py use.
         """
         logger.info("Preparing features for all cryptocurrencies...")
 
         prepared_data = {}
-        for crypto in config.CRYPTOCURRENCIES:
-            if crypto not in raw_data or raw_data[crypto].empty:
+        for crypto, data in raw_data.items():
+            df_15m = data.get('15m', pd.DataFrame())
+            if df_15m.empty:
                 continue
             try:
-                df_1m = raw_data.get(f'{crypto}_1m', pd.DataFrame())
-                external_data = {'intrabar_1m': df_1m if not df_1m.empty else None}
-                features_df = self.feature_engineer.prepare_features(
-                    raw_data[crypto],
-                    external_data=external_data,
+                features_df = prepare_features_for_crypto(
+                    self.feature_engineer, df_15m, data.get('1m')
                 )
                 prepared_data[crypto] = features_df
                 logger.info(f"{crypto}: {features_df.shape[1]} features, {len(features_df)} bars")
@@ -448,10 +451,11 @@ class CryptoPredictionBot:
         os.makedirs('candle_plots', exist_ok=True)
 
         for crypto in config.CRYPTOCURRENCIES:
-            if crypto not in raw_data or raw_data[crypto].empty:
+            df_15m = raw_data.get(crypto, {}).get('15m', pd.DataFrame())
+            if df_15m.empty:
                 continue
 
-            df = raw_data[crypto].copy()
+            df = df_15m.copy()
             df['datetime'] = pd.to_datetime(df['datetime'])
             df = df.sort_values('datetime').tail(n_bars).reset_index(drop=True)
 

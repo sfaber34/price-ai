@@ -2,18 +2,14 @@
 """
 Calibration diagnostic: trains on historical data, evaluates on a held-out period.
 
-Gives thousands of out-of-sample predictions in minutes rather than waiting
-weeks for live evaluation. Shows whether:
-  1. The model has any directional edge at all
-  2. Confidence correlates with accuracy (calibration works)
-  3. Which horizons are most predictable
+Uses the SAME training_pipeline module as the production bot and trainer —
+if you change how data is fetched, features are built, or models are trained,
+it automatically takes effect here too.
 
 Usage:
     python3 evaluate_calibration.py
 """
-import sys
 import numpy as np
-import pandas as pd
 import logging
 
 logging.disable(logging.CRITICAL)  # suppress training noise
@@ -21,7 +17,12 @@ logging.disable(logging.CRITICAL)  # suppress training noise
 import config
 from data_collector import DataCollector
 from feature_engineering import FeatureEngineer
-from ml_predictor import CryptoPredictionModel
+from training_pipeline import (
+    fetch_data_for_crypto,
+    prepare_features_for_crypto,
+    train_model,
+    predict_proba_batch,
+)
 
 TRAIN_DAYS = 180   # days used to train the diagnostic model
 TEST_DAYS  = 90    # held-out period — model never sees this during training
@@ -35,21 +36,20 @@ def calibration_report(probs: np.ndarray, actuals: np.ndarray, horizon: str):
     overall_acc = correct.mean()
     edge        = overall_acc - 0.50
 
-    sign = '▲' if edge >= 0 else '▼'
+    sign = '\u25B2' if edge >= 0 else '\u25BC'
     print(f"\n  [{horizon.upper()}]  n={n_total}  "
           f"overall accuracy={overall_acc:.1%}  "
           f"{sign} {abs(edge):.1%} edge vs random")
 
-    # Confidence distribution — how often is the model decisive?
     pct_high = (confidences >= 0.60).mean()
-    print(f"          confidence ≥0.60 on {pct_high:.0%} of predictions")
+    print(f"          confidence \u22650.60 on {pct_high:.0%} of predictions")
 
     bins   = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 1.01]
-    labels = ['0.50–0.55', '0.55–0.60', '0.60–0.65',
-              '0.65–0.70', '0.70–0.75', '0.75–0.80', '0.80+   ']
+    labels = ['0.50\u20130.55', '0.55\u20130.60', '0.60\u20130.65',
+              '0.65\u20130.70', '0.70\u20130.75', '0.75\u20130.80', '0.80+   ']
 
     print(f"\n  {'Confidence':>11}  {'n':>5}  {'Accuracy':>8}  {'Edge':>8}  Signal")
-    print(f"  {'─'*55}")
+    print(f"  {'\u2500'*55}")
 
     any_bucket = False
     for lo, hi, label in zip(bins[:-1], bins[1:], labels):
@@ -60,13 +60,13 @@ def calibration_report(probs: np.ndarray, actuals: np.ndarray, horizon: str):
         any_bucket = True
         acc  = float(correct[mask].mean())
         edge = acc - 0.50
-        bar  = '█' * int(abs(edge) * 100) if abs(edge) >= 0.01 else '·'
+        bar  = '\u2588' * int(abs(edge) * 100) if abs(edge) >= 0.01 else '\u00B7'
         sign = '+' if edge >= 0 else ''
         print(f"  {label}  {n:>5}  {acc:>8.1%}  {sign}{edge:.1%}     {bar}")
 
     if not any_bucket:
-        print("  (all predictions in 0.50–0.55 bucket — model sees no signal)")
-        print("  → features are not predictive for this horizon")
+        print("  (all predictions in 0.50\u20130.55 bucket \u2014 model sees no signal)")
+        print("  \u2192 features are not predictive for this horizon")
 
 
 def main():
@@ -77,37 +77,36 @@ def main():
     print("  Goal         : does confidence correlate with accuracy?")
     print("="*60)
 
-    collector  = DataCollector()
-    fe         = FeatureEngineer()
+    collector = DataCollector()
+    fe        = FeatureEngineer()
     total_days = TRAIN_DAYS + TEST_DAYS + 5
 
     for crypto in config.CRYPTOCURRENCIES:
-        print(f"\n{'─'*60}")
+        print(f"\n{'\u2500'*60}")
         print(f"  {crypto.upper()}")
-        print(f"{'─'*60}")
+        print(f"{'\u2500'*60}")
 
-        raw = collector.get_crypto_data(crypto, days=total_days)
-        if raw.empty:
-            print("  No data available.")
+        # Fetch data — same function the bot and trainer use
+        print("  Fetching data\u2026", end='', flush=True)
+        raw = fetch_data_for_crypto(collector, crypto, days=total_days)
+        df_15m = raw['15m']
+        df_1m  = raw['1m']
+        if df_15m.empty:
+            print(" no data available.")
             continue
+        print(f" {len(df_15m)} 15m bars, {len(df_1m)} 1m bars")
 
-        print("  Fetching 1m intrabar data…", end='', flush=True)
-        df_1m = collector.get_crypto_data_1m(crypto, days=total_days)
-        if df_1m.empty:
-            print(" not available (intrabar features skipped)")
-        else:
-            print(f" {len(df_1m)} bars")
-
-        print("  Preparing features…", end='', flush=True)
-        df = fe.prepare_features(raw, external_data={'intrabar_1m': df_1m if not df_1m.empty else None})
+        # Prepare features — same function the bot and trainer use
+        print("  Preparing features\u2026", end='', flush=True)
+        df = prepare_features_for_crypto(fe, df_15m, df_1m)
         df = df.sort_values('datetime').reset_index(drop=True)
-        print(f" {len(df)} bars")
+        print(f" {len(df)} bars, {df.shape[1]} columns")
 
-        n_train = TRAIN_DAYS * 24 * 4   # 15m bars per day
+        n_train = TRAIN_DAYS * 24 * 4
         n_test  = TEST_DAYS  * 24 * 4
 
         if len(df) < n_train + 200:
-            print(f"  Insufficient data ({len(df)} bars, need ≥{n_train + 200})")
+            print(f"  Insufficient data ({len(df)} bars, need \u2265{n_train + 200})")
             continue
 
         train_df = df.iloc[:n_train].copy()
@@ -115,52 +114,30 @@ def main():
         print(f"  Train: {len(train_df)} bars  |  Test: {len(test_df)} bars")
 
         for horizon in config.PREDICTION_INTERVALS:
-            target_col = f'target_direction_{horizon}'
-
-            print(f"\n  Training {horizon}…", end='', flush=True)
-            model = CryptoPredictionModel(crypto, horizon)
+            print(f"\n  Training {horizon}\u2026", end='', flush=True)
             try:
-                model.train(train_df)
+                # Train — same function the bot and trainer use
+                model = train_model(crypto, horizon, train_df)
             except Exception as e:
                 print(f" FAILED: {e}")
                 continue
             print(" done", end='', flush=True)
 
             try:
-                # Vectorised evaluation — no bar-by-bar loop needed
-                X_test, y_test = model.prepare_data(test_df, target_col)
-                if len(X_test) < 20:
-                    print(f"\n  [{horizon}] Too few test samples ({len(X_test)})")
+                # Predict — same function used everywhere
+                probs, actuals = predict_proba_batch(model, test_df, horizon)
+                if len(probs) < 20:
+                    print(f"\n  [{horizon}] Too few test samples ({len(probs)})")
                     continue
-
-                selector   = model.feature_selectors[f"{horizon}_selector"]
-                scaler     = model.scalers[f"{horizon}_scaler"]
-                classifier = model.models[f"{horizon}_xgb_classifier"]
-
-                X_sel = pd.DataFrame(
-                    selector.transform(X_test),
-                    columns=X_test.columns[selector.get_support()],
-                    index=X_test.index,
-                )
-                X_scaled = pd.DataFrame(
-                    scaler.transform(X_sel),
-                    columns=X_sel.columns,
-                    index=X_sel.index,
-                )
-
-                probs   = classifier.predict_proba(X_scaled)[:, 1]
-                actuals = (y_test > 0).astype(int).values
-
                 calibration_report(probs, actuals, horizon)
-
             except Exception as e:
                 print(f"\n  [{horizon}] Evaluation error: {e}")
 
     print("\n" + "="*60)
     print("  HOW TO READ THIS:")
-    print("  • Overall accuracy >52% sustained = genuine edge")
-    print("  • Accuracy rising with confidence = calibration works")
-    print("  • All predictions in 0.50–0.55 = no signal, wrong features")
+    print("  \u2022 Overall accuracy >52% sustained = genuine edge")
+    print("  \u2022 Accuracy rising with confidence = calibration works")
+    print("  \u2022 All predictions in 0.50\u20130.55 = no signal, wrong features")
     print("="*60 + "\n")
 
 

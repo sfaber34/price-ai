@@ -149,7 +149,6 @@ class CryptoPredictionModel:
              base model so that predict_proba() outputs genuine probabilities that
              correlate with empirical accuracy rather than raw XGBoost scores.
         """
-        from sklearn.calibration import CalibratedClassifierCV
         from sklearn.dummy import DummyClassifier
 
         # ── Convert target ───────────────────────────────────────────────────
@@ -240,47 +239,30 @@ class CryptoPredictionModel:
         except Exception as cv_err:
             logger.warning(f"CV failed ({cv_err}), reporting 0.5 fallback")
 
-        # ── Step 3: Calibrated final model ───────────────────────────────────
-        cal_folds = max(2, min(config.MODEL_SETTINGS.get('calibration_folds', 3), max_folds))
+        # ── Step 3: Train final model (plain XGBoost, no calibration wrapper) ─
+        # CalibratedClassifierCV was removed: with weak signal and a ~54% base
+        # rate it compresses the output distribution so tightly around the prior
+        # that the model predicts UP 95%+ of the time.  Raw XGBoost predict_proba
+        # already produces well-behaved probabilities for binary:logistic and
+        # evaluate_calibration.py confirms good calibration without the wrapper.
         model_type = 'dummy_classifier'
         feature_importance: Dict = {}
         accuracy = float(max(class_counts)) / len(y_binary)
 
         try:
-            base_model = xgb.XGBClassifier(**final_params)
-            tscv_cal = TimeSeriesSplit(n_splits=cal_folds)
-            model = CalibratedClassifierCV(base_model, cv=tscv_cal, method='isotonic')
+            model = xgb.XGBClassifier(**final_params)
             model.fit(X, y_binary)
-
-            # Average feature importances across the calibrated sub-estimators
-            importances = [
-                cc.estimator.feature_importances_
-                for cc in model.calibrated_classifiers_
-                if hasattr(cc.estimator, 'feature_importances_')
-            ]
-            if importances:
-                feature_importance = dict(zip(X.columns, np.mean(importances, axis=0)))
-
             y_pred = model.predict(X)
             accuracy = float(accuracy_score(y_binary, y_pred))
-            model_type = 'calibrated_xgb'
-
-        except Exception as cal_err:
-            logger.error(f"Calibrated model failed ({cal_err}), falling back to plain XGBoost")
-            try:
-                model = xgb.XGBClassifier(**final_params)
-                model.fit(X, y_binary)
-                y_pred = model.predict(X)
-                accuracy = float(accuracy_score(y_binary, y_pred))
-                feature_importance = dict(zip(X.columns, model.feature_importances_))
-                model_type = 'xgb_classifier'
-            except Exception as plain_err:
-                logger.error(f"Plain XGBoost also failed ({plain_err}), using dummy classifier")
-                model = DummyClassifier(strategy='most_frequent')
-                model.fit(X, y_binary)
-                y_pred = model.predict(X)
-                accuracy = float(accuracy_score(y_binary, y_pred))
-                feature_importance = {col: 0.0 for col in X.columns}
+            feature_importance = dict(zip(X.columns, model.feature_importances_))
+            model_type = 'xgb_classifier'
+        except Exception as plain_err:
+            logger.error(f"XGBoost training failed ({plain_err}), using dummy classifier")
+            model = DummyClassifier(strategy='most_frequent')
+            model.fit(X, y_binary)
+            y_pred = model.predict(X)
+            accuracy = float(accuracy_score(y_binary, y_pred))
+            feature_importance = {col: 0.0 for col in X.columns}
 
         self.models[f"{self.prediction_horizon}_xgb_classifier"] = model
 

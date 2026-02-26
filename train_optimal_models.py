@@ -1,6 +1,9 @@
 """
 Backtesting script for crypto price prediction models
 Trains on historical data, makes predictions, and evaluates against known future prices
+
+All data fetching, feature prep, and model training goes through training_pipeline.py
+— the same code evaluate_calibration.py and the live bot use.
 """
 import pandas as pd
 import numpy as np
@@ -10,11 +13,17 @@ from typing import Dict, List, Tuple
 import json
 import sys
 import argparse
+import os
 
+import config
 from data_collector import DataCollector
 from feature_engineering import FeatureEngineer
-from ml_predictor import EnsemblePredictionEngine
-import config
+from ml_predictor import CryptoPredictionModel
+from training_pipeline import (
+    fetch_all_cryptos,
+    prepare_all_cryptos,
+    train_model,
+)
 
 # Set up logging
 logging.basicConfig(
@@ -27,180 +36,93 @@ class CryptoBacktester:
     def __init__(self):
         self.data_collector = DataCollector()
         self.feature_engineer = FeatureEngineer()
-        self.prediction_engine = EnsemblePredictionEngine()
-        
-    def collect_backtest_data(self, days: int = 180) -> Dict[str, pd.DataFrame]:
-        """
-        Collect extended historical data for backtesting
-        """
-        logger.info(f"Collecting {days} days of historical data for backtesting...")
 
-        data = {}
+    def collect_and_prepare(self, days: int) -> Dict[str, pd.DataFrame]:
+        """Fetch data and prepare features using the shared pipeline."""
+        raw = fetch_all_cryptos(self.data_collector, days=days)
+        return prepare_all_cryptos(self.feature_engineer, raw)
 
-        # Collect crypto OHLCV data
-        for crypto in config.CRYPTOCURRENCIES:
-            try:
-                crypto_data = self.data_collector.get_crypto_data(crypto, days=days)
-                if not crypto_data.empty:
-                    data[crypto] = crypto_data
-                    logger.info(f"Collected {len(crypto_data)} records for {crypto}")
-                else:
-                    logger.warning(f"No data collected for {crypto}")
-            except Exception as e:
-                logger.error(f"Failed to collect data for {crypto}: {e}")
-
-        # Fetch 1m bars for intrabar features
-        for crypto in config.CRYPTOCURRENCIES:
-            try:
-                data_1m = self.data_collector.get_crypto_data_1m(crypto, days=days)
-                if not data_1m.empty:
-                    data[f'{crypto}_1m'] = data_1m
-                    logger.info(f"Collected {len(data_1m)} 1m bars for {crypto}")
-            except Exception as e:
-                logger.warning(f"1m data fetch failed for {crypto}: {e}")
-
-        return data
-    
-    def prepare_features_for_backtest(self, raw_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-        """
-        Prepare features for all cryptocurrencies independently (per-crypto, no cross-asset).
-        Matches the evaluate_calibration.py pipeline: 15m bars + 1m intrabar only.
-        """
-        logger.info("Preparing features for backtesting...")
-
-        prepared_data = {}
-        for crypto in config.CRYPTOCURRENCIES:
-            if crypto not in raw_data or raw_data[crypto].empty:
-                continue
-            try:
-                df_1m = raw_data.get(f'{crypto}_1m', pd.DataFrame())
-                external_data = {'intrabar_1m': df_1m if not df_1m.empty else None}
-                features_df = self.feature_engineer.prepare_features(
-                    raw_data[crypto],
-                    external_data=external_data,
-                )
-                if not features_df.empty:
-                    prepared_data[crypto] = features_df
-                    logger.info(f"Backtest {crypto}: {features_df.shape[1]} features, {len(features_df)} bars")
-                else:
-                    logger.warning(f"No features prepared for {crypto}")
-            except Exception as e:
-                logger.error(f"Feature preparation failed for {crypto}: {e}")
-
-        return prepared_data
-    
-    def create_time_splits(self, data: pd.DataFrame, train_days: int = 30, 
-                          step_days: int = 7, min_future_days: int = 2) -> List[Tuple[int, int]]:
+    def create_time_splits(self, data: pd.DataFrame, train_days: int = 30,
+                          step_days: int = 7, min_future_days: int = 2) -> List[Tuple[int, int, int]]:
         """
         Create time-based train/test splits for backtesting
-        
-        Args:
-            data: DataFrame with datetime index
-            train_days: Days of data to use for training
-            step_days: Days to step forward between tests
-            min_future_days: Minimum days needed for future predictions
-        
-        Returns:
-            List of (train_end_idx, test_start_idx) tuples
         """
         data = data.sort_values('datetime').reset_index(drop=True)
         total_records = len(data)
-        
-        # Calculate indices for splits (15-minute intervals: 4 per hour, 96 per day)
+
+        # 15-minute intervals: 4 per hour, 96 per day
         train_records = int(train_days * 24 * 4)
         step_records = int(step_days * 24 * 4)
         min_future_records = int(min_future_days * 24 * 4)
-        
+
         splits = []
-        
-        # Start after we have enough training data
         current_train_end = train_records
-        
+
         while current_train_end + min_future_records < total_records:
             train_start = max(0, current_train_end - train_records)
             train_end = current_train_end
             test_start = current_train_end
-            
             splits.append((train_start, train_end, test_start))
             current_train_end += step_records
-        
+
         logger.info(f"Created {len(splits)} time splits for backtesting")
         return splits
-    
-    def evaluate_predictions_at_split(self, data: pd.DataFrame, train_start: int, 
+
+    def evaluate_predictions_at_split(self, data: pd.DataFrame, train_start: int,
                                     train_end: int, test_start: int, crypto: str) -> Dict:
         """
         Train model on historical data and evaluate predictions against known future
         """
         try:
-            # Split data
             train_data = data.iloc[train_start:train_end].copy()
-            
-            # Minimum data validation
-            if len(train_data) < 50:  # Need at least 50 samples for reliable training
-                logger.warning(f"Insufficient training data: {len(train_data)} samples (minimum 50 required)")
+
+            if len(train_data) < 50:
+                logger.warning(f"Insufficient training data: {len(train_data)} samples")
                 return {}
-            
-            # Check for sufficient price variation
+
             price_range = train_data['price'].max() - train_data['price'].min()
             if price_range == 0:
                 logger.warning("No price variation in training data")
                 return {}
-            
-            # Get the prediction timestamp (start of test period)
+
             prediction_time = data.iloc[test_start]['datetime']
-            
-            # Find future bar data for evaluation (15-minute intervals: 4 per hour)
+
             # Polymarket-style: compare bar close vs bar open of the target bar
             future_prices = {}
             future_opens = {}
             _horizon_offsets = {'15m': 1, '1h': 4, '4h': 16}
             for horizon in config.PREDICTION_INTERVALS:
                 future_idx = test_start + _horizon_offsets.get(horizon, 1)
-
                 if future_idx < len(data):
-                    future_prices[horizon] = data.iloc[future_idx]['price']   # close of target bar
-                    future_opens[horizon] = data.iloc[future_idx]['open']     # open of target bar
+                    future_prices[horizon] = data.iloc[future_idx]['price']
+                    future_opens[horizon] = data.iloc[future_idx]['open']
                 else:
                     future_prices[horizon] = None
                     future_opens[horizon] = None
-            
-            # Train models on truncated data
+
             results = {}
             for horizon in config.PREDICTION_INTERVALS:
                 if future_prices.get(horizon) is None:
                     continue
-                
-                model_key = f"{crypto}_{horizon}"
-                
-                # Create or get model
-                if model_key not in self.prediction_engine.models:
-                    self.prediction_engine.add_model(crypto, horizon)
-                
+
+                target_col = f'target_direction_{horizon}'
+                if target_col in train_data.columns:
+                    unique_targets = train_data[target_col].nunique()
+                    if unique_targets < 2:
+                        logger.warning(f"Insufficient target variation for {horizon}")
+                        continue
+
                 try:
-                    # Train on truncated data with error handling
-                    model = self.prediction_engine.models[model_key]
-                    
-                    # Check target variable distribution before training
-                    target_col = f'target_direction_{horizon}'
-                    if target_col in train_data.columns:
-                        unique_targets = train_data[target_col].nunique()
-                        if unique_targets < 2:
-                            logger.warning(f"Insufficient target variation for {horizon}: {unique_targets} unique values")
-                            continue
-                    
-                    model.train(train_data)
-                    
-                    # Make prediction
+                    # Train using shared pipeline
+                    model = train_model(crypto, horizon, train_data)
                     prediction = model.predict(train_data)
-                    
+
                     if prediction:
                         current_price = train_data.iloc[-1]['price']
                         actual_future_price = future_prices[horizon]
                         actual_future_open = future_opens[horizon]
 
-                        # Direction evaluation — Polymarket-style: close >= open of target bar
-                        predicted_direction = prediction['predicted_direction']  # 1=UP, 0=DOWN
+                        predicted_direction = prediction['predicted_direction']
                         actual_direction = 1 if actual_future_price >= actual_future_open else 0
                         direction_correct = int(predicted_direction == actual_direction)
 
@@ -216,245 +138,161 @@ class CryptoBacktester:
                             'horizon': horizon,
                             'training_samples': len(train_data)
                         }
-                    
+
                 except Exception as model_error:
                     logger.warning(f"Model training/prediction failed for {crypto}-{horizon}: {model_error}")
                     continue
-            
+
             return results
-            
+
         except Exception as e:
             logger.error(f"Evaluation failed at split: {e}")
             return {}
-    
-    def run_backtest(self, days: int = 180, train_days: int = 90, 
+
+    def run_backtest(self, days: int = 180, train_days: int = 90,
                     step_days: int = 7) -> Dict:
-        """
-        Run full backtesting process
-        """
+        """Run full backtesting process"""
         logger.info("Starting comprehensive backtest...")
-        
-        # Collect historical data
-        raw_data = self.collect_backtest_data(days)
-        
-        # Prepare features
-        prepared_data = self.prepare_features_for_backtest(raw_data)
-        
-        # Run backtests for each crypto
+
+        prepared_data = self.collect_and_prepare(days)
+
         all_results = {}
-        
         for crypto in config.CRYPTOCURRENCIES:
             if crypto not in prepared_data:
                 logger.warning(f"No prepared data for {crypto}, skipping")
                 continue
-            
+
             logger.info(f"Running backtest for {crypto}...")
-            
             data = prepared_data[crypto]
             splits = self.create_time_splits(data, train_days, step_days)
-            
+
             crypto_results = []
-            
             for i, (train_start, train_end, test_start) in enumerate(splits):
                 logger.info(f"Processing split {i+1}/{len(splits)} for {crypto}")
-                
                 split_results = self.evaluate_predictions_at_split(
                     data, train_start, train_end, test_start, crypto
                 )
-                
                 if split_results:
                     crypto_results.append(split_results)
-            
+
             all_results[crypto] = crypto_results
             logger.info(f"Completed {len(crypto_results)} backtests for {crypto}")
-        
+
         return all_results
-    
+
     def run_training_optimization(self, days: int = 180, runs_per_window: int = 20) -> Dict:
         """
         Run backtest experiment with different training window sizes
-        
-        Args:
-            days: Total days of historical data to collect
-            runs_per_window: Number of backtest runs per training window size
-        
-        Returns:
-            Dict with results organized by training window size
         """
         logger.info("Starting training window size experiment...")
-        
-        # Define training window sizes (in days).
-        # Binance provides years of 15m history — use large windows to find what trains best.
+
         training_windows = {
-            '1_month':  30,   # 1 month  =  2 880 15m bars
-            '2_months': 60,   # 2 months =  5 760 15m bars
-            '3_months': 90,   # 3 months =  8 640 15m bars
-            '6_months': 180,  # 6 months = 17 280 15m bars
-            '9_months': 270,  # 9 months = 25 920 15m bars
-            '1_year':   365,  # 1 year   = 35 040 15m bars
+            '1_month':  30,
+            '2_months': 60,
+            '3_months': 90,
+            '6_months': 180,
+            '9_months': 270,
+            '1_year':   365,
         }
-        
-        # Collect historical data once — reused by both the experiment and production training
-        raw_data = self.collect_backtest_data(days)
-        prepared_data = self.prepare_features_for_backtest(raw_data)
-        self._last_prepared_data = prepared_data  # stash for caller to reuse
-        
-        # Results organized by training window size
+
+        # Collect and prepare once — reused for all experiments and production training
+        prepared_data = self.collect_and_prepare(days)
+        self._last_prepared_data = prepared_data
+
         experiment_results = {}
-        
-        # Calculate total number of runs across all windows and cryptos
-        available_cryptos = [crypto for crypto in config.CRYPTOCURRENCIES if crypto in prepared_data]
+        available_cryptos = [c for c in config.CRYPTOCURRENCIES if c in prepared_data]
         total_runs = len(training_windows) * len(available_cryptos) * runs_per_window
         current_run = 0
-        
-        # Track progress through training windows
         total_windows = len(training_windows)
         current_window = 0
-        
+
         for window_name, window_days in training_windows.items():
             current_window += 1
             logger.info(f"\n{'='*60}")
             logger.info(f"Testing training window {current_window}/{total_windows}: {window_name.upper()} ({window_days} days)")
             logger.info(f"{'='*60}")
-            
+
             experiment_results[window_name] = {}
-            
+
             for crypto in config.CRYPTOCURRENCIES:
                 if crypto not in prepared_data:
-                    logger.warning(f"No prepared data for {crypto}, skipping")
                     continue
-                
+
                 logger.info(f"Running {window_name} experiment for {crypto}...")
-                
                 data = prepared_data[crypto]
-                
-                # Create splits for this window size, step by 1 day to get more samples
                 splits = self.create_time_splits(data, window_days, step_days=1, min_future_days=2)
-                
-                # Limit to requested number of runs
+
                 if len(splits) > runs_per_window:
-                    # Take evenly spaced splits across the time range
                     step = len(splits) // runs_per_window
                     splits = splits[::step][:runs_per_window]
-                
+
                 crypto_results = []
-                
                 for i, (train_start, train_end, test_start) in enumerate(splits):
                     current_run += 1
-                    logger.info(f"Run {current_run}/{total_runs}: Processing {window_name} split {i+1}/{len(splits)} for {crypto}")
-                    
+                    logger.info(f"Run {current_run}/{total_runs}: {window_name} split {i+1}/{len(splits)} for {crypto}")
                     split_results = self.evaluate_predictions_at_split(
                         data, train_start, train_end, test_start, crypto
                     )
-                    
                     if split_results:
                         crypto_results.append(split_results)
-                
+
                 experiment_results[window_name][crypto] = crypto_results
                 logger.info(f"Completed {len(crypto_results)} {window_name} backtests for {crypto}")
-        
+
         return experiment_results
-    
+
     def analyze_backtest_results(self, results: Dict) -> Dict:
-        """
-        Analyze and summarize backtest results
-        """
-        logger.info("Analyzing backtest results...")
-        
+        """Analyze and summarize backtest results"""
         analysis = {}
-        
         for crypto, crypto_results in results.items():
             if not crypto_results:
                 continue
-            
             crypto_analysis = {}
-            
-            # Analyze by horizon
             for horizon in config.PREDICTION_INTERVALS:
-                horizon_data = []
-                
-                for split_result in crypto_results:
-                    if horizon in split_result:
-                        horizon_data.append(split_result[horizon])
-                
+                horizon_data = [sr[horizon] for sr in crypto_results if horizon in sr]
                 if horizon_data:
-                    direction_accuracy = [x['direction_correct'] for x in horizon_data]
-                    confidences = [x['confidence'] for x in horizon_data]
-
                     crypto_analysis[horizon] = {
                         'total_predictions': len(horizon_data),
-                        'direction_accuracy': np.mean(direction_accuracy),
-                        'avg_confidence': np.mean(confidences),
+                        'direction_accuracy': np.mean([x['direction_correct'] for x in horizon_data]),
+                        'avg_confidence': np.mean([x['confidence'] for x in horizon_data]),
                     }
-            
             analysis[crypto] = crypto_analysis
-        
         return analysis
-    
+
     def analyze_training_optimization(self, results: Dict) -> Dict:
-        """
-        Analyze training window experiment results
-        """
-        logger.info("Analyzing training window experiment results...")
-        
+        """Analyze training window experiment results"""
         analysis = {}
-        
         for window_name, window_data in results.items():
             window_analysis = {}
-            
             for crypto, crypto_results in window_data.items():
                 if not crypto_results:
                     continue
-                
                 crypto_analysis = {}
-                
-                # Analyze by horizon
                 for horizon in config.PREDICTION_INTERVALS:
-                    horizon_data = []
-                    
-                    for split_result in crypto_results:
-                        if horizon in split_result:
-                            horizon_data.append(split_result[horizon])
-                    
+                    horizon_data = [sr[horizon] for sr in crypto_results if horizon in sr]
                     if horizon_data:
-                        direction_accuracy = [x['direction_correct'] for x in horizon_data]
-                        confidences = [x['confidence'] for x in horizon_data]
-
                         crypto_analysis[horizon] = {
                             'total_predictions': len(horizon_data),
-                            'direction_accuracy': np.mean(direction_accuracy),
-                            'std_direction_accuracy': np.std(direction_accuracy),
-                            'avg_confidence': np.mean(confidences),
+                            'direction_accuracy': np.mean([x['direction_correct'] for x in horizon_data]),
+                            'std_direction_accuracy': np.std([x['direction_correct'] for x in horizon_data]),
+                            'avg_confidence': np.mean([x['confidence'] for x in horizon_data]),
                         }
-                
                 window_analysis[crypto] = crypto_analysis
-            
             analysis[window_name] = window_analysis
-        
         return analysis
-    
+
     def display_training_window_results(self, analysis: Dict):
-        """
-        Display training window experiment results in a comprehensive format
-        """
+        """Display training window experiment results"""
         print("\n" + "="*100)
-        print("🧪 TRAINING WINDOW SIZE EXPERIMENT RESULTS")
+        print("TRAINING WINDOW SIZE EXPERIMENT RESULTS")
         print("="*100)
-        
-        # Create summary table for each crypto and horizon
+
         for crypto in ['bitcoin', 'ethereum']:
-            if crypto == 'bitcoin':
-                crypto_emoji = "₿"
-            elif crypto == 'ethereum':
-                crypto_emoji = "♦️"
-            else:
-                crypto_emoji = "📈"
-            
-            print(f"\n{crypto_emoji} {crypto.upper()} - TRAINING WINDOW ANALYSIS")
+            print(f"\n  {crypto.upper()} - TRAINING WINDOW ANALYSIS")
             print("="*90)
-            
+
             for horizon in config.PREDICTION_INTERVALS:
-                print(f"\n📊 {horizon.upper()} PREDICTIONS")
+                print(f"\n  {horizon.upper()} PREDICTIONS")
                 print("-" * 75)
                 print(f"{'Window':>12} | {'Count':>5} | {'Dir Acc':>7} | {'Std Acc':>7} | {'Conf':>6}")
                 print("-" * 55)
@@ -463,98 +301,61 @@ class CryptoBacktester:
                     if (window_name in analysis and
                         crypto in analysis[window_name] and
                         horizon in analysis[window_name][crypto]):
-
                         stats = analysis[window_name][crypto][horizon]
                         display_name = window_name.replace('_', ' ').title()
-
                         print(f"{display_name:>12} | "
                               f"{stats['total_predictions']:>5} | "
                               f"{stats['direction_accuracy']*100:>5.1f}% | "
                               f"{stats['std_direction_accuracy']*100:>5.1f}% | "
                               f"{stats['avg_confidence']*100:>4.0f}%")
-        
-        # Summary insights
+
         print("\n" + "="*100)
-        print("💡 KEY INSIGHTS")
+        print("KEY INSIGHTS")
         print("="*100)
-        
-        # Find optimal training windows
+
         for crypto in ['bitcoin', 'ethereum']:
-            if crypto == 'bitcoin':
-                crypto_emoji = "₿"
-            else:
-                crypto_emoji = "♦️"
-
-            print(f"\n{crypto_emoji} {crypto.upper()} OPTIMAL TRAINING WINDOWS:")
-
+            print(f"\n  {crypto.upper()} OPTIMAL TRAINING WINDOWS:")
             for horizon in config.PREDICTION_INTERVALS:
                 best_window = None
                 best_accuracy = 0.0
-
                 for window_name in ['1_month', '2_months', '3_months', '6_months', '9_months', '1_year']:
                     if (window_name in analysis and
                         crypto in analysis[window_name] and
                         horizon in analysis[window_name][crypto]):
-
                         accuracy = analysis[window_name][crypto][horizon]['direction_accuracy']
                         if accuracy > best_accuracy:
                             best_accuracy = accuracy
                             best_window = window_name.replace('_', ' ').title()
-
                 if best_window:
-                    print(f"  • {horizon.upper():>2}: {best_window} training window (Dir Acc: {best_accuracy*100:.1f}%)")
-        
+                    print(f"    {horizon.upper():>2}: {best_window} (Dir Acc: {best_accuracy*100:.1f}%)")
+
         print("\n" + "="*100)
-    
+
     def display_backtest_results(self, analysis: Dict):
-        """
-        Display formatted backtest results
-        """
+        """Display formatted backtest results"""
         print("\n" + "="*80)
-        print("🔬 COMPREHENSIVE BACKTEST RESULTS")
+        print("COMPREHENSIVE BACKTEST RESULTS")
         print("="*80)
-        
+
         for crypto, crypto_analysis in analysis.items():
-            if crypto == 'bitcoin':
-                crypto_emoji = "₿"
-            elif crypto == 'ethereum':
-                crypto_emoji = "♦️"
-            else:
-                crypto_emoji = "📈"
-            
-            print(f"\n{crypto_emoji} {crypto.upper()} BACKTEST ANALYSIS")
+            print(f"\n  {crypto.upper()} BACKTEST ANALYSIS")
             print("-" * 60)
             print(f"{'Horizon':>6} | {'Count':>5} | {'Dir Acc':>7} | {'Confidence':>10}")
             print("-" * 42)
-
             for horizon, stats in crypto_analysis.items():
                 print(f"{horizon.upper():>6} | "
                       f"{stats['total_predictions']:>5} | "
                       f"{stats['direction_accuracy']*100:>5.1f}% | "
                       f"{stats['avg_confidence']*100:>8.1f}%")
-        
+
         print("\n" + "="*80)
 
-def train_production_models(backtester: CryptoBacktester, analysis: Dict,
-                            prepared_data: Dict[str, pd.DataFrame]) -> Dict:
+
+def train_production_models(prepared_data: Dict[str, pd.DataFrame]) -> Dict:
     """
     Train final production models on a fixed training window and save them.
-
-    Why a fixed window instead of selecting based on backtest accuracy?
-    The window-selection experiment runs ~50 samples per window size.  Picking
-    the "best" window from those noisy estimates is test-set selection bias —
-    the winner is mostly chosen by luck, and its reported accuracy is inflated.
-    Using a fixed 365-day window (config.MODEL_SETTINGS['production_training_days'])
-    is unbiased, captures recent market regime, and provides enough data for the
-    calibrated XGBoost to learn robust patterns.
-
-    The backtest analysis passed in `analysis` is still printed/saved for
-    informational purposes so you can see which windows generalised best.
-
-    `prepared_data` is passed in from the caller so we do NOT re-fetch or
-    re-engineer features — that work was already done for the backtest run.
+    Uses training_pipeline.train_model() — same code as evaluate_calibration.
     """
-    import os
     os.makedirs('models', exist_ok=True)
 
     production_window_days = config.MODEL_SETTINGS.get('production_training_days', 365)
@@ -572,29 +373,23 @@ def train_production_models(backtester: CryptoBacktester, analysis: Dict,
         production_models[crypto] = {}
         data = prepared_data[crypto]
 
-        # Use the most recent `production_window_days` of data
         n_bars = int(production_window_days * 24 * 4)
         recent_data = data.tail(n_bars).copy()
 
         print(f"\n  {crypto.upper()}: {len(recent_data)} training samples "
-              f"({production_window_days} days × 96 bars/day)")
+              f"({production_window_days} days x 96 bars/day)")
 
         for horizon in config.PREDICTION_INTERVALS:
-            print(f"\n🔧 Training {crypto.upper()} {horizon.upper()}...")
-
-            model_key = f"{crypto}_{horizon}"
-            if model_key not in backtester.prediction_engine.models:
-                backtester.prediction_engine.add_model(crypto, horizon)
-
-            model = backtester.prediction_engine.models[model_key]
+            print(f"\n  Training {crypto.upper()} {horizon.upper()}...")
 
             try:
-                training_info = model.train(recent_data)
-                clf_results = training_info.get('classification_results', {})
+                # Same train_model() that evaluate_calibration uses
+                model = train_model(crypto, horizon, recent_data)
 
                 model_filepath = f"models/{crypto}_{horizon}_production.pkl"
                 model.save_model(model_filepath)
 
+                clf_results = model.training_history[-1].get('classification_results', {})
                 production_models[crypto][horizon] = {
                     'model_path': model_filepath,
                     'training_window': f'{production_window_days}_days_fixed',
@@ -607,97 +402,74 @@ def train_production_models(backtester: CryptoBacktester, analysis: Dict,
 
                 cv_acc = clf_results.get('cv_accuracy_mean', 0.0)
                 n_est = clf_results.get('best_n_estimators', '?')
-                print(f"  ✅ Saved → {model_filepath}  "
+                print(f"    Saved -> {model_filepath}  "
                       f"(CV acc: {cv_acc:.3f}, n_estimators: {n_est})")
 
             except Exception as e:
-                print(f"  ❌ Failed to train {crypto} {horizon}: {e}")
+                print(f"    Failed to train {crypto} {horizon}: {e}")
                 logger.exception(f"Production training failed for {crypto} {horizon}")
 
     with open('models/production_models.json', 'w') as f:
         json.dump(production_models, f, indent=2)
 
-    print(f"\n🎯 Production models saved → models/production_models.json")
+    print(f"\n  Production models saved -> models/production_models.json")
     return production_models
 
+
 def main():
-    """
-    Run the backtesting script
-    """
-    # Parse command line arguments
     parser = argparse.ArgumentParser(description='Crypto Price Prediction Backtester')
     parser.add_argument('--runs', type=int, default=30,
                        help='Number of runs per training window (default: 30)')
     parser.add_argument('--days', type=int, default=730,
-                       help='Days of history for the backtest experiment (default: 730). '
-                            'Production models always train on the most recent '
-                            'production_training_days (config, default 365) of this data.')
+                       help='Days of history for the backtest experiment (default: 730)')
     parser.add_argument('--quick', action='store_true',
-                       help='Quick test mode (3 runs per window)')
+                       help='Quick test mode (1 run per window)')
     parser.add_argument('--skip-backtest', action='store_true',
-                       help='Skip the window-size experiment and go straight to production '
-                            'model training. Much faster (~2 min vs ~30 min).')
+                       help='Skip window-size experiment, go straight to production training')
 
     args = parser.parse_args()
 
     production_window_days = config.MODEL_SETTINGS.get('production_training_days', 180)
     backtester = CryptoBacktester()
 
-    # ------------------------------------------------------------------ #
-    # Fast path: skip the backtest experiment entirely                     #
-    # ------------------------------------------------------------------ #
+    # ---- Fast path: skip backtest, just train production models ----
     if args.skip_backtest:
-        print("🚀 Crypto Model Trainer  (backtest skipped)")
+        print("Crypto Model Trainer  (backtest skipped)")
         print("="*50)
-        print(f"Fetching {production_window_days}d of data for production training…")
+        print(f"Fetching {production_window_days}d of data for production training...")
 
-        raw_data = backtester.collect_backtest_data(days=production_window_days + 5)
-        prepared_data = backtester.prepare_features_for_backtest(raw_data)
-        analysis = {}  # no backtest analysis — only used for display/save
+        prepared_data = backtester.collect_and_prepare(days=production_window_days + 5)
 
-        print("\n🔥 TRAINING PRODUCTION MODELS...")
-        train_production_models(backtester, analysis, prepared_data)
-        print("\n✅ Production model training complete!")
-        print("🤖 Production models saved to models/ directory")
+        print("\nTRAINING PRODUCTION MODELS...")
+        train_production_models(prepared_data)
+        print("\nProduction model training complete!")
+        print("Production models saved to models/ directory")
         return
 
-    # ------------------------------------------------------------------ #
-    # Full path: window-size experiment + production training              #
-    # ------------------------------------------------------------------ #
-    # Set runs based on mode
+    # ---- Full path: window-size experiment + production training ----
     if args.quick:
         runs_per_window = 1
-        print("🚀 Crypto Price Prediction Backtester - QUICK TEST MODE")
+        print("Crypto Price Prediction Backtester - QUICK TEST MODE")
     else:
         runs_per_window = args.runs
-        print("🚀 Crypto Price Prediction Backtester")
+        print("Crypto Price Prediction Backtester")
 
     print("="*50)
     print("Training Window Size Experiment")
     print("="*50)
 
-    # Run training optimization
-    print("🧪 Running training window optimization...")
-    print(f"Testing 6 different training window sizes with {runs_per_window} runs each")
-    print("⚠️  Includes error handling for insufficient data and training failures\n")
+    print(f"Testing 6 different training window sizes with {runs_per_window} runs each\n")
 
     experiment_results = backtester.run_training_optimization(
         days=args.days,
         runs_per_window=runs_per_window
     )
-    # Reuse the data that was already fetched and feature-engineered inside the
-    # experiment — no second download or feature pass needed.
     prepared_data = backtester._last_prepared_data
 
-    # Analyze experiment results
     analysis = backtester.analyze_training_optimization(experiment_results)
-
-    # Display comprehensive results
     backtester.display_training_window_results(analysis)
 
-    # Save detailed results
     with open('optimal_training_results.json', 'w') as f:
-        # Convert numpy types for JSON serialization
         json_analysis = {}
         for window_name, window_data in analysis.items():
             json_analysis[window_name] = {}
@@ -708,20 +480,15 @@ def main():
                         k: float(v) if isinstance(v, (np.floating, np.integer)) else v
                         for k, v in stats.items()
                     }
-
         json.dump(json_analysis, f, indent=2)
 
-    # Train production models on fixed window using already-prepared data
-    # (1m intrabar features already flow through prepare_features_for_backtest)
-    print("\n🔥 TRAINING PRODUCTION MODELS...")
-    optimal_models = train_production_models(
-        backtester, analysis, prepared_data
-    )
+    print("\nTRAINING PRODUCTION MODELS...")
+    train_production_models(prepared_data)
 
     logger.info("Optimal training results saved to optimal_training_results.json")
-    print("\n✅ Optimal model training complete!")
-    print("📊 Results saved to optimal_training_results.json")
-    print("🤖 Production models saved to models/ directory")
+    print("\nOptimal model training complete!")
+    print("Results saved to optimal_training_results.json")
+    print("Production models saved to models/ directory")
 
 if __name__ == "__main__":
-    main() 
+    main()
