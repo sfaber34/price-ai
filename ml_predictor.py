@@ -138,16 +138,14 @@ class CryptoPredictionModel:
     
     def train_xgboost_classifier(self, X: pd.DataFrame, y: pd.Series) -> Dict:
         """
-        Train a calibrated XGBoost classifier for direction prediction.
+        Train an XGBoost classifier for direction prediction.
 
         Three-step process:
           1. Early stopping on a time-ordered holdout (last 15 % of data) to find
              the optimal number of trees — prevents overfitting to training noise.
           2. TimeSeriesSplit cross-validation on the base model for an unbiased
              accuracy estimate that is reported in logs/metadata.
-          3. CalibratedClassifierCV (isotonic, TimeSeriesSplit) wraps the final
-             base model so that predict_proba() outputs genuine probabilities that
-             correlate with empirical accuracy rather than raw XGBoost scores.
+          3. Train the final XGBoost model on all data.
         """
         from sklearn.dummy import DummyClassifier
 
@@ -239,34 +237,23 @@ class CryptoPredictionModel:
         except Exception as cv_err:
             logger.warning(f"CV failed ({cv_err}), reporting 0.5 fallback")
 
-        # ── Step 3: Calibrated final model ───────────────────────────────────
-        from sklearn.calibration import CalibratedClassifierCV
-
-        cal_folds = max(2, min(config.MODEL_SETTINGS.get('calibration_folds', 3), max_folds))
+        # ── Step 3: Train final model (plain XGBoost) ─────────────────────────
         model_type = 'dummy_classifier'
         feature_importance: Dict = {}
         accuracy = float(max(class_counts)) / len(y_binary)
 
         try:
-            base_model = xgb.XGBClassifier(**final_params)
-            tscv_cal = TimeSeriesSplit(n_splits=cal_folds)
-            model = CalibratedClassifierCV(base_model, cv=tscv_cal, method='isotonic')
+            model = xgb.XGBClassifier(**final_params)
             model.fit(X, y_binary)
 
-            importances = [
-                cc.estimator.feature_importances_
-                for cc in model.calibrated_classifiers_
-                if hasattr(cc.estimator, 'feature_importances_')
-            ]
-            if importances:
-                feature_importance = dict(zip(X.columns, np.mean(importances, axis=0)))
+            feature_importance = dict(zip(X.columns, model.feature_importances_))
 
             y_pred = model.predict(X)
             accuracy = float(accuracy_score(y_binary, y_pred))
-            model_type = 'calibrated_xgb'
+            model_type = 'xgb_classifier'
 
-        except Exception as cal_err:
-            logger.error(f"Calibrated model failed ({cal_err}), falling back to plain XGBoost")
+        except Exception as train_err:
+            logger.error(f"XGBoost training failed ({train_err}), falling back to plain XGBoost")
             try:
                 model = xgb.XGBClassifier(**final_params)
                 model.fit(X, y_binary)

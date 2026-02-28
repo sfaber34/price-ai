@@ -5,9 +5,9 @@
       "training_window": "180_days_fixed",
       "training_days": 180,
       "training_samples": 17280,
-      "model_type": "calibrated_xgb",
-      "cv_accuracy": 0.5109870945238926,
-      "best_n_estimators": 27
+      "model_type": "xgb_classifier",
+      "cv_accuracy": 0.5182008368200837,
+      "best_n_estimators": 17
     }
   },
   "ethereum": {
@@ -16,8 +16,8 @@
       "training_window": "180_days_fixed",
       "training_days": 180,
       "training_samples": 17280,
-      "model_type": "calibrated_xgb",
-      "cv_accuracy": 0.5312955887460924,
+      "model_type": "xgb_classifier",
+      "cv_accuracy": 0.5391455366446684,
       "best_n_estimators": 54
     }
   }
