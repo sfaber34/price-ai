@@ -2,6 +2,7 @@
 Data collection module for crypto price prediction bot
 Fetches OHLCV + taker volume data from Binance.US public REST API.
 """
+import os
 import requests
 import pandas as pd
 import time
@@ -74,6 +75,10 @@ class DataCollector:
     _OKX_BASE     = 'https://www.okx.com/api/v5'
     _OKX_INST_IDS = {'bitcoin': 'BTC-USD-SWAP', 'ethereum': 'ETH-USD-SWAP'}
     _OKX_CCY      = {'bitcoin': 'BTC', 'ethereum': 'ETH'}
+
+    # Coinalyze — free API for deep OI history (daily, never deleted)
+    _COINALYZE_BASE    = 'https://api.coinalyze.net/v1'
+    _COINALYZE_SYMBOLS = {'bitcoin': 'BTCUSDT_PERP.A', 'ethereum': 'ETHUSDT_PERP.A'}
 
     def get_crypto_data(self, crypto_id: str, days: int = 365) -> pd.DataFrame:
         """
@@ -609,7 +614,11 @@ class DataCollector:
 
     def get_open_interest(self, crypto_id: str, days: int = 90) -> pd.DataFrame:
         """
-        Fetch hourly open interest from Binance futures (primary) or OKX (fallback).
+        Fetch open interest history.
+
+        For days <= 30: Binance futures hourly (primary), OKX (fallback).
+        For days > 30:  Coinalyze daily for the deep history (>30 days ago)
+                        + Binance hourly for the recent 30 days, concatenated.
 
         Returns columns: datetime (tz-naive UTC), oi_usd (float), oi_volume_usd (float).
         Returns empty DataFrame on any failure.
@@ -627,12 +636,30 @@ class DataCollector:
         end_ms   = _utc_ms()
         start_ms = end_ms - days * 86_400_000
 
-        # ── Primary: Binance futures ──────────────────────────────────────────
-        df = self._get_open_interest_binance(symbol, start_ms, end_ms)
+        if days <= 30:
+            # Short window — Binance hourly is sufficient
+            df = self._get_open_interest_binance(symbol, start_ms, end_ms)
+            if df.empty and crypto_id in self._OKX_CCY:
+                df = self._get_open_interest_okx(self._OKX_CCY[crypto_id], start_ms)
+        else:
+            # Long window — Coinalyze daily for deep history + Binance hourly for recent
+            df_deep = self._get_open_interest_coinalyze(crypto_id, start_ms, end_ms)
+            df_recent = self._get_open_interest_binance(symbol, start_ms, end_ms)
 
-        # ── Fallback: OKX ────────────────────────────────────────────────────
-        if df.empty and crypto_id in self._OKX_CCY:
-            df = self._get_open_interest_okx(self._OKX_CCY[crypto_id], start_ms)
+            if not df_deep.empty and not df_recent.empty:
+                # Binance hourly is higher resolution — let it take precedence for overlap
+                cutoff = df_recent['datetime'].min()
+                df_deep_only = df_deep[df_deep['datetime'] < cutoff]
+                df = pd.concat([df_deep_only, df_recent], ignore_index=True)
+                df = df.drop_duplicates('datetime').sort_values('datetime').reset_index(drop=True)
+            elif not df_deep.empty:
+                df = df_deep
+            elif not df_recent.empty:
+                df = df_recent
+            else:
+                # Last resort: OKX
+                df = self._get_open_interest_okx(self._OKX_CCY.get(crypto_id, ''), start_ms) \
+                     if crypto_id in self._OKX_CCY else pd.DataFrame()
 
         if df.empty:
             logger.warning(f"No open interest data available for {crypto_id}")
@@ -730,6 +757,92 @@ class DataCollector:
                 .drop_duplicates('datetime')
                 .sort_values('datetime')
                 .reset_index(drop=True))
+
+    def _get_open_interest_coinalyze(self, crypto_id: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+        """
+        Fetch daily OI history from Coinalyze (free API, unlimited daily history).
+
+        Coinalyze returns OI in contracts.  We multiply by a rough price estimate
+        from the OHLC close field on each record to convert to USD, matching the
+        Binance oi_usd unit so downstream features (oi_price_ratio) stay consistent.
+
+        Requires COINALYZE_API_KEY in environment / .env.
+        """
+        api_key = getattr(config, 'COINALYZE_API_KEY', None) or os.environ.get('COINALYZE_API_KEY')
+        if not api_key:
+            logger.warning("COINALYZE_API_KEY not set — skipping Coinalyze OI fetch")
+            return pd.DataFrame()
+
+        symbol = self._COINALYZE_SYMBOLS.get(crypto_id)
+        if not symbol:
+            return pd.DataFrame()
+
+        start_s = start_ms // 1000
+        end_s   = end_ms   // 1000
+
+        try:
+            resp = self.session.get(
+                f"{self._COINALYZE_BASE}/open-interest-history",
+                params={
+                    'symbols':  symbol,
+                    'interval': 'daily',
+                    'from':     start_s,
+                    'to':       end_s,
+                },
+                headers={'api_key': api_key},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+
+            if not isinstance(payload, list) or not payload:
+                return pd.DataFrame()
+
+            history = payload[0].get('history', [])
+            if not history:
+                return pd.DataFrame()
+
+            # Also fetch OHLCV price history to convert contracts → USD
+            price_resp = self.session.get(
+                f"{self._COINALYZE_BASE}/ohlcv-history",
+                params={
+                    'symbols':  symbol,
+                    'interval': 'daily',
+                    'from':     start_s,
+                    'to':       end_s,
+                },
+                headers={'api_key': api_key},
+                timeout=15,
+            )
+            price_resp.raise_for_status()
+            price_payload = price_resp.json()
+            price_map = {}
+            if isinstance(price_payload, list) and price_payload:
+                for rec in price_payload[0].get('history', []):
+                    price_map[rec['t']] = rec['c']  # close price
+
+            rows = []
+            for rec in history:
+                ts = rec['t']
+                oi_contracts = rec['c']  # daily close OI in contracts
+                price = price_map.get(ts, 0)
+                oi_usd = oi_contracts * price if price else 0
+                rows.append({
+                    'datetime': pd.to_datetime(ts, unit='s'),
+                    'oi_usd':   oi_usd,
+                    'oi_volume_usd': 0.0,
+                })
+
+            df = pd.DataFrame(rows)
+            # Drop rows where we couldn't get a price
+            df = df[df['oi_usd'] > 0]
+            df = df.drop_duplicates('datetime').sort_values('datetime').reset_index(drop=True)
+            logger.info(f"Coinalyze OI: {len(df)} daily records for {crypto_id}")
+            return df
+
+        except Exception as e:
+            logger.warning(f"Coinalyze OI fetch failed for {crypto_id}: {e}")
+            return pd.DataFrame()
 
     def get_fear_greed(self, days: int = 90) -> pd.DataFrame:
         """

@@ -239,30 +239,48 @@ class CryptoPredictionModel:
         except Exception as cv_err:
             logger.warning(f"CV failed ({cv_err}), reporting 0.5 fallback")
 
-        # ── Step 3: Train final model (plain XGBoost, no calibration wrapper) ─
-        # CalibratedClassifierCV was removed: with weak signal and a ~54% base
-        # rate it compresses the output distribution so tightly around the prior
-        # that the model predicts UP 95%+ of the time.  Raw XGBoost predict_proba
-        # already produces well-behaved probabilities for binary:logistic and
-        # evaluate_calibration.py confirms good calibration without the wrapper.
+        # ── Step 3: Calibrated final model ───────────────────────────────────
+        from sklearn.calibration import CalibratedClassifierCV
+
+        cal_folds = max(2, min(config.MODEL_SETTINGS.get('calibration_folds', 3), max_folds))
         model_type = 'dummy_classifier'
         feature_importance: Dict = {}
         accuracy = float(max(class_counts)) / len(y_binary)
 
         try:
-            model = xgb.XGBClassifier(**final_params)
+            base_model = xgb.XGBClassifier(**final_params)
+            tscv_cal = TimeSeriesSplit(n_splits=cal_folds)
+            model = CalibratedClassifierCV(base_model, cv=tscv_cal, method='isotonic')
             model.fit(X, y_binary)
+
+            importances = [
+                cc.estimator.feature_importances_
+                for cc in model.calibrated_classifiers_
+                if hasattr(cc.estimator, 'feature_importances_')
+            ]
+            if importances:
+                feature_importance = dict(zip(X.columns, np.mean(importances, axis=0)))
+
             y_pred = model.predict(X)
             accuracy = float(accuracy_score(y_binary, y_pred))
-            feature_importance = dict(zip(X.columns, model.feature_importances_))
-            model_type = 'xgb_classifier'
-        except Exception as plain_err:
-            logger.error(f"XGBoost training failed ({plain_err}), using dummy classifier")
-            model = DummyClassifier(strategy='most_frequent')
-            model.fit(X, y_binary)
-            y_pred = model.predict(X)
-            accuracy = float(accuracy_score(y_binary, y_pred))
-            feature_importance = {col: 0.0 for col in X.columns}
+            model_type = 'calibrated_xgb'
+
+        except Exception as cal_err:
+            logger.error(f"Calibrated model failed ({cal_err}), falling back to plain XGBoost")
+            try:
+                model = xgb.XGBClassifier(**final_params)
+                model.fit(X, y_binary)
+                y_pred = model.predict(X)
+                accuracy = float(accuracy_score(y_binary, y_pred))
+                feature_importance = dict(zip(X.columns, model.feature_importances_))
+                model_type = 'xgb_classifier'
+            except Exception as plain_err:
+                logger.error(f"Plain XGBoost also failed ({plain_err}), using dummy classifier")
+                model = DummyClassifier(strategy='most_frequent')
+                model.fit(X, y_binary)
+                y_pred = model.predict(X)
+                accuracy = float(accuracy_score(y_binary, y_pred))
+                feature_importance = {col: 0.0 for col in X.columns}
 
         self.models[f"{self.prediction_horizon}_xgb_classifier"] = model
 
@@ -344,14 +362,16 @@ class CryptoPredictionModel:
         try:
             latest_data = df.iloc[[-1]].copy()
 
-            exclude_cols = [
-                'datetime', 'crypto',
-                'target_direction_15m',
-                'target_datetime_15m',
-            ]
+            if not self.feature_columns:
+                raise ValueError("Model has no saved feature_columns — was it loaded correctly?")
 
-            feature_cols = sorted(c for c in latest_data.columns if c not in exclude_cols)
-            X = latest_data[feature_cols].fillna(0)
+            missing = [c for c in self.feature_columns if c not in latest_data.columns]
+            if missing:
+                logger.warning(f"{len(missing)} features missing in live data, filling with 0: {missing[:5]}...")
+                for c in missing:
+                    latest_data[c] = 0.0
+
+            X = latest_data[self.feature_columns].fillna(0)
 
             selector = self.feature_selectors[f"{self.prediction_horizon}_selector"]
             X_selected = pd.DataFrame(

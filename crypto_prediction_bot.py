@@ -59,13 +59,12 @@ class CryptoPredictionBot:
     
     def collect_all_data(self, days: int = 30) -> Dict[str, Dict[str, pd.DataFrame]]:
         """
-        Collect all required data for training/prediction.
-        Uses training_pipeline.fetch_data_for_crypto() — same as evaluate_calibration.
+        Collect 15m and 1m bar data for training/prediction.
 
         15m bars are cached in memory: the first call does a full fetch, subsequent
         calls only fetch the last day and append — cutting ~10s down to <1s.
 
-        Returns {crypto: {'15m': df, '1m': df}} matching fetch_all_cryptos() format.
+        Returns {crypto: {'15m': df, '1m': df}}.
         """
         logger.info(f"Collecting data for past {days} days...")
 
@@ -73,7 +72,9 @@ class CryptoPredictionBot:
         cutoff = _utcnow() - timedelta(days=days)
 
         for crypto in config.CRYPTOCURRENCIES:
-            crypto_data: Dict[str, pd.DataFrame] = {'15m': pd.DataFrame(), '1m': pd.DataFrame()}
+            crypto_data: Dict[str, pd.DataFrame] = {
+                '15m': pd.DataFrame(), '1m': pd.DataFrame(),
+            }
 
             # 15m bars with caching
             try:
@@ -133,7 +134,7 @@ class CryptoPredictionBot:
                 continue
             try:
                 features_df = prepare_features_for_crypto(
-                    self.feature_engineer, df_15m, data.get('1m')
+                    self.feature_engineer, df_15m, data.get('1m'),
                 )
                 prepared_data[crypto] = features_df
                 logger.info(f"{crypto}: {features_df.shape[1]} features, {len(features_df)} bars")
