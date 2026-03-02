@@ -66,7 +66,9 @@ MODEL_SETTINGS = {
     # Fixed production training window (days).  We deliberately do NOT select
     # this from backtest accuracy to avoid test-set selection bias.
     'production_training_days': 180,
-    'retrain_frequency_hours': 6
+    'retrain_frequency_hours': 6,
+    'optuna_trials': 30,           # hyperparam search trials (0 = skip, use hardcoded)
+    'sample_weight_decay': 1.0,    # exponential decay for recency weighting (0 = uniform)
 }
 
 # Rate Limiting (to respect free API limits)

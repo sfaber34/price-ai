@@ -4,10 +4,9 @@ Uses XGBoost and ensemble methods for multi-horizon predictions
 """
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, TimeSeriesSplit, cross_val_score
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.preprocessing import StandardScaler
-from sklearn.feature_selection import SelectKBest, f_classif
 import xgboost as xgb
 import joblib
 import logging
@@ -16,6 +15,62 @@ from datetime import datetime, timedelta, timezone
 import config
 
 logger = logging.getLogger(__name__)
+
+
+class TreeBasedSelector:
+    """Drop-in replacement for SelectKBest that uses a shallow XGBoost to rank
+    features by tree-based importance.  Exposes fit/transform/get_support so the
+    rest of the pipeline (predict, evaluate_calibration, training_pipeline) works
+    unchanged."""
+
+    def __init__(self, k: int = 50):
+        self.k = k
+        self._support_mask: Optional[np.ndarray] = None
+        self._selected_indices: Optional[np.ndarray] = None
+
+    def fit(self, X, y):
+        n_features = X.shape[1]
+        k = min(self.k, n_features)
+
+        preliminary = xgb.XGBClassifier(
+            n_estimators=50,
+            max_depth=3,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            verbosity=0,
+        )
+        preliminary.fit(X, y)
+
+        importances = preliminary.feature_importances_
+        # Pick top-k indices (descending importance)
+        self._selected_indices = np.argsort(importances)[::-1][:k]
+        self._support_mask = np.zeros(n_features, dtype=bool)
+        self._support_mask[self._selected_indices] = True
+
+        top_names = []
+        if hasattr(X, 'columns'):
+            top_names = [X.columns[i] for i in self._selected_indices[:5]]
+        logger.info(f"TreeBasedSelector: kept {k}/{n_features} features, "
+                    f"top-5: {top_names}")
+        return self
+
+    def transform(self, X):
+        if self._support_mask is None:
+            raise RuntimeError("TreeBasedSelector has not been fitted yet")
+        if hasattr(X, 'iloc'):
+            return X.iloc[:, self._support_mask].values
+        return X[:, self._support_mask]
+
+    def fit_transform(self, X, y):
+        self.fit(X, y)
+        return self.transform(X)
+
+    def get_support(self):
+        if self._support_mask is None:
+            raise RuntimeError("TreeBasedSelector has not been fitted yet")
+        return self._support_mask
 
 class CryptoPredictionModel:
     def __init__(self, crypto_name: str, prediction_horizon: str):
@@ -99,15 +154,14 @@ class CryptoPredictionModel:
     
     def feature_selection(self, X: pd.DataFrame, y: pd.Series, k: int = 50) -> pd.DataFrame:
         """
-        Select top k features using f_classif (ANOVA F-test).
-        Stable closed-form scoring that outperforms mutual_info_classif on this
-        dataset size (~17k samples). XGBoost handles nonlinear relationships
-        downstream, so linear feature selection is sufficient.
+        Select top k features using a preliminary shallow XGBoost to rank by
+        tree-based feature importance.  Captures nonlinear relationships that
+        the previous f_classif (linear ANOVA) missed.
         """
         selector_key = f"{self.prediction_horizon}_selector"
 
         if selector_key not in self.feature_selectors:
-            selector = SelectKBest(score_func=f_classif, k=min(k, X.shape[1]))
+            selector = TreeBasedSelector(k=min(k, X.shape[1]))
             X_selected = selector.fit_transform(X, y)
             self.feature_selectors[selector_key] = selector
 
@@ -136,6 +190,21 @@ class CryptoPredictionModel:
         
         return pd.DataFrame(X_scaled, columns=X.columns, index=X.index)
     
+    @staticmethod
+    def _compute_sample_weights(n_samples: int, decay: float) -> Optional[np.ndarray]:
+        """Compute exponential-decay sample weights.
+
+        weight[i] = exp(-decay * (n-1-i) / n)  — i=0 oldest, i=n-1 newest.
+        decay=0 returns None (uniform).  decay=1 gives newest=1.0, oldest≈0.37.
+        """
+        if decay <= 0:
+            return None
+        idx = np.arange(n_samples, dtype=np.float64)
+        weights = np.exp(-decay * (n_samples - 1 - idx) / n_samples)
+        logger.info(f"Sample weights: decay={decay}, oldest={weights[0]:.3f}, "
+                    f"newest={weights[-1]:.3f}, ratio={weights[-1]/weights[0]:.2f}x")
+        return weights
+
     def train_xgboost_classifier(self, X: pd.DataFrame, y: pd.Series) -> Dict:
         """
         Train an XGBoost classifier for direction prediction.
@@ -143,9 +212,11 @@ class CryptoPredictionModel:
         Three-step process:
           1. Early stopping on a time-ordered holdout (last 15 % of data) to find
              the optimal number of trees — prevents overfitting to training noise.
-          2. TimeSeriesSplit cross-validation on the base model for an unbiased
-             accuracy estimate that is reported in logs/metadata.
-          3. Train the final XGBoost model on all data.
+          2. Bayesian hyperparameter tuning with Optuna (TimeSeriesSplit CV).
+          3. Train the final XGBoost model on all data with best params.
+
+        Sample weights with exponential decay are applied to all fit() calls
+        so recent bars have more influence than old ones.
         """
         from sklearn.dummy import DummyClassifier
 
@@ -184,6 +255,10 @@ class CryptoPredictionModel:
             max(2, min_class_size // 2),
         )
 
+        # ── Sample weights (exponential recency decay) ────────────────────────
+        decay = config.MODEL_SETTINGS.get('sample_weight_decay', 0.0)
+        sample_weights = self._compute_sample_weights(n_samples, decay)
+
         # ── Base XGBoost params ───────────────────────────────────────────────
         xgb_params = config.MODEL_SETTINGS['xgboost_params'].copy()
         xgb_params['objective'] = 'binary:logistic'
@@ -203,6 +278,8 @@ class CryptoPredictionModel:
                 y_tr = y_binary.iloc[:n_samples - n_val]
                 y_val = y_binary.iloc[n_samples - n_val:]
 
+                es_weights = sample_weights[:n_samples - n_val] if sample_weights is not None else None
+
                 es_params = xgb_params.copy()
                 es_params['n_estimators'] = 1000  # high ceiling; early stopping prunes it
                 es_params['early_stopping_rounds'] = early_stopping_rounds  # XGBoost 2.x: constructor
@@ -210,6 +287,7 @@ class CryptoPredictionModel:
                 es_model.fit(
                     X_tr, y_tr,
                     eval_set=[(X_val, y_val)],
+                    sample_weight=es_weights,
                     verbose=False,
                 )
                 best_n_estimators = max(10, es_model.best_iteration + 1)
@@ -222,17 +300,68 @@ class CryptoPredictionModel:
             logger.info(f"Dataset too small for early stopping ({n_samples} rows), "
                         f"using n_estimators={best_n_estimators}")
 
-        # Final params with early-stopping-selected tree count
+        # ── Step 2: Optuna hyperparameter tuning (replaces plain CV) ──────────
+        optuna_trials = config.MODEL_SETTINGS.get('optuna_trials', 0)
+        best_tuned_params: Dict = {}
+
+        if optuna_trials > 0:
+            try:
+                import optuna
+                optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+                def objective(trial):
+                    params = xgb_params.copy()
+                    params['n_estimators'] = best_n_estimators
+                    params['max_depth'] = trial.suggest_int('max_depth', 2, 6)
+                    params['learning_rate'] = trial.suggest_float('learning_rate', 0.01, 0.15, log=True)
+                    params['subsample'] = trial.suggest_float('subsample', 0.6, 1.0)
+                    params['colsample_bytree'] = trial.suggest_float('colsample_bytree', 0.5, 1.0)
+                    params['min_child_weight'] = trial.suggest_int('min_child_weight', 1, 10)
+                    params['reg_alpha'] = trial.suggest_float('reg_alpha', 0.01, 1.0, log=True)
+                    params['reg_lambda'] = trial.suggest_float('reg_lambda', 0.5, 3.0)
+
+                    tscv = TimeSeriesSplit(n_splits=max(2, max_folds))
+                    scores = []
+                    for train_idx, val_idx in tscv.split(X):
+                        m = xgb.XGBClassifier(**params)
+                        sw = sample_weights[train_idx] if sample_weights is not None else None
+                        m.fit(X.iloc[train_idx], y_binary.iloc[train_idx], sample_weight=sw, verbose=False)
+                        scores.append(accuracy_score(y_binary.iloc[val_idx], m.predict(X.iloc[val_idx])))
+                    return float(np.mean(scores))
+
+                study = optuna.create_study(direction='maximize')
+                study.optimize(objective, n_trials=optuna_trials, show_progress_bar=False)
+
+                best_tuned_params = study.best_params
+                logger.info(f"Optuna best CV accuracy: {study.best_value:.4f} "
+                            f"(n_trials={optuna_trials})")
+                logger.info(f"Optuna best params: {best_tuned_params}")
+
+            except ImportError:
+                logger.warning("optuna not installed — skipping hyperparameter tuning, "
+                               "using hardcoded params")
+            except Exception as opt_err:
+                logger.warning(f"Optuna tuning failed ({opt_err}), using hardcoded params")
+
+        # Build final params: start from config defaults, overlay Optuna best
         final_params = xgb_params.copy()
         final_params['n_estimators'] = best_n_estimators
+        final_params.update(best_tuned_params)
 
-        # ── Step 2: TimeSeriesSplit CV on base model (accuracy reporting) ─────
+        # ── CV accuracy reporting (quick, uses final params + sample weights) ──
         cv_scores = np.array([0.5])
         try:
             if max_folds >= 2:
                 tscv = TimeSeriesSplit(n_splits=max_folds)
-                cv_model = xgb.XGBClassifier(**final_params)
-                cv_scores = cross_val_score(cv_model, X, y_binary, cv=tscv, scoring='accuracy')
+                scores = []
+                for train_idx, val_idx in tscv.split(X):
+                    cv_model = xgb.XGBClassifier(**final_params)
+                    sw = sample_weights[train_idx] if sample_weights is not None else None
+                    cv_model.fit(X.iloc[train_idx], y_binary.iloc[train_idx],
+                                 sample_weight=sw, verbose=False)
+                    scores.append(accuracy_score(y_binary.iloc[val_idx],
+                                                 cv_model.predict(X.iloc[val_idx])))
+                cv_scores = np.array(scores)
                 logger.info(f"CV accuracy: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
         except Exception as cv_err:
             logger.warning(f"CV failed ({cv_err}), reporting 0.5 fallback")
@@ -244,7 +373,7 @@ class CryptoPredictionModel:
 
         try:
             model = xgb.XGBClassifier(**final_params)
-            model.fit(X, y_binary)
+            model.fit(X, y_binary, sample_weight=sample_weights)
 
             feature_importance = dict(zip(X.columns, model.feature_importances_))
 
@@ -255,8 +384,10 @@ class CryptoPredictionModel:
         except Exception as train_err:
             logger.error(f"XGBoost training failed ({train_err}), falling back to plain XGBoost")
             try:
-                model = xgb.XGBClassifier(**final_params)
-                model.fit(X, y_binary)
+                fallback_params = xgb_params.copy()
+                fallback_params['n_estimators'] = best_n_estimators
+                model = xgb.XGBClassifier(**fallback_params)
+                model.fit(X, y_binary, sample_weight=sample_weights)
                 y_pred = model.predict(X)
                 accuracy = float(accuracy_score(y_binary, y_pred))
                 feature_importance = dict(zip(X.columns, model.feature_importances_))
@@ -281,6 +412,8 @@ class CryptoPredictionModel:
             'class_distribution': class_counts.to_dict(),
             'min_class_percentage': min_class_pct * 100,
         }
+        if best_tuned_params:
+            results['optuna_best_params'] = best_tuned_params
 
         logger.info(f"{model_type} trained ({self.crypto_name} {self.prediction_horizon}) — "
                     f"CV: {cv_scores.mean():.3f}, best_n_est: {best_n_estimators}, "
@@ -290,9 +423,8 @@ class CryptoPredictionModel:
     def train(self, df: pd.DataFrame) -> Dict:
         """
         Train a direction classifier for the given horizon.
-        Feature selection uses f_classif against the binary direction target so
-        the 50 chosen features are the ones that actually predict UP/DOWN.
-        XGBoost captures nonlinear effects downstream.
+        Feature selection uses a preliminary shallow XGBoost to rank features by
+        tree-based importance, keeping the top-k that predict UP/DOWN.
         """
         logger.info(f"Training direction classifier for {self.crypto_name} - {self.prediction_horizon}")
 
