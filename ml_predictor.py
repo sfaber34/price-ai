@@ -33,8 +33,8 @@ class TreeBasedSelector:
         k = min(self.k, n_features)
 
         preliminary = xgb.XGBClassifier(
-            n_estimators=50,
-            max_depth=3,
+            n_estimators=100,
+            max_depth=4,
             learning_rate=0.1,
             subsample=0.8,
             colsample_bytree=0.8,

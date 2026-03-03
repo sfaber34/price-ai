@@ -42,7 +42,7 @@ FRED_SERIES = {}
 MODEL_SETTINGS = {
     'train_test_split': 0.8,
     'cross_validation_folds': 5,
-    'feature_selection_k': 50,
+    'feature_selection_k': 40,
     'xgboost_params': {
         # These are the fallback values used if early stopping fails.
         # Early stopping will search up to 1000 trees and prune back;
@@ -67,8 +67,8 @@ MODEL_SETTINGS = {
     # this from backtest accuracy to avoid test-set selection bias.
     'production_training_days': 180,
     'retrain_frequency_hours': 6,
-    'optuna_trials': 30,           # hyperparam search trials (0 = skip, use hardcoded)
-    'sample_weight_decay': 1.0,    # exponential decay for recency weighting (0 = uniform)
+    'optuna_trials': 60,           # hyperparam search trials (0 = skip, use hardcoded)
+    'sample_weight_decay': 1.20,    # exponential decay for recency weighting (0 = uniform)
 }
 
 # Rate Limiting (to respect free API limits)

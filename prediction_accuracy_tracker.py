@@ -1062,8 +1062,8 @@ class PredictionAccuracyTracker:
 
             plt.figure(figsize=(6 * n_horizons, 5))
 
-            conf_bins = [0.5, 0.55, 0.60, 0.65, 0.70, 0.80, 1.01]
-            bin_labels = ['50-55%', '55-60%', '60-65%', '65-70%', '70-80%', '>80%']
+            conf_bins = [0.50, 0.54, 0.58, 0.62, 0.66, 0.70, 0.74, 1.01]
+            bin_labels = ['50-54%', '54-58%', '58-62%', '62-66%', '66-70%', '70-74%', '>74%']
 
             for i, horizon in enumerate(horizons):
                 plt.subplot(1, n_horizons, i + 1)
