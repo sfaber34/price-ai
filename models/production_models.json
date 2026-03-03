@@ -6,8 +6,8 @@
       "training_days": 180,
       "training_samples": 17280,
       "model_type": "xgb_classifier",
-      "cv_accuracy": 0.5139769954688045,
-      "best_n_estimators": 17
+      "cv_accuracy": 0.5186476124085047,
+      "best_n_estimators": 16
     }
   },
   "ethereum": {
@@ -17,8 +17,8 @@
       "training_days": 180,
       "training_samples": 17280,
       "model_type": "xgb_classifier",
-      "cv_accuracy": 0.5394928794720389,
-      "best_n_estimators": 63
+      "cv_accuracy": 0.5449808961444946,
+      "best_n_estimators": 22
     }
   }
 }

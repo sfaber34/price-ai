@@ -68,7 +68,7 @@ MODEL_SETTINGS = {
     'production_training_days': 180,
     'retrain_frequency_hours': 6,
     'optuna_trials': 60,           # hyperparam search trials (0 = skip, use hardcoded)
-    'sample_weight_decay': 1.20,    # exponential decay for recency weighting (0 = uniform)
+    'sample_weight_decay': 2.0,    # exponential decay for recency weighting (0 = uniform)
 }
 
 # Rate Limiting (to respect free API limits)
