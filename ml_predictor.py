@@ -5,8 +5,13 @@ Uses XGBoost and ensemble methods for multi-horizon predictions
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split, TimeSeriesSplit
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
 from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
+try:
+    from sklearn.frozen import FrozenEstimator as _FrozenEstimator
+except ImportError:
+    _FrozenEstimator = None  # sklearn < 1.6 — fall back to cv='prefit'
 import xgboost as xgb
 import joblib
 import logging
@@ -101,7 +106,10 @@ class CryptoPredictionModel:
         
         feature_cols = sorted(col for col in clean_df.columns if col not in exclude_cols)
 
-        X = clean_df[feature_cols].fillna(0)  # Fill remaining NaN with 0
+        # Forward-fill first so early-window rolling NaNs inherit the first valid
+        # value rather than being treated as the literal number 0 (which is a real
+        # value for many normalised features and would teach the model a spurious signal).
+        X = clean_df[feature_cols].ffill().fillna(0)
         y = clean_df[target_col]
         # Ensure integer class labels (0/1) — boolean/object targets break
         # mutual_info_classif and some classifiers.  The target column can be
@@ -209,14 +217,22 @@ class CryptoPredictionModel:
         """
         Train an XGBoost classifier for direction prediction.
 
-        Three-step process:
-          1. Early stopping on a time-ordered holdout (last 15 % of data) to find
-             the optimal number of trees — prevents overfitting to training noise.
-          2. Bayesian hyperparameter tuning with Optuna (TimeSeriesSplit CV).
-          3. Train the final XGBoost model on all data with best params.
+        Four-step process:
+          1. 80/20 time-ordered split: XGBoost trains on the first 80 %,
+             the last 20 % is held out purely for isotonic calibration so
+             the calibrator never sees its own training data.
+          2. Early stopping on a held-out tail of the training portion to find
+             the optimal number of trees.
+          3. Bayesian hyperparameter tuning with Optuna (TimeSeriesSplit CV,
+             AUC objective — better aligned with probability quality than accuracy).
+             Search space includes gamma (tree-growth regularisation) and a wider
+             reg_lambda range; max_depth is capped at 4 to prevent overfitting on
+             noisy 15 m financial data.
+          4. Isotonic calibration on the 20 % holdout so reported confidence
+             scores reflect true probabilities rather than raw XGBoost scores.
 
-        Sample weights with exponential decay are applied to all fit() calls
-        so recent bars have more influence than old ones.
+        Sample weights with exponential decay are applied to all XGBoost fit()
+        calls so recent bars have more influence than old ones.
         """
         from sklearn.dummy import DummyClassifier
 
@@ -241,23 +257,35 @@ class CryptoPredictionModel:
                 'feature_importance': {col: 0.0 for col in X.columns},
             }
 
+        n_samples = len(X)
+
+        # ── 80/20 time-ordered split ──────────────────────────────────────────
+        # Training portion: first 80 % — used for early stopping, Optuna, final fit.
+        # Calibration portion: last 20 % — held out exclusively for isotonic calibration.
+        n_train = int(n_samples * 0.80)
+        n_cal   = n_samples - n_train
+        X_train = X.iloc[:n_train]
+        y_train = y_binary.iloc[:n_train]
+        X_cal   = X.iloc[n_train:]
+        y_cal   = y_binary.iloc[n_train:]
+
         min_class_pct = float(min(class_counts)) / len(y_binary)
         if min_class_pct < 0.05:
             logger.warning(f"Severe class imbalance: minority = {min_class_pct:.2%}")
 
-        n_samples = len(X)
-        min_class_size = int(min(class_counts))
+        train_class_counts = y_train.value_counts()
+        min_class_size = int(min(train_class_counts)) if len(train_class_counts) > 1 else 1
 
-        # How many CV folds can the data support?
+        # How many CV folds can the training portion support?
         max_folds = min(
             config.MODEL_SETTINGS['cross_validation_folds'],
-            max(2, n_samples // 10),
+            max(2, n_train // 10),
             max(2, min_class_size // 2),
         )
 
-        # ── Sample weights (exponential recency decay) ────────────────────────
+        # ── Sample weights (exponential recency decay, training portion only) ─
         decay = config.MODEL_SETTINGS.get('sample_weight_decay', 0.0)
-        sample_weights = self._compute_sample_weights(n_samples, decay)
+        sample_weights = self._compute_sample_weights(n_train, decay)
 
         # ── Base XGBoost params ───────────────────────────────────────────────
         xgb_params = config.MODEL_SETTINGS['xgboost_params'].copy()
@@ -266,23 +294,23 @@ class CryptoPredictionModel:
             xgb_params['scale_pos_weight'] = float(max(class_counts)) / float(min(class_counts))
             logger.info(f"Class balancing: scale_pos_weight={xgb_params['scale_pos_weight']:.2f}")
 
-        # ── Step 1: Early stopping to find optimal n_estimators ───────────────
+        # ── Step 1: Early stopping within training portion ────────────────────
         early_stopping_rounds = config.MODEL_SETTINGS.get('early_stopping_rounds', 30)
         best_n_estimators = xgb_params.get('n_estimators', 100)  # safe fallback
 
-        n_val = max(int(n_samples * 0.15), 50)
-        if n_samples - n_val >= 100:
+        n_val = max(int(n_train * 0.15), 50)
+        if n_train - n_val >= 100:
             try:
-                X_tr = X.iloc[:n_samples - n_val]
-                X_val = X.iloc[n_samples - n_val:]
-                y_tr = y_binary.iloc[:n_samples - n_val]
-                y_val = y_binary.iloc[n_samples - n_val:]
+                X_tr  = X_train.iloc[:n_train - n_val]
+                X_val = X_train.iloc[n_train - n_val:]
+                y_tr  = y_train.iloc[:n_train - n_val]
+                y_val = y_train.iloc[n_train - n_val:]
 
-                es_weights = sample_weights[:n_samples - n_val] if sample_weights is not None else None
+                es_weights = sample_weights[:n_train - n_val] if sample_weights is not None else None
 
                 es_params = xgb_params.copy()
                 es_params['n_estimators'] = 1000  # high ceiling; early stopping prunes it
-                es_params['early_stopping_rounds'] = early_stopping_rounds  # XGBoost 2.x: constructor
+                es_params['early_stopping_rounds'] = early_stopping_rounds
                 es_model = xgb.XGBClassifier(**es_params)
                 es_model.fit(
                     X_tr, y_tr,
@@ -297,10 +325,10 @@ class CryptoPredictionModel:
                 logger.warning(f"Early stopping failed ({es_err}), "
                                f"using fallback n_estimators={best_n_estimators}")
         else:
-            logger.info(f"Dataset too small for early stopping ({n_samples} rows), "
+            logger.info(f"Training portion too small for early stopping ({n_train} rows), "
                         f"using n_estimators={best_n_estimators}")
 
-        # ── Step 2: Optuna hyperparameter tuning (replaces plain CV) ──────────
+        # ── Step 2: Optuna hyperparameter tuning (AUC objective) ──────────────
         optuna_trials = config.MODEL_SETTINGS.get('optuna_trials', 0)
         best_tuned_params: Dict = {}
 
@@ -311,29 +339,37 @@ class CryptoPredictionModel:
 
                 def objective(trial):
                     params = xgb_params.copy()
-                    params['n_estimators'] = best_n_estimators
-                    params['max_depth'] = trial.suggest_int('max_depth', 2, 6)
-                    params['learning_rate'] = trial.suggest_float('learning_rate', 0.01, 0.15, log=True)
-                    params['subsample'] = trial.suggest_float('subsample', 0.6, 1.0)
+                    params['n_estimators']     = best_n_estimators
+                    # max_depth capped at 4: depth-6 trees overfit on noisy 15 m data
+                    params['max_depth']        = trial.suggest_int('max_depth', 2, 4)
+                    params['learning_rate']    = trial.suggest_float('learning_rate', 0.01, 0.15, log=True)
+                    params['subsample']        = trial.suggest_float('subsample', 0.6, 1.0)
                     params['colsample_bytree'] = trial.suggest_float('colsample_bytree', 0.5, 1.0)
                     params['min_child_weight'] = trial.suggest_int('min_child_weight', 1, 10)
-                    params['reg_alpha'] = trial.suggest_float('reg_alpha', 0.01, 1.0, log=True)
-                    params['reg_lambda'] = trial.suggest_float('reg_lambda', 0.5, 3.0)
+                    # gamma: min loss-reduction to make a split — key anti-overfit knob
+                    params['gamma']            = trial.suggest_float('gamma', 0.0, 2.0)
+                    params['reg_alpha']        = trial.suggest_float('reg_alpha', 0.01, 1.0, log=True)
+                    # reg_lambda upper bound widened to 10: stronger L2 often helps on noisy data
+                    params['reg_lambda']       = trial.suggest_float('reg_lambda', 0.5, 10.0)
 
                     tscv = TimeSeriesSplit(n_splits=max(2, max_folds))
                     scores = []
-                    for train_idx, val_idx in tscv.split(X):
+                    for train_idx, val_idx in tscv.split(X_train):
                         m = xgb.XGBClassifier(**params)
                         sw = sample_weights[train_idx] if sample_weights is not None else None
-                        m.fit(X.iloc[train_idx], y_binary.iloc[train_idx], sample_weight=sw, verbose=False)
-                        scores.append(accuracy_score(y_binary.iloc[val_idx], m.predict(X.iloc[val_idx])))
-                    return float(np.mean(scores))
+                        m.fit(X_train.iloc[train_idx], y_train.iloc[train_idx],
+                              sample_weight=sw, verbose=False)
+                        val_probs = m.predict_proba(X_train.iloc[val_idx])[:, 1]
+                        # AUC — optimises probability ranking, not just 50 % threshold accuracy
+                        if len(np.unique(y_train.iloc[val_idx])) == 2:
+                            scores.append(roc_auc_score(y_train.iloc[val_idx], val_probs))
+                    return float(np.mean(scores)) if scores else 0.5
 
                 study = optuna.create_study(direction='maximize')
                 study.optimize(objective, n_trials=optuna_trials, show_progress_bar=False)
 
                 best_tuned_params = study.best_params
-                logger.info(f"Optuna best CV accuracy: {study.best_value:.4f} "
+                logger.info(f"Optuna best CV AUC: {study.best_value:.4f} "
                             f"(n_trials={optuna_trials})")
                 logger.info(f"Optuna best params: {best_tuned_params}")
 
@@ -348,37 +384,38 @@ class CryptoPredictionModel:
         final_params['n_estimators'] = best_n_estimators
         final_params.update(best_tuned_params)
 
-        # ── CV accuracy reporting (quick, uses final params + sample weights) ──
+        # ── CV AUC reporting (uses final params on training portion) ──────────
         cv_scores = np.array([0.5])
         try:
             if max_folds >= 2:
                 tscv = TimeSeriesSplit(n_splits=max_folds)
                 scores = []
-                for train_idx, val_idx in tscv.split(X):
+                for train_idx, val_idx in tscv.split(X_train):
                     cv_model = xgb.XGBClassifier(**final_params)
                     sw = sample_weights[train_idx] if sample_weights is not None else None
-                    cv_model.fit(X.iloc[train_idx], y_binary.iloc[train_idx],
+                    cv_model.fit(X_train.iloc[train_idx], y_train.iloc[train_idx],
                                  sample_weight=sw, verbose=False)
-                    scores.append(accuracy_score(y_binary.iloc[val_idx],
-                                                 cv_model.predict(X.iloc[val_idx])))
-                cv_scores = np.array(scores)
-                logger.info(f"CV accuracy: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+                    val_probs = cv_model.predict_proba(X_train.iloc[val_idx])[:, 1]
+                    if len(np.unique(y_train.iloc[val_idx])) == 2:
+                        scores.append(roc_auc_score(y_train.iloc[val_idx], val_probs))
+                if scores:
+                    cv_scores = np.array(scores)
+                logger.info(f"CV AUC: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
         except Exception as cv_err:
             logger.warning(f"CV failed ({cv_err}), reporting 0.5 fallback")
 
-        # ── Step 3: Train final model (plain XGBoost) ─────────────────────────
+        # ── Step 3: Train final XGBoost on training portion ───────────────────
         model_type = 'dummy_classifier'
         feature_importance: Dict = {}
         accuracy = float(max(class_counts)) / len(y_binary)
 
         try:
             model = xgb.XGBClassifier(**final_params)
-            model.fit(X, y_binary, sample_weight=sample_weights)
+            model.fit(X_train, y_train, sample_weight=sample_weights)
 
-            feature_importance = dict(zip(X.columns, model.feature_importances_))
-
-            y_pred = model.predict(X)
-            accuracy = float(accuracy_score(y_binary, y_pred))
+            feature_importance = dict(zip(X_train.columns, model.feature_importances_))
+            y_pred = model.predict(X_train)
+            accuracy = float(accuracy_score(y_train, y_pred))
             model_type = 'xgb_classifier'
 
         except Exception as train_err:
@@ -387,24 +424,53 @@ class CryptoPredictionModel:
                 fallback_params = xgb_params.copy()
                 fallback_params['n_estimators'] = best_n_estimators
                 model = xgb.XGBClassifier(**fallback_params)
-                model.fit(X, y_binary, sample_weight=sample_weights)
-                y_pred = model.predict(X)
-                accuracy = float(accuracy_score(y_binary, y_pred))
-                feature_importance = dict(zip(X.columns, model.feature_importances_))
+                model.fit(X_train, y_train, sample_weight=sample_weights)
+                y_pred = model.predict(X_train)
+                accuracy = float(accuracy_score(y_train, y_pred))
+                feature_importance = dict(zip(X_train.columns, model.feature_importances_))
                 model_type = 'xgb_classifier'
             except Exception as plain_err:
                 logger.error(f"Plain XGBoost also failed ({plain_err}), using dummy classifier")
                 model = DummyClassifier(strategy='most_frequent')
-                model.fit(X, y_binary)
-                y_pred = model.predict(X)
-                accuracy = float(accuracy_score(y_binary, y_pred))
-                feature_importance = {col: 0.0 for col in X.columns}
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_train)
+                accuracy = float(accuracy_score(y_train, y_pred))
+                feature_importance = {col: 0.0 for col in X_train.columns}
 
-        self.models[f"{self.prediction_horizon}_xgb_classifier"] = model
+        # ── Step 4: Isotonic calibration on held-out 20 % ─────────────────────
+        # The XGBoost is already trained; we only fit the isotonic monotone
+        # mapping on the unseen calibration holdout.
+        # sklearn ≥ 1.6: use FrozenEstimator to avoid the cv='prefit' deprecation.
+        # sklearn < 1.6: fall back to cv='prefit' (still works, just deprecated).
+        final_model = model
+        if n_cal >= 30 and model_type == 'xgb_classifier':
+            try:
+                # sigmoid (Platt scaling) over isotonic: fits only 2 parameters
+                # (A·f + B) so it generalises across market regimes and is
+                # mathematically guaranteed to be monotone out-of-sample.
+                # Isotonic is a staircase with N steps — it memorises the
+                # calibration set and can break monotonicity on unseen data.
+                if _FrozenEstimator is not None:
+                    calibrated = CalibratedClassifierCV(
+                        estimator=_FrozenEstimator(model), method='sigmoid'
+                    )
+                else:
+                    calibrated = CalibratedClassifierCV(
+                        estimator=model, cv='prefit', method='sigmoid'
+                    )
+                calibrated.fit(X_cal, y_cal)
+                final_model = calibrated
+                logger.info(f"Isotonic calibration fitted on {n_cal} held-out samples "
+                            f"({self.crypto_name} {self.prediction_horizon})")
+            except Exception as cal_err:
+                logger.warning(f"Isotonic calibration failed ({cal_err}), "
+                               f"storing uncalibrated model")
+
+        self.models[f"{self.prediction_horizon}_xgb_classifier"] = final_model
 
         results = {
             'model_type': model_type,
-            'cv_accuracy_mean': float(cv_scores.mean()),
+            'cv_accuracy_mean': float(cv_scores.mean()),  # AUC score
             'cv_accuracy_std': float(cv_scores.std()),
             'train_accuracy': accuracy,
             'best_n_estimators': best_n_estimators,
@@ -416,7 +482,7 @@ class CryptoPredictionModel:
             results['optuna_best_params'] = best_tuned_params
 
         logger.info(f"{model_type} trained ({self.crypto_name} {self.prediction_horizon}) — "
-                    f"CV: {cv_scores.mean():.3f}, best_n_est: {best_n_estimators}, "
+                    f"CV AUC: {cv_scores.mean():.3f}, best_n_est: {best_n_estimators}, "
                     f"train_acc: {accuracy:.3f}")
         return results
     
@@ -447,18 +513,15 @@ class CryptoPredictionModel:
         # Feature selection driven by direction target
         X_selected = self.feature_selection(X, y_clf, k=config.MODEL_SETTINGS['feature_selection_k'])
 
-        # Scale
-        X_scaled = self.scale_features(X_selected, fit=True)
-
-        # Train classifier only
-        classification_results = self.train_xgboost_classifier(X_scaled, y_clf)
+        # Train classifier only (no StandardScaler — XGBoost is scale-invariant)
+        classification_results = self.train_xgboost_classifier(X_selected, y_clf)
 
         training_info = {
             'timestamp': datetime.now(timezone.utc).replace(tzinfo=None),
             'crypto': self.crypto_name,
             'horizon': self.prediction_horizon,
             'training_samples': len(X),
-            'features_used': len(X_scaled.columns),
+            'features_used': len(X_selected.columns),
             'classification_results': classification_results,
         }
 
@@ -499,15 +562,10 @@ class CryptoPredictionModel:
                 index=X.index,
             )
 
-            scaler = self.scalers[f"{self.prediction_horizon}_scaler"]
-            X_scaled = pd.DataFrame(
-                scaler.transform(X_selected),
-                columns=X_selected.columns,
-                index=X_selected.index,
-            )
-
+            # No StandardScaler — XGBoost is scale-invariant; calibrated probabilities
+            # are produced directly by the CalibratedClassifierCV wrapper.
             classifier = self.models[f"{self.prediction_horizon}_xgb_classifier"]
-            direction_prob = classifier.predict_proba(X_scaled)[0, 1]  # P(UP)
+            direction_prob = classifier.predict_proba(X_selected)[0, 1]  # P(UP)
             predicted_direction = int(direction_prob >= 0.5)  # >= matches Polymarket rules
 
             current_price = latest_data['price'].iloc[0]

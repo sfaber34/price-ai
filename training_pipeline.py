@@ -145,8 +145,7 @@ def predict_proba_batch(
     target_col = f'target_direction_{horizon}'
     X, y = model.prepare_data(df, target_col)
 
-    selector = model.feature_selectors[f"{horizon}_selector"]
-    scaler = model.scalers[f"{horizon}_scaler"]
+    selector   = model.feature_selectors[f"{horizon}_selector"]
     classifier = model.models[f"{horizon}_xgb_classifier"]
 
     X_sel = pd.DataFrame(
@@ -154,11 +153,8 @@ def predict_proba_batch(
         columns=X.columns[selector.get_support()],
         index=X.index,
     )
-    X_scaled = pd.DataFrame(
-        scaler.transform(X_sel),
-        columns=X_sel.columns,
-        index=X_sel.index,
-    )
 
-    probs = classifier.predict_proba(X_scaled)[:, 1]
+    # No StandardScaler — XGBoost is scale-invariant; classifier is a
+    # CalibratedClassifierCV wrapper that returns calibrated probabilities.
+    probs = classifier.predict_proba(X_sel)[:, 1]
     return probs, (y > 0).astype(int).values

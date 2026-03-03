@@ -92,7 +92,6 @@ def predict_with_loaded_model(model: CryptoPredictionModel, df: pd.DataFrame, ho
     y_binary = (y > 0).astype(int)
 
     selector   = model.feature_selectors[f"{horizon}_selector"]
-    scaler     = model.scalers[f"{horizon}_scaler"]
     classifier = model.models[f"{horizon}_xgb_classifier"]
 
     X_sel = pd.DataFrame(
@@ -100,12 +99,9 @@ def predict_with_loaded_model(model: CryptoPredictionModel, df: pd.DataFrame, ho
         columns=X.columns[selector.get_support()],
         index=X.index,
     )
-    X_scaled = pd.DataFrame(
-        scaler.transform(X_sel),
-        columns=X_sel.columns,
-        index=X_sel.index,
-    )
-    probs = classifier.predict_proba(X_scaled)[:, 1]
+    # No StandardScaler step — XGBoost is scale-invariant; the classifier is a
+    # CalibratedClassifierCV wrapper that returns calibrated probabilities directly.
+    probs = classifier.predict_proba(X_sel)[:, 1]
 
     return probs, y_binary.values
 

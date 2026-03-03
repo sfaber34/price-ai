@@ -68,7 +68,9 @@ MODEL_SETTINGS = {
     'production_training_days': 180,
     'retrain_frequency_hours': 6,
     'optuna_trials': 60,           # hyperparam search trials (0 = skip, use hardcoded)
-    'sample_weight_decay': 1.20,    # exponential decay for recency weighting (0 = uniform)
+    'sample_weight_decay': 2,    # exponential decay for recency weighting (0 = uniform)
+                                   # decay=2 → half-weight at ~62 days ago; focuses model on
+                                   # current regime while retaining 6 months of structural patterns.
 }
 
 # Rate Limiting (to respect free API limits)
