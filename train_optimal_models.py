@@ -87,12 +87,18 @@ class CryptoBacktester:
 
             prediction_time = data.iloc[test_start]['datetime']
 
-            # Polymarket-style: compare bar close vs bar open of the target bar
+            # Polymarket-style: compare bar close vs bar open of the target bar.
+            # The model predicts from data.iloc[test_start - 1] (last training bar).
+            # The target for that bar is the *next* bar, which is data.iloc[test_start].
+            # Offsets are relative to test_start:
+            #   15m → test_start + 0  (the immediate next bar)
+            #   1h  → test_start + 3  (4 bars from the prediction row = test_start - 1 + 4)
+            #   4h  → test_start + 15 (16 bars from the prediction row)
             future_prices = {}
             future_opens = {}
-            _horizon_offsets = {'15m': 1, '1h': 4, '4h': 16}
+            _horizon_offsets = {'15m': 0, '1h': 3, '4h': 15}
             for horizon in config.PREDICTION_INTERVALS:
-                future_idx = test_start + _horizon_offsets.get(horizon, 1)
+                future_idx = test_start + _horizon_offsets.get(horizon, 0)
                 if future_idx < len(data):
                     future_prices[horizon] = data.iloc[future_idx]['price']
                     future_opens[horizon] = data.iloc[future_idx]['open']

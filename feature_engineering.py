@@ -1217,101 +1217,6 @@ class FeatureEngineer:
 
         return df
 
-    def add_intrabar_5m_features(self, df: pd.DataFrame, df_5m: pd.DataFrame = None) -> pd.DataFrame:
-        """
-        Add within-bar features derived from 5-minute bars.
-
-        Each 15m bar contains exactly 3 five-minute sub-bars.  Features capture
-        the *character* of the bar — continuation vs reversal, volume building
-        toward close, buying pressure acceleration — giving the 15m model
-        short-term signal that is invisible in a single OHLCV row.
-
-        Alignment: each 5m bar is mapped to its parent 15m bar via floor('15min'),
-        then merged backward — no future leakage.
-        """
-        if df_5m is None or df_5m.empty:
-            return df
-
-        try:
-            df_5m = df_5m.copy()
-            df_5m['datetime'] = pd.to_datetime(df_5m['datetime'])
-            df_5m = df_5m.sort_values('datetime').reset_index(drop=True)
-
-            # Map each 5m bar to its parent 15m bar
-            df_5m['bar_15m'] = df_5m['datetime'].dt.floor('15min')
-            df_5m['rank_in_bar'] = df_5m.groupby('bar_15m').cumcount()  # 0=first, 1=middle, 2=last
-
-            has_cvd = ('taker_buy_base_vol' in df_5m.columns and
-                       'taker_sell_base_vol' in df_5m.columns)
-            if has_cvd:
-                df_5m['bar_cvd'] = df_5m['taker_buy_base_vol'] - df_5m['taker_sell_base_vol']
-
-            n_per_bar = df_5m.groupby('bar_15m').size()
-            first_bars = df_5m[df_5m['rank_in_bar'] == 0]
-            last_bars = df_5m.groupby('bar_15m').tail(1)
-            middle_bars = df_5m[df_5m['rank_in_bar'] == 1]
-
-            feats = pd.DataFrame(index=n_per_bar.index)
-
-            # First-to-last direction: price change across the bar's 5m sub-bars
-            first_price = first_bars.set_index('bar_15m')['price']
-            last_price = last_bars.set_index('bar_15m')['price']
-            feats['intra5m_first_last_direction'] = (
-                (last_price - first_price) / (first_price.abs() + 1e-10)
-            )
-
-            # Middle bar momentum: body of the middle 5m bar
-            if not middle_bars.empty and 'open' in middle_bars.columns:
-                mid = middle_bars.set_index('bar_15m')
-                feats['intra5m_middle_momentum'] = (
-                    (mid['price'] - mid['open']) / (mid['open'].abs() + 1e-10)
-                )
-
-            # CVD acceleration: last bar CVD minus first bar CVD
-            if has_cvd:
-                first_cvd = first_bars.set_index('bar_15m')['bar_cvd']
-                last_cvd = last_bars.set_index('bar_15m')['bar_cvd']
-                feats['intra5m_cvd_acceleration'] = last_cvd - first_cvd
-
-                # Normalised CVD: total 5m CVD / total volume
-                total_cvd = df_5m.groupby('bar_15m')['bar_cvd'].sum()
-                if 'volume' in df_5m.columns:
-                    total_vol = df_5m.groupby('bar_15m')['volume'].sum()
-                    feats['intra5m_cvd_norm'] = total_cvd / (total_vol + 1e-10)
-
-            # Volume trend: last bar volume minus first bar volume / total
-            if 'volume' in df_5m.columns:
-                first_vol = first_bars.set_index('bar_15m')['volume']
-                last_vol = last_bars.set_index('bar_15m')['volume']
-                total_vol = df_5m.groupby('bar_15m')['volume'].sum()
-                feats['intra5m_volume_trend'] = (
-                    (last_vol - first_vol) / (total_vol + 1e-10)
-                )
-
-            feats = feats.reset_index()  # bar_15m becomes a column
-
-            # Merge onto 15m df
-            df = df.copy()
-            df['datetime'] = pd.to_datetime(df['datetime'])
-            df = df.sort_values('datetime').reset_index(drop=True)
-            feats = feats.sort_values('bar_15m')
-
-            df = pd.merge_asof(
-                df, feats,
-                left_on='datetime',
-                right_on='bar_15m',
-                direction='backward',
-            )
-            df = df.drop(columns=['bar_15m'], errors='ignore')
-
-            n_added = len([c for c in feats.columns if c != 'bar_15m'])
-            logger.info(f"Added {n_added} intrabar features from 5m data")
-
-        except Exception as e:
-            logger.error(f"Error adding intrabar 5m features: {e}")
-
-        return df
-
     def prepare_features(self, crypto_df: pd.DataFrame, market_df: pd.DataFrame = None, external_data: dict = None) -> pd.DataFrame:
         """
         Main feature preparation pipeline
@@ -1334,7 +1239,6 @@ class FeatureEngineer:
         df = self.add_funding_rate_features(df, external_data.get('funding_rate'))
         df = self.add_open_interest_features(df, external_data.get('open_interest'))
         df = self.add_intrabar_features(df, external_data.get('intrabar_1m'))
-        df = self.add_intrabar_5m_features(df, external_data.get('intrabar_5m'))
 
         df = self.create_target_variables(df)
         

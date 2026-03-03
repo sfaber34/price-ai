@@ -45,7 +45,7 @@ def calibration_report(probs: np.ndarray, actuals: np.ndarray, horizon: str):
               '0.65\u20130.70', '0.70\u20130.75', '0.75\u20130.80', '0.80+   ']
 
     print(f"\n  {'Confidence':>11}  {'n':>5}  {'Accuracy':>8}  {'Edge':>8}  Signal")
-    print(f"  {'\u2500'*55}")
+    print("  " + "\u2500" * 55)
 
     any_bucket = False
     for lo, hi, label in zip(bins[:-1], bins[1:], labels):
@@ -133,9 +133,9 @@ def main():
             print(f"\n  {crypto.upper()}: no production model, skipping")
             continue
 
-        print(f"\n{'\u2500' * 60}")
+        print("\n" + "\u2500" * 60)
         print(f"  {crypto.upper()}")
-        print(f"{'\u2500' * 60}")
+        print("\u2500" * 60)
 
         for horizon in config.PREDICTION_INTERVALS:
             if horizon not in production_models[crypto]:
